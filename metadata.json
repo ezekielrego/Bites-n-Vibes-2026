@@ -1,0 +1,8 @@
+{
+  "name": "VibeTick - Concert & Event Discovery",
+  "description": "A premium, pixel-perfect concert and event discovery app featuring glassmorphism, immersive gradients, and seamless ticket management.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
