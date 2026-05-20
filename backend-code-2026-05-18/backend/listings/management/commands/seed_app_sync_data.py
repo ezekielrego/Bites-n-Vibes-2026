@@ -10,7 +10,7 @@ from django.db import transaction
 from django.utils.text import slugify
 
 from accounts.models import User
-from listings.models import Category, Listing, ListingImage, SavedListing, Tag
+from listings.models import Category, Listing, ListingImage, SavedListing, Tag, Ticket
 from notifications.models import Notification
 
 
@@ -329,6 +329,7 @@ class Command(BaseCommand):
             listings = self._sync_listings(categories, tags, demo_user, workspace_root)
             self._sync_notifications(demo_user, listings)
             self._sync_saved_listings(demo_user, listings)
+            self._sync_tickets(demo_user, listings)
 
         self.stdout.write(self.style.SUCCESS('App sync data seeded successfully.'))
 
@@ -499,3 +500,24 @@ class Command(BaseCommand):
             if not listing:
                 continue
             SavedListing.objects.get_or_create(user=demo_user, listing=listing)
+
+    def _sync_tickets(self, demo_user, listings):
+        ticket_slugs = [
+            'gelora-bung-karno-neon-orbit',
+            'district-hall-warehouse-frequency',
+        ]
+
+        Ticket.objects.filter(user=demo_user).exclude(
+            listing__in=[listings[slug] for slug in ticket_slugs if slug in listings]
+        ).delete()
+
+        for slug in ticket_slugs:
+            listing = listings.get(slug)
+            if not listing:
+                continue
+
+            Ticket.objects.get_or_create(
+                user=demo_user,
+                listing=listing,
+                defaults={'status': 'confirmed'},
+            )

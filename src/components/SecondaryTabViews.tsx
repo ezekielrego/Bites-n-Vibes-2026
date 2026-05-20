@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
+  Modal,
   Platform,
   Pressable,
   ScrollView,
@@ -16,15 +17,20 @@ import { Feather } from '@expo/vector-icons';
 import { Image } from 'expo-image';
 import * as ImagePicker from 'expo-image-picker';
 import * as Location from 'expo-location';
+import * as VideoThumbnails from 'expo-video-thumbnails';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { APP_VERSION } from '../constants';
 import { shadow, theme } from '../theme';
 import {
   AppCategory,
   AppEvent,
   AppNotification,
+  AppTicket,
   AppUser,
+  ChangePasswordInput,
   CreateAppEventInput,
   LocalUploadImage,
+  UpdateProfileInput,
 } from '../types';
 import { Tag, useJellyPressAnimation } from './Primitives';
 
@@ -39,6 +45,12 @@ type SelectOption = {
 
 const APP_LOGO = require('../../logo.png');
 const PRICE_RANGE_OPTIONS: PriceRange[] = ['$', '$$', '$$$', '$$$$'];
+const PRICE_RANGE_SELECT_OPTIONS: SelectOption[] = PRICE_RANGE_OPTIONS.map((value) => ({
+  value,
+  label: value,
+  icon: 'dollar-sign',
+}));
+const MAX_VIDEO_SOFT_LIMIT_BYTES = 20 * 1024 * 1024;
 const MAX_CREATE_GALLERY_MEDIA = 8;
 const CREATE_TAG_OPTIONS: SelectOption[] = [
   { value: 'Rooftop', label: 'Rooftop', icon: 'map-pin' },
@@ -173,14 +185,18 @@ export function InboxTabView({
 
 export function CreateTabView({
   categories,
+  editingEvent,
   isSubmitting,
+  onCancelEdit,
   submitProgress,
   submitStage,
   submitError,
   onSubmit,
 }: {
   categories: AppCategory[];
+  editingEvent: AppEvent | null;
   isSubmitting: boolean;
+  onCancelEdit: () => void;
   submitProgress: number;
   submitStage: string | null;
   submitError: string | null;
@@ -225,22 +241,40 @@ export function CreateTabView({
     () => categoryOptions.find((option) => option.value === draft.categoryId) ?? null,
     [categoryOptions, draft.categoryId],
   );
+  const selectedPriceRangeOption = useMemo(
+    () => PRICE_RANGE_SELECT_OPTIONS.find((option) => option.value === draft.priceRange) ?? null,
+    [draft.priceRange],
+  );
+  const showArtistField = useMemo(() => categorySupportsArtist(draft.categoryId), [draft.categoryId]);
   useEffect(() => {
     if (selectableCategories.length === 0) {
       return;
     }
 
-    setDraft((current) => {
-      if (current.categoryId && current.categoryId !== 'all') {
-        return current;
-      }
+    setDraft((current) =>
+      editingEvent
+        ? buildDraftFromEvent(editingEvent, selectableCategories)
+        : current.categoryId && current.categoryId !== 'all'
+          ? current
+          : {
+              ...current,
+              categoryId: selectableCategories[0]?.id ?? '',
+            },
+    );
+  }, [editingEvent, selectableCategories]);
 
-      return {
-        ...current,
-        categoryId: selectableCategories[0]?.id ?? '',
-      };
-    });
-  }, [selectableCategories]);
+  useEffect(() => {
+    if (editingEvent) {
+      setDraft(buildDraftFromEvent(editingEvent, selectableCategories));
+      setStep(0);
+      setLocalError(null);
+      return;
+    }
+
+    setDraft(buildInitialDraft(selectableCategories));
+    setStep(0);
+    setLocalError(null);
+  }, [editingEvent, selectableCategories]);
 
   const setField = <K extends keyof CreateDraft>(field: K, value: CreateDraft[K]) => {
     setDraft((current) => ({ ...current, [field]: value }));
@@ -259,6 +293,7 @@ export function CreateTabView({
     setDraft((current) => ({
       ...current,
       categoryId,
+      artist: categorySupportsArtist(categoryId) ? current.artist : '',
     }));
   };
 
@@ -271,23 +306,29 @@ export function CreateTabView({
   };
 
   const handlePickImage = async (field: 'heroImage' | 'ticketImage') => {
+    const allowVideo = field === 'heroImage';
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!permission.granted) {
-      Alert.alert('Photos needed', 'Allow photo access so you can upload listing images.');
+      Alert.alert('Photos needed', 'Allow photo access so you can upload listing media.');
       return;
     }
 
     const result = await ImagePicker.launchImageLibraryAsync({
-      allowsEditing: true,
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      allowsEditing: !allowVideo,
+      mediaTypes: allowVideo ? ['images', 'videos'] : ['images'],
       quality: 0.92,
+      videoExportPreset: allowVideo && Platform.OS === 'ios' ? ImagePicker.VideoExportPreset.MediumQuality : undefined,
+      videoQuality:
+        allowVideo && Platform.OS === 'ios' ? ImagePicker.UIImagePickerControllerQualityType.Medium : undefined,
     });
 
     if (result.canceled || result.assets.length === 0) {
       return;
     }
 
-    setField(field, toLocalUploadImage(result.assets[0], field === 'heroImage' ? 'hero' : 'ticket'));
+    const nextMedia = await toLocalUploadImage(result.assets[0], field === 'heroImage' ? 'hero' : 'ticket');
+    setField(field, nextMedia);
+    warnIfVideoNeedsCompression(nextMedia);
   };
 
   const handlePickGalleryMedia = async () => {
@@ -309,17 +350,22 @@ export function CreateTabView({
       mediaTypes: ['images', 'videos'],
       quality: 0.92,
       selectionLimit: remaining,
+      videoExportPreset: Platform.OS === 'ios' ? ImagePicker.VideoExportPreset.MediumQuality : undefined,
+      videoQuality: Platform.OS === 'ios' ? ImagePicker.UIImagePickerControllerQualityType.Medium : undefined,
     });
 
     if (result.canceled || result.assets.length === 0) {
       return;
     }
 
-    const nextItems = result.assets
-      .slice(0, remaining)
-      .map((asset, index) => toLocalUploadImage(asset, `gallery-${Date.now()}-${index}`));
+    const nextItems = await Promise.all(
+      result.assets
+        .slice(0, remaining)
+        .map((asset, index) => toLocalUploadImage(asset, `gallery-${Date.now()}-${index}`)),
+    );
 
     setField('galleryMedia', [...draft.galleryMedia, ...nextItems].slice(0, MAX_CREATE_GALLERY_MEDIA));
+    warnIfVideoNeedsCompression(...nextItems);
     setLocalError(null);
   };
 
@@ -375,8 +421,8 @@ export function CreateTabView({
         accuracy: Location.Accuracy.Balanced,
       });
 
-      const latitude = String(position.coords.latitude);
-      const longitude = String(position.coords.longitude);
+      const latitude = formatCoordinate(position.coords.latitude);
+      const longitude = formatCoordinate(position.coords.longitude);
       let address = '';
       let city = '';
       let region = '';
@@ -408,8 +454,23 @@ export function CreateTabView({
     }
   };
 
+  const warnIfVideoNeedsCompression = (...items: LocalUploadImage[]) => {
+    const hasLargeVideo = items.some(
+      (item) => item.mimeType.startsWith('video/') && (item.fileSize ?? 0) > MAX_VIDEO_SOFT_LIMIT_BYTES,
+    );
+
+    if (!hasLargeVideo || Platform.OS === 'ios') {
+      return;
+    }
+
+    Alert.alert(
+      'Large video selected',
+      'Videos over 20MB will upload as-is on this device. Shorter clips keep uploads lighter and home previews smoother.',
+    );
+  };
+
   const handleNext = () => {
-    const validation = validateRequiredStep(draft);
+    const validation = validateRequiredStep(draft, Boolean(editingEvent));
     if (validation) {
       setLocalError(validation);
       return;
@@ -435,7 +496,7 @@ export function CreateTabView({
   };
 
   const handlePublish = async () => {
-    const validation = validateRequiredStep(draft);
+    const validation = validateRequiredStep(draft, Boolean(editingEvent));
     if (validation) {
       setLocalError(validation);
       setStep(0);
@@ -445,7 +506,7 @@ export function CreateTabView({
     setLocalError(null);
 
     try {
-      await onSubmit(buildCreateInput(draft));
+      await onSubmit(buildCreateInput(draft, editingEvent?.media ?? []));
       setDraft(buildInitialDraft(selectableCategories));
       setStep(0);
     } catch (error) {
@@ -457,9 +518,16 @@ export function CreateTabView({
     <View style={styles.sectionStack}>
       <View style={styles.sectionHeading}>
         <View>
-          <Text style={styles.sectionTitle}>Create</Text>
-          <Text style={styles.sectionCopy}>Start with the essentials, then add the extras when you are ready.</Text>
+          <Text style={styles.sectionTitle}>{editingEvent ? 'Edit listing' : 'Create'}</Text>
+          <Text style={styles.sectionCopy}>
+            {editingEvent
+              ? 'Update the important pieces now. Existing media stays in place unless you add more.'
+              : 'Start with the essentials, then add the extras when you are ready.'}
+          </Text>
         </View>
+        {editingEvent ? (
+          <CompactActionButton icon="x" label="Close edit" onPress={onCancelEdit} tone="muted" />
+        ) : null}
       </View>
 
       <StepStrip currentStep={step} />
@@ -469,7 +537,7 @@ export function CreateTabView({
           <View style={styles.formStepStack}>
             <StepIntro
               title="Basics and images"
-              copy="Collect the name, tags, and artwork first. Hero art is required, and you can add more gallery images or a video for the details slider."
+              copy="Collect the name, tags, and artwork first. Hero image or video is required, and you can add more gallery images or video for the details slider."
             />
 
             <CompactField
@@ -477,13 +545,6 @@ export function CreateTabView({
               placeholder="Late Night Brunch"
               value={draft.title}
               onChangeText={(value) => setField('title', value)}
-            />
-            <CompactField
-              label="Artist or host"
-              placeholder="DJ Nova"
-              value={draft.artist}
-              onChangeText={(value) => setField('artist', value)}
-              optional
             />
             <CompactField
               label="Venue"
@@ -498,31 +559,6 @@ export function CreateTabView({
               onChangeText={(value) => setField('city', value)}
               optional
             />
-            <View style={styles.row}>
-              <View style={styles.rowCell}>
-                <CompactField
-                  label="Price"
-                  placeholder="$18"
-                  value={draft.price}
-                  onChangeText={(value) => setField('price', value)}
-                  optional
-                />
-              </View>
-              <View style={styles.rowCell}>
-                <FieldLabel label="Price range" optional />
-                <View style={styles.priceRangeRow}>
-                  {PRICE_RANGE_OPTIONS.map((option) => (
-                    <CompactChoicePill
-                      key={option}
-                      active={draft.priceRange === option}
-                      label={option}
-                      onPress={() => setField('priceRange', option)}
-                    />
-                  ))}
-                </View>
-              </View>
-            </View>
-
             <SingleSelectDropdown
               label="Primary category"
               options={categoryOptions}
@@ -530,6 +566,25 @@ export function CreateTabView({
               selectedValue={draft.categoryId}
               selectedLabel={selectedCategoryOption?.label}
               onSelect={handlePrimaryCategorySelect}
+            />
+
+            {showArtistField ? (
+              <CompactField
+                label="Artist or host"
+                placeholder="DJ Nova"
+                value={draft.artist}
+                onChangeText={(value) => setField('artist', value)}
+                optional
+              />
+            ) : null}
+
+            <SingleSelectDropdown
+              label="Price range"
+              options={PRICE_RANGE_SELECT_OPTIONS}
+              placeholder="Choose price range"
+              selectedValue={draft.priceRange}
+              selectedLabel={selectedPriceRangeOption?.label}
+              onSelect={(value) => setField('priceRange', value as PriceRange)}
             />
 
             <MultiSelectDropdown
@@ -540,22 +595,37 @@ export function CreateTabView({
               onToggle={toggleTagSelection}
             />
 
+            <CompactField
+              label="Price"
+              placeholder="$18"
+              value={draft.price}
+              onChangeText={(value) => setField('price', value)}
+              optional
+            />
+
             <View style={styles.uploadRow}>
-              <UploadTile
-                label="Hero image"
-                hint="Required"
-                image={draft.heroImage}
-                onPress={() => void handlePickImage('heroImage')}
-              />
-              <UploadTile
-                label="Ticket image"
-                hint="Optional"
-                image={draft.ticketImage}
-                onPress={() => void handlePickImage('ticketImage')}
-              />
+              <View style={styles.uploadCell}>
+                <UploadTile
+                  label="Ticket image"
+                  hint="Optional"
+                  image={draft.ticketImage}
+                  remotePreview={editingEvent?.ticketImage ? String(editingEvent.ticketImage) : null}
+                  onPress={() => void handlePickImage('ticketImage')}
+                />
+              </View>
+              <View style={styles.uploadCell}>
+                <UploadTile
+                  label="Hero media"
+                  hint="Required"
+                  image={draft.heroImage}
+                  remotePreview={editingEvent?.image ? String(editingEvent.image) : null}
+                  onPress={() => void handlePickImage('heroImage')}
+                />
+              </View>
             </View>
 
             <GalleryMediaPicker
+              existingItems={editingEvent?.media ?? []}
               items={draft.galleryMedia}
               maxItems={MAX_CREATE_GALLERY_MEDIA}
               onAdd={() => void handlePickGalleryMedia()}
@@ -806,7 +876,9 @@ export function CreateTabView({
                     ? `${submitStage} ${Math.max(1, Math.round(submitProgress * 100))}%`
                     : 'Publishing...'
                   : step === 2
-                    ? 'Publish'
+                    ? editingEvent
+                      ? 'Save changes'
+                      : 'Publish'
                     : 'Next'
               }
               onPress={() => void (step === 2 ? handlePublish() : handleNext())}
@@ -821,24 +893,406 @@ export function CreateTabView({
 }
 
 export function ProfileTabView({
+  categories,
   historyEvents,
   myListings,
+  onCancelTicket,
+  onChangePassword,
+  onDeleteListings,
+  onClearHistory,
+  onEditListing,
+  onMarkTicketUsed,
+  onOpenCategory,
+  onOpenSavedTab,
+  onOpenTicket,
+  onRemoveHistoryItem,
   onSignOut,
+  onStartCreate,
+  onToggleEmailNotifications,
+  onTogglePushNotifications,
+  onUpdateProfile,
   profile,
+  receivedTickets,
   savedEvents,
+  tickets,
   unreadCount,
   onSelectEvent,
 }: {
+  categories: AppCategory[];
   historyEvents: AppEvent[];
   myListings: AppEvent[];
+  onCancelTicket: (ticket: AppTicket) => Promise<void>;
+  onChangePassword: (input: ChangePasswordInput) => Promise<{ message: string }>;
+  onDeleteListings: (eventIds: string[]) => Promise<void>;
+  onClearHistory: () => Promise<void>;
+  onEditListing: (event: AppEvent) => void;
+  onMarkTicketUsed: (ticket: AppTicket) => Promise<void>;
+  onOpenCategory: (categoryId: string) => void;
+  onOpenSavedTab: () => void;
+  onOpenTicket: (ticket: AppTicket) => void;
+  onRemoveHistoryItem: (event: AppEvent) => Promise<void>;
   onSignOut: () => void;
+  onStartCreate: () => void;
+  onToggleEmailNotifications: (enabled: boolean) => Promise<AppUser>;
+  onTogglePushNotifications: (enabled: boolean) => Promise<AppUser>;
+  onUpdateProfile: (input: UpdateProfileInput) => Promise<AppUser>;
   profile: AppUser | null;
+  receivedTickets: AppTicket[];
   savedEvents: AppEvent[];
+  tickets: AppTicket[];
   unreadCount: number;
   onSelectEvent: (event: AppEvent) => void;
 }) {
-  const savedTickets = savedEvents.slice(0, 4);
-  const recentViews = historyEvents.slice(0, 6);
+  const insets = useSafeAreaInsets();
+  const [activePanel, setActivePanel] = useState<'profile' | 'password' | 'notifications' | null>(null);
+  const [profilePage, setProfilePage] = useState<'main' | 'hosted' | 'tickets'>('main');
+  const [busyKey, setBusyKey] = useState<'profile' | 'password' | 'push' | 'email' | 'hosted-delete' | null>(null);
+  const [ticketBusyKey, setTicketBusyKey] = useState<string | null>(null);
+  const [historyBusyKey, setHistoryBusyKey] = useState<string | null>(null);
+  const [showAllMyTickets, setShowAllMyTickets] = useState(false);
+  const [showAllReceivedTickets, setShowAllReceivedTickets] = useState(false);
+  const [showAllHistory, setShowAllHistory] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [avatarUpload, setAvatarUpload] = useState<LocalUploadImage | null>(null);
+  const [name, setName] = useState(profile?.name ?? '');
+  const [phone, setPhone] = useState(profile?.phone ?? '');
+  const [oldPassword, setOldPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [hostedSearchQuery, setHostedSearchQuery] = useState('');
+  const [hostedSelectionMode, setHostedSelectionMode] = useState(false);
+  const [showAllHostedListings, setShowAllHostedListings] = useState(false);
+  const [showAllTicketPage, setShowAllTicketPage] = useState(false);
+  const [selectedHostedIds, setSelectedHostedIds] = useState<string[]>([]);
+  const visibleMyTickets = showAllMyTickets ? tickets : tickets.slice(0, 4);
+  const visibleReceivedTickets = showAllReceivedTickets ? receivedTickets : receivedTickets.slice(0, 5);
+  const recentViews = showAllHistory ? historyEvents : historyEvents.slice(0, 6);
+  const activeTicketCount = tickets.filter((ticket) => ticket.status === 'confirmed').length;
+  const ticketHistoryCount = tickets.filter((ticket) => ticket.status !== 'confirmed').length;
+  const categoryShortcuts = categories.filter((category) => category.id !== 'all');
+  const filteredHostedListings = useMemo(() => {
+    const query = hostedSearchQuery.trim().toLowerCase();
+    if (!query) {
+      return myListings;
+    }
+
+    return myListings.filter((event) =>
+      [event.title, event.venue, event.city, event.ownerName ?? ''].some((value) =>
+        value.toLowerCase().includes(query),
+      ),
+    );
+  }, [hostedSearchQuery, myListings]);
+  const visibleHostedListings = showAllHostedListings ? filteredHostedListings : filteredHostedListings.slice(0, 8);
+  const visibleTicketPageItems = showAllTicketPage ? tickets : tickets.slice(0, 8);
+
+  useEffect(() => {
+    setName(profile?.name ?? '');
+    setPhone(profile?.phone ?? '');
+  }, [profile?.name, profile?.phone]);
+
+  useEffect(() => {
+    setSelectedHostedIds((current) => current.filter((id) => myListings.some((event) => event.id === id)));
+  }, [myListings]);
+
+  const handleAvatarPick = async () => {
+    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!permission.granted) {
+      Alert.alert('Photos needed', 'Allow photo access so you can update your profile picture.');
+      return;
+    }
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      allowsEditing: true,
+      aspect: [1, 1],
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      quality: 0.92,
+    });
+
+    if (result.canceled || result.assets.length === 0) {
+      return;
+    }
+
+    setAvatarUpload(await toLocalUploadImage(result.assets[0], 'avatar'));
+  };
+
+  const handleSaveProfile = async () => {
+    if (!profile) {
+      return;
+    }
+
+    setBusyKey('profile');
+    setError(null);
+    setNotice(null);
+
+    try {
+      await onUpdateProfile({
+        name,
+        phone,
+        emailNotificationsEnabled: profile.emailNotificationsEnabled,
+        pushNotificationsEnabled: profile.pushNotificationsEnabled,
+        avatar: avatarUpload,
+      });
+      setAvatarUpload(null);
+      setNotice('Profile updated.');
+      setActivePanel(null);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Profile could not be updated right now.');
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const handleSavePassword = async () => {
+    setBusyKey('password');
+    setError(null);
+    setNotice(null);
+
+    try {
+      const response = await onChangePassword({
+        oldPassword,
+        newPassword,
+        confirmPassword,
+      });
+      setOldPassword('');
+      setNewPassword('');
+      setConfirmPassword('');
+      setNotice(response.message ?? 'Password updated.');
+      setActivePanel(null);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Password could not be updated right now.');
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const handleTogglePush = async () => {
+    if (!profile) {
+      return;
+    }
+
+    setBusyKey('push');
+    setError(null);
+    setNotice(null);
+
+    try {
+      const next = !profile.pushNotificationsEnabled;
+      await onTogglePushNotifications(next);
+      setNotice(next ? 'Push notifications are on.' : 'Push notifications are off.');
+    } catch (toggleError) {
+      setError(toggleError instanceof Error ? toggleError.message : 'Push notifications could not be updated.');
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const handleToggleEmail = async () => {
+    if (!profile) {
+      return;
+    }
+
+    setBusyKey('email');
+    setError(null);
+    setNotice(null);
+
+    try {
+      const next = !profile.emailNotificationsEnabled;
+      await onToggleEmailNotifications(next);
+      setNotice(next ? 'Email updates are on.' : 'Email updates are off.');
+    } catch (toggleError) {
+      setError(toggleError instanceof Error ? toggleError.message : 'Email updates could not be updated.');
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const handleManagedTicketCancel = async (ticket: AppTicket) => {
+    setTicketBusyKey(`${ticket.id}:cancel`);
+    setError(null);
+    setNotice(null);
+
+    try {
+      await onCancelTicket(ticket);
+      setNotice('Ticket cancelled.');
+    } catch (ticketError) {
+      setError(ticketError instanceof Error ? ticketError.message : 'Ticket could not be cancelled right now.');
+    } finally {
+      setTicketBusyKey(null);
+    }
+  };
+
+  const handleManagedTicketUsed = async (ticket: AppTicket) => {
+    setTicketBusyKey(`${ticket.id}:used`);
+    setError(null);
+    setNotice(null);
+
+    try {
+      await onMarkTicketUsed(ticket);
+      setNotice('Ticket marked as used.');
+    } catch (ticketError) {
+      setError(ticketError instanceof Error ? ticketError.message : 'Ticket could not be updated right now.');
+    } finally {
+      setTicketBusyKey(null);
+    }
+  };
+
+  const handleRemoveHistory = async (event: AppEvent) => {
+    setHistoryBusyKey(event.id);
+    setError(null);
+    setNotice(null);
+
+    try {
+      await onRemoveHistoryItem(event);
+      setNotice('History item removed.');
+    } catch (historyError) {
+      setError(historyError instanceof Error ? historyError.message : 'History item could not be removed.');
+    } finally {
+      setHistoryBusyKey(null);
+    }
+  };
+
+  const handleClearViewedHistory = async () => {
+    setHistoryBusyKey('clear');
+    setError(null);
+    setNotice(null);
+
+    try {
+      await onClearHistory();
+      setNotice('History cleared.');
+    } catch (historyError) {
+      setError(historyError instanceof Error ? historyError.message : 'History could not be cleared right now.');
+    } finally {
+      setHistoryBusyKey(null);
+    }
+  };
+
+  const handleOpenHostedPage = () => {
+    setHostedSelectionMode(false);
+    setShowAllHostedListings(false);
+    setSelectedHostedIds([]);
+    setHostedSearchQuery('');
+    setProfilePage('hosted');
+  };
+
+  const handleOpenTicketsPage = () => {
+    setShowAllTicketPage(false);
+    setProfilePage('tickets');
+  };
+
+  const handleToggleHostedSelection = (eventId: string) => {
+    setSelectedHostedIds((current) =>
+      current.includes(eventId) ? current.filter((id) => id !== eventId) : [...current, eventId],
+    );
+  };
+
+  const performDeleteHostedListings = async () => {
+    if (selectedHostedIds.length === 0) {
+      setError('Select one or more listings first.');
+      return;
+    }
+
+    setBusyKey('hosted-delete');
+    setError(null);
+    setNotice(null);
+
+    try {
+      await onDeleteListings(selectedHostedIds);
+      setSelectedHostedIds([]);
+      setHostedSelectionMode(false);
+      setNotice(selectedHostedIds.length === 1 ? 'Listing deleted.' : 'Listings deleted.');
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : 'Listings could not be deleted right now.');
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const handleDeleteHostedListings = () => {
+    if (selectedHostedIds.length === 0) {
+      setError('Select one or more listings first.');
+      return;
+    }
+
+    Alert.alert(
+      selectedHostedIds.length === 1 ? 'Delete this listing?' : `Delete ${selectedHostedIds.length} listings?`,
+      'This will remove them from your hosted page and the public feed.',
+      [
+        {
+          text: 'Cancel',
+          style: 'cancel',
+        },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: () => {
+            void performDeleteHostedListings();
+          },
+        },
+      ],
+    );
+  };
+
+  if (profilePage === 'hosted') {
+    return (
+      <HostedListingsPage
+        busy={busyKey === 'hosted-delete'}
+        listings={visibleHostedListings}
+        totalShownCount={filteredHostedListings.length}
+        query={hostedSearchQuery}
+        rawCount={myListings.length}
+        selectedIds={selectedHostedIds}
+        showAll={showAllHostedListings}
+        selectionMode={hostedSelectionMode}
+        onBack={() => {
+          setProfilePage('main');
+          setHostedSelectionMode(false);
+          setShowAllHostedListings(false);
+          setSelectedHostedIds([]);
+        }}
+        onChangeQuery={setHostedSearchQuery}
+        onCreate={onStartCreate}
+        onDeleteSelected={handleDeleteHostedListings}
+        onEdit={onEditListing}
+        onOpen={onSelectEvent}
+        onToggleShowAll={() => setShowAllHostedListings((current) => !current)}
+        onSelectAll={() =>
+          setSelectedHostedIds((current) =>
+            filteredHostedListings.every((event) => current.includes(event.id))
+              ? current.filter((id) => !filteredHostedListings.some((event) => event.id === id))
+              : Array.from(new Set([...current, ...filteredHostedListings.map((event) => event.id)])),
+          )
+        }
+        onToggleSelect={handleToggleHostedSelection}
+        onToggleSelectionMode={() => {
+          setHostedSelectionMode((current) => {
+            if (current) {
+              setSelectedHostedIds([]);
+            }
+            return !current;
+          });
+        }}
+      />
+    );
+  }
+
+  if (profilePage === 'tickets') {
+    return (
+      <TicketsPage
+        activeCount={activeTicketCount}
+        showAll={showAllTicketPage}
+        tickets={visibleTicketPageItems}
+        totalCount={tickets.length}
+        onBack={() => {
+          setProfilePage('main');
+          setShowAllTicketPage(false);
+        }}
+        onCancelTicket={(ticket) => void handleManagedTicketCancel(ticket)}
+        onOpenTicket={onOpenTicket}
+        onToggleShowAll={() => setShowAllTicketPage((current) => !current)}
+        ticketBusyKey={ticketBusyKey}
+      />
+    );
+  }
 
   return (
     <View style={styles.sectionStack}>
@@ -863,78 +1317,783 @@ export function ProfileTabView({
         <View style={styles.profileStatsRow}>
           <MiniStatCard label="Saved" value={String(savedEvents.length)} />
           <MiniStatCard label="Hosting" value={String(myListings.length)} />
-          <MiniStatCard label="Alerts" value={String(unreadCount)} />
+          <MiniStatCard label="Received" value={String(receivedTickets.length)} />
         </View>
 
         <View style={styles.profileActionRow}>
+          <CompactActionButton
+            icon="user"
+            label="Edit profile"
+            onPress={() => setActivePanel('profile')}
+            tone="muted"
+          />
           <CompactActionButton icon="log-out" label="Sign out" onPress={onSignOut} tone="muted" />
         </View>
       </View>
 
+      {notice ? (
+        <View style={styles.inlineSuccess}>
+          <Feather color="#8BE28B" name={'check-circle' as FeatherName} size={14} />
+          <Text style={styles.inlineSuccessText}>{notice}</Text>
+        </View>
+      ) : null}
+
+      {error ? (
+        <View style={styles.inlineError}>
+          <Feather color={theme.colors.accentStrong} name={'info' as FeatherName} size={14} />
+          <Text style={styles.inlineErrorText}>{error}</Text>
+        </View>
+      ) : null}
+
       <View style={styles.profileSection}>
         <View style={styles.compactSectionHeader}>
-          <Text style={styles.compactSectionTitle}>Saved tickets</Text>
-          <Text style={styles.compactSectionHint}>Quick access</Text>
+          <View style={styles.compactSectionCopy}>
+            <Text style={styles.compactSectionTitle}>My tickets</Text>
+            <Text style={styles.compactSectionHint}>
+              {activeTicketCount} active{ticketHistoryCount > 0 ? ` • ${ticketHistoryCount} history` : ''}
+            </Text>
+          </View>
+          {tickets.length > 4 ? (
+            <CompactActionButton
+              icon={showAllMyTickets ? 'chevron-up' : 'chevron-down'}
+              label={showAllMyTickets ? 'Less' : 'View all'}
+              onPress={() => setShowAllMyTickets((current) => !current)}
+              tone="muted"
+            />
+          ) : null}
         </View>
 
-        {savedTickets.length === 0 ? (
+        {tickets.length === 0 ? (
           <EmptyState
             icon="download"
             title="No tickets saved yet"
-            copy="Once you save a place or event, its ticket art can live here."
+            copy="Book a listing and your real tickets will show up here."
             compact
           />
         ) : (
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.ticketRail}>
-            {savedTickets.map((event) => (
-              <PressableTicketCard key={event.id} event={event} onPress={() => onSelectEvent(event)} />
+          <View style={styles.ticketManagementList}>
+            {visibleMyTickets.map((ticket) => (
+              <TicketManagementRow
+                key={`my-ticket-${ticket.id}`}
+                title={ticket.event.title}
+                subtitle={ticket.event.venue}
+                meta={`Ref ${ticket.referenceCode} • ${formatTicketDate(ticket.bookedAt)}`}
+                status={ticket.status}
+                primaryActionLabel="Open"
+                onPrimaryAction={() => onOpenTicket(ticket)}
+                secondaryActionLabel={ticket.canCancel ? (ticketBusyKey === `${ticket.id}:cancel` ? 'Cancelling...' : 'Cancel') : undefined}
+                onSecondaryAction={ticket.canCancel ? () => void handleManagedTicketCancel(ticket) : undefined}
+                secondaryActionDisabled={ticketBusyKey !== null}
+              />
             ))}
-          </ScrollView>
+          </View>
         )}
       </View>
 
       <View style={styles.profileSection}>
         <View style={styles.compactSectionHeader}>
-          <Text style={styles.compactSectionTitle}>Recently viewed</Text>
-          <Text style={styles.compactSectionHint}>History</Text>
+          <View style={styles.compactSectionCopy}>
+            <Text style={styles.compactSectionTitle}>Received tickets</Text>
+            <Text style={styles.compactSectionHint}>Host dashboard</Text>
+          </View>
+          {receivedTickets.length > 5 ? (
+            <CompactActionButton
+              icon={showAllReceivedTickets ? 'chevron-up' : 'chevron-down'}
+              label={showAllReceivedTickets ? 'Less' : 'View all'}
+              onPress={() => setShowAllReceivedTickets((current) => !current)}
+              tone="muted"
+            />
+          ) : null}
         </View>
 
-        {recentViews.length === 0 ? (
+        {receivedTickets.length === 0 ? (
+          <EmptyState
+            icon="user"
+            title="No incoming tickets yet"
+            copy="When people book your listings, they will appear here with quick controls."
+            compact
+          />
+        ) : (
+          <View style={styles.ticketManagementList}>
+            {visibleReceivedTickets.map((ticket) => (
+              <TicketManagementRow
+                key={`received-ticket-${ticket.id}`}
+                title={ticket.buyerName || 'Guest'}
+                subtitle={ticket.event.title}
+                meta={`Ref ${ticket.referenceCode} • ${formatTicketDate(ticket.bookedAt)}`}
+                status={ticket.status}
+                primaryActionLabel="Listing"
+                onPrimaryAction={() => onSelectEvent(ticket.event)}
+                secondaryActionLabel={ticket.canMarkUsed ? (ticketBusyKey === `${ticket.id}:used` ? 'Saving...' : 'Used') : undefined}
+                onSecondaryAction={ticket.canMarkUsed ? () => void handleManagedTicketUsed(ticket) : undefined}
+                secondaryActionTone="accent"
+                secondaryActionDisabled={ticketBusyKey !== null}
+                tertiaryActionLabel={ticket.canCancel ? (ticketBusyKey === `${ticket.id}:cancel` ? 'Cancelling...' : 'Cancel') : undefined}
+                onTertiaryAction={ticket.canCancel ? () => void handleManagedTicketCancel(ticket) : undefined}
+                tertiaryActionDisabled={ticketBusyKey !== null}
+              />
+            ))}
+          </View>
+        )}
+      </View>
+
+      <View style={styles.profileSection}>
+        <View style={styles.compactSectionHeader}>
+          <View style={styles.compactSectionCopy}>
+            <Text style={styles.compactSectionTitle}>Hosting</Text>
+            <Text style={styles.compactSectionHint}>Separate page</Text>
+          </View>
+          <CompactActionButton icon="grid" label="Open" onPress={handleOpenHostedPage} tone="muted" />
+        </View>
+
+        <View style={styles.hostingSummaryCard}>
+          <MiniStatCard label="Listings" value={`${myListings.length}`} />
+          <MiniStatCard label="Received" value={`${receivedTickets.length}`} />
+          <MiniStatCard label="Create" value="Open" />
+        </View>
+      </View>
+
+      <View style={styles.profileSection}>
+        <View style={styles.compactSectionHeader}>
+          <View style={styles.compactSectionCopy}>
+            <Text style={styles.compactSectionTitle}>Recently viewed</Text>
+            <Text style={styles.compactSectionHint}>History</Text>
+          </View>
+          <View style={styles.sectionHeaderActions}>
+            {historyEvents.length > 6 ? (
+              <CompactActionButton
+                icon={showAllHistory ? 'chevron-up' : 'chevron-down'}
+                label={showAllHistory ? 'Less' : 'View all'}
+                onPress={() => setShowAllHistory((current) => !current)}
+                tone="muted"
+              />
+            ) : null}
+            {historyEvents.length > 0 ? (
+              <CompactActionButton
+                icon="x"
+                label={historyBusyKey === 'clear' ? 'Clearing...' : 'Clear'}
+                onPress={() => void handleClearViewedHistory()}
+                tone="muted"
+                disabled={historyBusyKey !== null}
+              />
+            ) : null}
+          </View>
+        </View>
+
+        {historyEvents.length === 0 ? (
           <EmptyState
             icon="clock"
             title="No recent views yet"
             copy="Open a few listings and your view history will settle here."
             compact
           />
-        ) : (
+        ) : !showAllHistory ? (
           <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.ticketRail}>
             {recentViews.map((event) => (
               <PressableTicketCard key={`history-${event.id}`} event={event} onPress={() => onSelectEvent(event)} />
             ))}
           </ScrollView>
+        ) : (
+          <View style={styles.historyList}>
+            {recentViews.map((event) => (
+              <HistoryEventRow
+                key={`history-${event.id}`}
+                event={event}
+                busy={historyBusyKey === event.id}
+                onOpen={() => onSelectEvent(event)}
+                onRemove={() => void handleRemoveHistory(event)}
+              />
+            ))}
+          </View>
         )}
       </View>
 
       <View style={styles.profileSection}>
         <View style={styles.compactSectionHeader}>
-          <Text style={styles.compactSectionTitle}>Settings</Text>
-          <Text style={styles.compactSectionHint}>Tighter controls</Text>
+          <View style={styles.compactSectionCopy}>
+            <Text style={styles.compactSectionTitle}>Categories</Text>
+            <Text style={styles.compactSectionHint}>Jump to discover</Text>
+          </View>
+        </View>
+
+        <View style={styles.categoryShortcutWrap}>
+          {categoryShortcuts.map((category) => (
+            <CompactChip
+              key={`category-shortcut-${category.id}`}
+              active={false}
+              icon={(category.icon as FeatherName) ?? 'grid'}
+              label={category.name}
+              onPress={() => onOpenCategory(category.id)}
+            />
+          ))}
+        </View>
+      </View>
+
+      <View style={styles.profileSection}>
+        <View style={styles.compactSectionHeader}>
+          <View style={styles.compactSectionCopy}>
+            <Text style={styles.compactSectionTitle}>Settings</Text>
+            <Text style={styles.compactSectionHint}>Tighter controls</Text>
+          </View>
         </View>
 
         <View style={styles.settingsStack}>
-          <SettingsRow
+          <SettingsActionRow
             icon="bell"
             label="Notifications"
-            value={profile?.pushNotificationsEnabled ? 'Push on' : 'Push off'}
+            value={profile?.pushNotificationsEnabled ? 'On' : 'Off'}
+            onPress={() => setActivePanel('notifications')}
           />
-          <SettingsRow icon="heart" label="Saved places" value={`${savedEvents.length}`} />
-          <SettingsRow icon="grid" label="Hosted listings" value={`${myListings.length}`} />
-          <SettingsRow icon="mail" label="Email updates" value={profile?.emailNotificationsEnabled ? 'On' : 'Off'} />
-          <SettingsRow icon="user" label="Account" value={profile?.phone ?? 'No phone yet'} />
+          <SettingsRow icon="message-circle" label="Inbox" value={unreadCount > 0 ? `${unreadCount} new` : 'Up to date'} />
+          <SettingsActionRow icon="heart" label="Saved places" value={`${savedEvents.length}`} onPress={onOpenSavedTab} />
+          <SettingsActionRow icon="grid" label="Hosted listings" value={`${myListings.length}`} onPress={handleOpenHostedPage} />
+          <SettingsActionRow icon="download" label="My tickets" value={`${tickets.length}`} onPress={handleOpenTicketsPage} />
+          <SettingsActionRow
+            icon="mail"
+            label="Email updates"
+            value={profile?.emailNotificationsEnabled ? 'On' : 'Off'}
+            onPress={() => setActivePanel('notifications')}
+          />
+          <SettingsActionRow
+            icon="user"
+            label="Account"
+            value={profile?.phone ?? 'No phone yet'}
+            onPress={() => setActivePanel('profile')}
+          />
+          <SettingsActionRow
+            icon="settings"
+            label="Password"
+            value="Change"
+            onPress={() => setActivePanel('password')}
+          />
           <SettingsRow icon="info" label="About app" value="Bites & Vibes" />
           <SettingsRow icon="settings" label="Version" value={`v${APP_VERSION}`} />
         </View>
       </View>
+
+      <SettingsModalShell
+        title="Account details"
+        visible={activePanel === 'profile'}
+        onClose={() => setActivePanel(null)}
+        topInset={insets.top}
+      >
+        <View style={styles.profilePanel}>
+          <View style={styles.profilePanelHeader}>
+            <Text style={styles.profilePanelTitle}>Account details</Text>
+            <CompactActionButton icon="image" label="Avatar" onPress={() => void handleAvatarPick()} tone="muted" />
+          </View>
+
+          <View style={styles.profileEditorTop}>
+            <View style={styles.profileEditorAvatar}>
+              <Image
+                source={avatarUpload?.uri ?? profile?.avatar ?? APP_LOGO}
+                contentFit="cover"
+                style={styles.profileAvatarImage}
+                transition={120}
+              />
+            </View>
+            <Text style={styles.profileEditorHint}>Keep your public details fresh for bookings and hosted listings.</Text>
+          </View>
+
+          <CompactField label="Name" placeholder="Your name" value={name} onChangeText={setName} />
+          <CompactField
+            label="Phone"
+            placeholder="+263 77 123 4567"
+            value={phone}
+            onChangeText={setPhone}
+            optional
+            keyboardType="phone-pad"
+          />
+
+          <View style={styles.profilePanelActions}>
+            <CompactActionButton icon="x" label="Close" onPress={() => setActivePanel(null)} tone="muted" />
+            <CompactActionButton
+              icon="check"
+              label={busyKey === 'profile' ? 'Saving...' : 'Save'}
+              onPress={() => void handleSaveProfile()}
+              tone="accent"
+              disabled={busyKey === 'profile'}
+            />
+          </View>
+        </View>
+      </SettingsModalShell>
+
+      <SettingsModalShell
+        title="Password"
+        visible={activePanel === 'password'}
+        onClose={() => setActivePanel(null)}
+        topInset={insets.top}
+      >
+        <View style={styles.profilePanel}>
+          <View style={styles.profilePanelHeader}>
+            <Text style={styles.profilePanelTitle}>Password</Text>
+          </View>
+
+          <CompactField
+            label="Current password"
+            placeholder="Enter current password"
+            value={oldPassword}
+            onChangeText={setOldPassword}
+            optional
+            autoCapitalize="none"
+            secureTextEntry
+          />
+          <CompactField
+            label="New password"
+            placeholder="Choose a new password"
+            value={newPassword}
+            onChangeText={setNewPassword}
+            autoCapitalize="none"
+            secureTextEntry
+          />
+          <CompactField
+            label="Confirm password"
+            placeholder="Repeat the new password"
+            value={confirmPassword}
+            onChangeText={setConfirmPassword}
+            autoCapitalize="none"
+            secureTextEntry
+          />
+
+          <View style={styles.profilePanelActions}>
+            <CompactActionButton icon="x" label="Close" onPress={() => setActivePanel(null)} tone="muted" />
+            <CompactActionButton
+              icon="check"
+              label={busyKey === 'password' ? 'Saving...' : 'Update'}
+              onPress={() => void handleSavePassword()}
+              tone="accent"
+              disabled={busyKey === 'password'}
+            />
+          </View>
+        </View>
+      </SettingsModalShell>
+
+      <SettingsModalShell
+        title="Notifications"
+        visible={activePanel === 'notifications'}
+        onClose={() => setActivePanel(null)}
+        topInset={insets.top}
+      >
+        <View style={styles.modalStack}>
+          <NotificationPreferenceCard
+            busy={busyKey === 'push'}
+            description="Receive device push alerts for tickets, bookings, and updates."
+            enabled={Boolean(profile?.pushNotificationsEnabled)}
+            label="Push notifications"
+            onToggle={() => void handleTogglePush()}
+          />
+          <NotificationPreferenceCard
+            busy={busyKey === 'email'}
+            description="Receive email notices when something important changes."
+            enabled={Boolean(profile?.emailNotificationsEnabled)}
+            label="Email updates"
+            onToggle={() => void handleToggleEmail()}
+          />
+        </View>
+      </SettingsModalShell>
+
+    </View>
+  );
+}
+
+function HostedListingsPage({
+  busy,
+  listings,
+  totalShownCount,
+  query,
+  rawCount,
+  selectedIds,
+  showAll,
+  selectionMode,
+  onBack,
+  onChangeQuery,
+  onCreate,
+  onDeleteSelected,
+  onEdit,
+  onOpen,
+  onSelectAll,
+  onToggleShowAll,
+  onToggleSelect,
+  onToggleSelectionMode,
+}: {
+  busy: boolean;
+  listings: AppEvent[];
+  totalShownCount: number;
+  query: string;
+  rawCount: number;
+  selectedIds: string[];
+  showAll: boolean;
+  selectionMode: boolean;
+  onBack: () => void;
+  onChangeQuery: (value: string) => void;
+  onCreate: () => void;
+  onDeleteSelected: () => void;
+  onEdit: (event: AppEvent) => void;
+  onOpen: (event: AppEvent) => void;
+  onSelectAll: () => void;
+  onToggleShowAll: () => void;
+  onToggleSelect: (eventId: string) => void;
+  onToggleSelectionMode: () => void;
+}) {
+  const allVisibleSelected = listings.length > 0 && listings.every((event) => selectedIds.includes(event.id));
+
+  return (
+    <View style={styles.sectionStack}>
+      <View style={styles.hostedPageHeader}>
+        <CompactActionButton icon="chevron-left" label="Back" onPress={onBack} tone="muted" />
+        <View style={styles.hostedPageTitleWrap}>
+          <Text style={styles.hostedPageTitle}>Hosted listings</Text>
+          <Text style={styles.hostedPageHint}>{rawCount} total listings</Text>
+        </View>
+        <CompactActionButton icon="plus-circle" label="Create" onPress={onCreate} tone="accent" />
+      </View>
+
+      <View style={styles.hostedSearchShell}>
+        <Feather color={theme.colors.textMuted} name="search" size={16} />
+        <TextInput
+          placeholder="Search hosted listings"
+          placeholderTextColor={theme.colors.textSoft}
+          style={styles.hostedSearchInput}
+          value={query}
+          onChangeText={onChangeQuery}
+        />
+      </View>
+
+      <View style={styles.hostedToolbar}>
+        <Text style={styles.hostedToolbarMeta}>
+          {listings.length} shown{totalShownCount > listings.length ? ` of ${totalShownCount}` : ''}{selectionMode ? ` • ${selectedIds.length} selected` : ''}
+        </Text>
+        <View style={styles.hostedToolbarActions}>
+          {totalShownCount > 8 ? (
+            <CompactActionButton
+              icon={showAll ? 'chevron-up' : 'chevron-down'}
+              label={showAll ? 'Less' : 'View all'}
+              onPress={onToggleShowAll}
+              tone="muted"
+            />
+          ) : null}
+          {selectionMode ? (
+            <>
+              <CompactActionButton
+                icon={allVisibleSelected ? 'check-square' : 'square'}
+                label={allVisibleSelected ? 'All selected' : 'Select all'}
+                onPress={onSelectAll}
+                tone="muted"
+              />
+              <CompactActionButton
+                icon="trash-2"
+                label={busy ? 'Deleting...' : 'Delete'}
+                onPress={onDeleteSelected}
+                tone="muted"
+                disabled={busy || selectedIds.length === 0}
+              />
+            </>
+          ) : null}
+          <CompactActionButton
+            icon={selectionMode ? 'x' : 'check-square'}
+            label={selectionMode ? 'Done' : 'Select'}
+            onPress={onToggleSelectionMode}
+            tone="muted"
+          />
+        </View>
+      </View>
+
+      {rawCount === 0 ? (
+        <EmptyState
+          icon="grid"
+          title="No hosted listings yet"
+          copy="Create your first listing, then come back here to manage it."
+          compact
+        />
+      ) : listings.length === 0 ? (
+        <EmptyState
+          icon="search"
+          title="Nothing matched that search"
+          copy="Try a shorter search or clear it to see all your hosted listings again."
+          compact
+        />
+      ) : (
+        <View style={styles.hostedManagerList}>
+          {listings.map((event) => (
+            <HostedListingManagementRow
+              key={`hosted-page-${event.id}`}
+              event={event}
+              selected={selectedIds.includes(event.id)}
+              selectionMode={selectionMode}
+              onEdit={() => onEdit(event)}
+              onOpen={() => onOpen(event)}
+              onToggleSelect={() => onToggleSelect(event.id)}
+            />
+          ))}
+        </View>
+      )}
+    </View>
+  );
+}
+
+function TicketsPage({
+  activeCount,
+  showAll,
+  tickets,
+  totalCount,
+  onBack,
+  onCancelTicket,
+  onOpenTicket,
+  onToggleShowAll,
+  ticketBusyKey,
+}: {
+  activeCount: number;
+  showAll: boolean;
+  tickets: AppTicket[];
+  totalCount: number;
+  onBack: () => void;
+  onCancelTicket: (ticket: AppTicket) => void;
+  onOpenTicket: (ticket: AppTicket) => void;
+  onToggleShowAll: () => void;
+  ticketBusyKey: string | null;
+}) {
+  return (
+    <View style={styles.sectionStack}>
+      <View style={styles.hostedPageHeader}>
+        <CompactActionButton icon="chevron-left" label="Back" onPress={onBack} tone="muted" />
+        <View style={styles.hostedPageTitleWrap}>
+          <Text style={styles.hostedPageTitle}>My tickets</Text>
+          <Text style={styles.hostedPageHint}>{totalCount} total tickets</Text>
+        </View>
+      </View>
+
+      <View style={styles.hostedToolbar}>
+        <Text style={styles.hostedToolbarMeta}>
+          {tickets.length} shown{totalCount > tickets.length ? ` of ${totalCount}` : ''} | {activeCount} active
+        </Text>
+        {totalCount > 8 ? (
+          <CompactActionButton
+            icon={showAll ? 'chevron-up' : 'chevron-down'}
+            label={showAll ? 'Less' : 'View all'}
+            onPress={onToggleShowAll}
+            tone="muted"
+          />
+        ) : null}
+      </View>
+
+      {totalCount === 0 ? (
+        <EmptyState
+          icon="download"
+          title="No tickets saved yet"
+          copy="Book a listing and your real tickets will show up here."
+          compact
+        />
+      ) : (
+        <View style={styles.ticketManagementList}>
+          {tickets.map((ticket) => (
+            <TicketManagementRow
+              key={`tickets-page-${ticket.id}`}
+              title={ticket.event.title}
+              subtitle={ticket.event.venue}
+              meta={`Ref ${ticket.referenceCode} | ${formatTicketDate(ticket.bookedAt)}`}
+              status={ticket.status}
+              primaryActionLabel="Open"
+              onPrimaryAction={() => onOpenTicket(ticket)}
+              secondaryActionLabel={
+                ticket.canCancel ? (ticketBusyKey === `${ticket.id}:cancel` ? 'Cancelling...' : 'Cancel') : undefined
+              }
+              onSecondaryAction={ticket.canCancel ? () => onCancelTicket(ticket) : undefined}
+              secondaryActionDisabled={ticketBusyKey !== null}
+            />
+          ))}
+        </View>
+      )}
+    </View>
+  );
+}
+
+function TicketManagementRow({
+  title,
+  subtitle,
+  meta,
+  status,
+  primaryActionLabel,
+  onPrimaryAction,
+  secondaryActionLabel,
+  onSecondaryAction,
+  secondaryActionTone = 'muted',
+  secondaryActionDisabled = false,
+  tertiaryActionLabel,
+  onTertiaryAction,
+  tertiaryActionDisabled = false,
+}: {
+  title: string;
+  subtitle: string;
+  meta: string;
+  status: AppTicket['status'];
+  primaryActionLabel: string;
+  onPrimaryAction: () => void;
+  secondaryActionLabel?: string;
+  onSecondaryAction?: () => void;
+  secondaryActionTone?: 'accent' | 'muted';
+  secondaryActionDisabled?: boolean;
+  tertiaryActionLabel?: string;
+  onTertiaryAction?: () => void;
+  tertiaryActionDisabled?: boolean;
+}) {
+  return (
+    <View style={styles.ticketManagementRow}>
+      <View style={styles.ticketManagementTop}>
+        <View style={styles.ticketManagementCopy}>
+          <Text numberOfLines={1} style={styles.ticketManagementTitle}>
+            {title}
+          </Text>
+          <Text numberOfLines={1} style={styles.ticketManagementSubtitle}>
+            {subtitle}
+          </Text>
+        </View>
+        <StatusPill status={status} />
+      </View>
+
+      <Text numberOfLines={1} style={styles.ticketManagementMeta}>
+        {meta}
+      </Text>
+
+      <View style={styles.ticketManagementActions}>
+        <CompactActionButton icon="external-link" label={primaryActionLabel} onPress={onPrimaryAction} tone="muted" />
+        {secondaryActionLabel && onSecondaryAction ? (
+          <CompactActionButton
+            icon={secondaryActionTone === 'accent' ? 'check' : 'x'}
+            label={secondaryActionLabel}
+            onPress={onSecondaryAction}
+            tone={secondaryActionTone}
+            disabled={secondaryActionDisabled}
+          />
+        ) : null}
+        {tertiaryActionLabel && onTertiaryAction ? (
+          <CompactActionButton
+            icon="x"
+            label={tertiaryActionLabel}
+            onPress={onTertiaryAction}
+            tone="muted"
+            disabled={tertiaryActionDisabled}
+          />
+        ) : null}
+      </View>
+    </View>
+  );
+}
+
+function HistoryEventRow({
+  event,
+  busy,
+  onOpen,
+  onRemove,
+}: {
+  event: AppEvent;
+  busy: boolean;
+  onOpen: () => void;
+  onRemove: () => void;
+}) {
+  return (
+    <View style={styles.historyRow}>
+      <Pressable onPress={onOpen} style={styles.historyRowPressable}>
+        <View style={styles.historyRowCard}>
+          <Image source={event.image} contentFit="cover" style={styles.historyRowImage} transition={120} />
+          <View style={styles.historyRowCopy}>
+            <Text numberOfLines={1} style={styles.historyRowTitle}>
+              {event.title}
+            </Text>
+            <Text numberOfLines={1} style={styles.historyRowMeta}>
+              {event.venue}  |  {event.day} {event.month}  |  {event.time}
+            </Text>
+          </View>
+        </View>
+      </Pressable>
+      <CompactActionButton
+        icon="x"
+        label={busy ? 'Removing...' : 'Remove'}
+        onPress={onRemove}
+        tone="muted"
+        disabled={busy}
+      />
+    </View>
+  );
+}
+
+function StatusPill({ status }: { status: AppTicket['status'] }) {
+  return (
+    <View
+      style={[
+        styles.ticketStatusPill,
+        status === 'used' ? styles.ticketStatusPillUsed : null,
+        status === 'cancelled' ? styles.ticketStatusPillCancelled : null,
+      ]}
+    >
+      <Text
+        style={[
+          styles.ticketStatusText,
+          status === 'used' ? styles.ticketStatusTextUsed : null,
+          status === 'cancelled' ? styles.ticketStatusTextCancelled : null,
+        ]}
+      >
+        {status}
+      </Text>
+    </View>
+  );
+}
+
+function SettingsModalShell({
+  title,
+  visible,
+  onClose,
+  topInset,
+  children,
+}: {
+  title: string;
+  visible: boolean;
+  onClose: () => void;
+  topInset: number;
+  children: React.ReactNode;
+}) {
+  return (
+    <Modal animationType="slide" onRequestClose={onClose} transparent visible={visible}>
+      <View style={styles.modalBackdrop}>
+        <View style={[styles.modalShell, { marginTop: topInset + 12 }]}>
+          <View style={styles.modalTitleRow}>
+            <Text style={styles.modalTitle}>{title}</Text>
+            <CompactActionButton icon="x" label="Close" onPress={onClose} tone="muted" />
+          </View>
+          <ScrollView contentContainerStyle={styles.modalScrollContent} showsVerticalScrollIndicator={false}>
+            {children}
+          </ScrollView>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function NotificationPreferenceCard({
+  label,
+  description,
+  enabled,
+  busy,
+  onToggle,
+}: {
+  label: string;
+  description: string;
+  enabled: boolean;
+  busy: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <View style={styles.notificationPrefCard}>
+      <View style={styles.notificationPrefCopy}>
+        <Text style={styles.notificationPrefTitle}>{label}</Text>
+        <Text style={styles.notificationPrefDescription}>{description}</Text>
+      </View>
+      <CompactActionButton
+        icon={enabled ? 'x' : 'check'}
+        label={busy ? 'Saving...' : enabled ? 'Turn off' : 'Turn on'}
+        onPress={onToggle}
+        tone={enabled ? 'muted' : 'accent'}
+        disabled={busy}
+      />
     </View>
   );
 }
@@ -1106,6 +2265,7 @@ function CompactField({
   multiline = false,
   keyboardType,
   autoCapitalize = 'sentences',
+  secureTextEntry = false,
 }: {
   label: string;
   value: string;
@@ -1115,6 +2275,7 @@ function CompactField({
   multiline?: boolean;
   keyboardType?: 'default' | 'numeric' | 'phone-pad' | 'email-address';
   autoCapitalize?: 'none' | 'sentences' | 'words' | 'characters';
+  secureTextEntry?: boolean;
 }) {
   return (
     <View style={styles.fieldGroup}>
@@ -1125,6 +2286,7 @@ function CompactField({
         multiline={multiline}
         placeholder={placeholder}
         placeholderTextColor={theme.colors.textSoft}
+        secureTextEntry={secureTextEntry}
         style={[styles.compactInput, multiline && styles.compactInputMultiline]}
         textAlignVertical={multiline ? 'top' : 'center'}
         value={value}
@@ -1153,23 +2315,42 @@ function UploadTile({
   label,
   hint,
   image,
+  remotePreview,
   onPress,
 }: {
   label: string;
   hint: string;
   image: LocalUploadImage | null;
+  remotePreview?: string | null;
   onPress: () => void;
 }) {
   const jelly = useJellyPressAnimation({
     pressedScaleX: 1.018,
     pressedScaleY: 0.962,
   });
+  const isVideo = Boolean(image?.mimeType.startsWith('video/'));
+  const previewSource = image?.previewUri ?? image?.posterImage?.uri ?? (image ? image.uri : remotePreview ?? null);
+  const hintText = image
+    ? isVideo
+      ? `${image.fileSize && image.fileSize > MAX_VIDEO_SOFT_LIMIT_BYTES ? 'Optimized video' : 'Video'} ready`
+      : image.name
+    : remotePreview
+      ? 'Current media'
+      : hint;
 
   return (
     <Pressable onPress={onPress} onPressIn={jelly.onPressIn} onPressOut={jelly.onPressOut} style={styles.uploadCell}>
       <Animated.View style={[styles.uploadTile, jelly.animatedStyle]}>
-        {image ? (
-          <Image source={image.uri} contentFit="cover" style={styles.uploadPreview} transition={120} />
+        {previewSource ? (
+          <View>
+            <Image source={previewSource} contentFit="cover" style={styles.uploadPreview} transition={120} />
+            {isVideo ? (
+              <View style={styles.uploadVideoBadge}>
+                <Feather color={theme.colors.white} name={'play-circle' as FeatherName} size={14} />
+                <Text style={styles.uploadVideoBadgeText}>Video</Text>
+              </View>
+            ) : null}
+          </View>
         ) : (
           <View style={styles.uploadEmpty}>
             <Feather color={theme.colors.accentStrong} name={'plus-circle' as FeatherName} size={18} />
@@ -1178,7 +2359,7 @@ function UploadTile({
 
         <View style={styles.uploadCopy}>
           <Text style={styles.uploadTitle}>{label}</Text>
-          <Text style={styles.uploadHint}>{image ? image.name : hint}</Text>
+          <Text style={styles.uploadHint}>{hintText}</Text>
         </View>
       </Animated.View>
     </Pressable>
@@ -1186,11 +2367,13 @@ function UploadTile({
 }
 
 function GalleryMediaPicker({
+  existingItems,
   items,
   maxItems,
   onAdd,
   onRemove,
 }: {
+  existingItems: AppEvent['media'];
   items: LocalUploadImage[];
   maxItems: number;
   onAdd: () => void;
@@ -1209,13 +2392,16 @@ function GalleryMediaPicker({
             <Feather color={theme.colors.accentStrong} name={'plus-circle' as FeatherName} size={18} />
             <Text style={styles.galleryAddTitle}>Add media</Text>
             <Text style={styles.galleryAddHint}>
-              {items.length}/{maxItems} selected
+              {items.length + existingItems.length}/{maxItems + existingItems.length} showing
             </Text>
           </View>
         </Pressable>
 
-        {items.length > 0 ? (
+        {existingItems.length > 0 || items.length > 0 ? (
           <View style={styles.galleryMediaGrid}>
+            {existingItems.map((item) => (
+              <ExistingGalleryMediaCard key={item.id} item={item} />
+            ))}
             {items.map((item, index) => (
               <GalleryMediaCard key={`${item.name}-${index}`} item={item} onRemove={() => onRemove(index)} />
             ))}
@@ -1234,10 +2420,20 @@ function GalleryMediaCard({
   onRemove: () => void;
 }) {
   const isVideo = item.mimeType.startsWith('video/');
+  const previewSource = item.previewUri ?? item.posterImage?.uri ?? (isVideo ? null : item.uri);
 
   return (
     <View style={styles.galleryMediaCard}>
-      {isVideo ? (
+      {previewSource ? (
+        <View>
+          <Image source={previewSource} contentFit="cover" style={styles.galleryMediaPreview} transition={120} />
+          {isVideo ? (
+            <View style={styles.galleryMediaVideoBadge}>
+              <Feather color={theme.colors.white} name={'play-circle' as FeatherName} size={16} />
+            </View>
+          ) : null}
+        </View>
+      ) : isVideo ? (
         <View style={[styles.galleryMediaPreview, styles.galleryMediaVideoPreview]}>
           <Feather color={theme.colors.accentStrong} name={'play-circle' as FeatherName} size={20} />
         </View>
@@ -1251,6 +2447,38 @@ function GalleryMediaCard({
 
       <Text numberOfLines={2} style={styles.galleryMediaName}>
         {item.name}
+      </Text>
+    </View>
+  );
+}
+
+function ExistingGalleryMediaCard({ item }: { item: AppEvent['media'][number] }) {
+  const previewSource = item.kind === 'video' ? item.preview ?? null : item.source;
+  return (
+    <View style={styles.galleryMediaCard}>
+      {previewSource ? (
+        <View>
+          <Image source={previewSource} contentFit="cover" style={styles.galleryMediaPreview} transition={120} />
+          {item.kind === 'video' ? (
+            <View style={styles.galleryMediaVideoBadge}>
+              <Feather color={theme.colors.white} name={'play-circle' as FeatherName} size={16} />
+            </View>
+          ) : null}
+        </View>
+      ) : item.kind === 'video' ? (
+        <View style={[styles.galleryMediaPreview, styles.galleryMediaVideoPreview]}>
+          <Feather color={theme.colors.accentStrong} name={'play-circle' as FeatherName} size={20} />
+        </View>
+      ) : (
+        <Image source={item.source} contentFit="cover" style={styles.galleryMediaPreview} transition={120} />
+      )}
+
+      <View style={styles.galleryExistingBadge}>
+        <Text style={styles.galleryExistingBadgeText}>Current</Text>
+      </View>
+
+      <Text numberOfLines={2} style={styles.galleryMediaName}>
+        {item.altText ?? 'Existing media'}
       </Text>
     </View>
   );
@@ -1470,29 +2698,6 @@ function CompactChip({
   );
 }
 
-function CompactChoicePill({
-  active,
-  label,
-  onPress,
-}: {
-  active: boolean;
-  label: string;
-  onPress: () => void;
-}) {
-  const jelly = useJellyPressAnimation({
-    pressedScaleX: 1.024,
-    pressedScaleY: 0.94,
-  });
-
-  return (
-    <Pressable onPress={onPress} onPressIn={jelly.onPressIn} onPressOut={jelly.onPressOut} style={styles.priceOptionPressable}>
-      <Animated.View style={[styles.priceOption, active && styles.priceOptionActive, jelly.animatedStyle]}>
-        <Text style={[styles.priceOptionText, active && styles.priceOptionTextActive]}>{label}</Text>
-      </Animated.View>
-    </Pressable>
-  );
-}
-
 function CompactActionButton({
   icon,
   label,
@@ -1535,6 +2740,162 @@ function CompactActionButton({
         <Text style={[styles.actionButtonText, tone === 'accent' ? styles.actionButtonTextAccent : styles.actionButtonTextMuted]}>
           {label}
         </Text>
+      </Animated.View>
+    </Pressable>
+  );
+}
+
+function ManagedListingRow({
+  event,
+  editDisabled = false,
+  editLabel = 'Edit',
+  detailText,
+  onEdit,
+  onOpen,
+}: {
+  event: AppEvent;
+  editDisabled?: boolean;
+  editLabel?: string;
+  detailText?: string | null;
+  onEdit: () => void;
+  onOpen: () => void;
+}) {
+  const jelly = useJellyPressAnimation({
+    pressedScaleX: 1.01,
+    pressedScaleY: 0.97,
+  });
+
+  return (
+    <View style={styles.managedListingRowShell}>
+      <Pressable onPress={onOpen} onPressIn={jelly.onPressIn} onPressOut={jelly.onPressOut} style={styles.managedListingRowPressable}>
+        <Animated.View style={[styles.managedListingRow, jelly.animatedStyle]}>
+          <Image source={event.image} contentFit="cover" style={styles.managedListingImage} transition={120} />
+          <View style={styles.managedListingBody}>
+            <Text numberOfLines={1} style={styles.managedListingTitle}>
+              {event.title}
+            </Text>
+            <Text numberOfLines={1} style={styles.managedListingMeta}>
+              {event.venue}  |  {event.day} {event.month}
+            </Text>
+            {detailText ? (
+              <Text numberOfLines={1} style={styles.managedListingHint}>
+                {detailText}
+              </Text>
+            ) : null}
+          </View>
+        </Animated.View>
+      </Pressable>
+      <View style={styles.managedListingAction}>
+        <CompactActionButton
+          icon={editDisabled ? 'clock' : 'settings'}
+          label={editLabel}
+          onPress={onEdit}
+          tone="muted"
+          disabled={editDisabled}
+        />
+      </View>
+    </View>
+  );
+}
+
+function HostedListingManagementRow({
+  event,
+  selected,
+  selectionMode,
+  onEdit,
+  onOpen,
+  onToggleSelect,
+}: {
+  event: AppEvent;
+  selected: boolean;
+  selectionMode: boolean;
+  onEdit: () => void;
+  onOpen: () => void;
+  onToggleSelect: () => void;
+}) {
+  const jelly = useJellyPressAnimation({
+    pressedScaleX: 1.01,
+    pressedScaleY: 0.97,
+  });
+
+  return (
+    <View style={[styles.hostedListingRow, selected && styles.hostedListingRowSelected]}>
+      <Pressable
+        onPress={selectionMode ? onToggleSelect : onOpen}
+        onPressIn={jelly.onPressIn}
+        onPressOut={jelly.onPressOut}
+        style={styles.hostedListingRowPressable}
+      >
+        <Animated.View style={[styles.hostedListingRowInner, jelly.animatedStyle]}>
+          {selectionMode ? (
+            <View style={[styles.hostedListingSelectCircle, selected && styles.hostedListingSelectCircleActive]}>
+              <Feather
+                color={selected ? theme.colors.white : theme.colors.textSoft}
+                name={selected ? 'check' : 'circle'}
+                size={14}
+              />
+            </View>
+          ) : null}
+
+          <Image source={event.image} contentFit="cover" style={styles.hostedListingImage} transition={120} />
+
+          <View style={styles.hostedListingCopy}>
+            <Text numberOfLines={1} style={styles.hostedListingTitle}>
+              {event.title}
+            </Text>
+            <Text numberOfLines={1} style={styles.hostedListingMeta}>
+              {event.venue}  |  {event.city}
+            </Text>
+            <Text numberOfLines={1} style={styles.hostedListingHint}>
+              {formatEditWindowHint(event)}
+            </Text>
+          </View>
+        </Animated.View>
+      </Pressable>
+
+      {!selectionMode ? (
+        <View style={styles.hostedListingActions}>
+          <CompactActionButton icon="external-link" label="Open" onPress={onOpen} tone="muted" />
+          <CompactActionButton
+            icon={event.ownerCanEdit === false ? 'clock' : 'settings'}
+            label={event.ownerCanEdit === false ? 'Locked' : 'Edit'}
+            onPress={onEdit}
+            tone="muted"
+            disabled={event.ownerCanEdit === false}
+          />
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+function SettingsActionRow({
+  icon,
+  label,
+  value,
+  onPress,
+}: {
+  icon: FeatherName;
+  label: string;
+  value: string;
+  onPress: () => void;
+}) {
+  const jelly = useJellyPressAnimation({
+    pressedScaleX: 1.01,
+    pressedScaleY: 0.97,
+  });
+
+  return (
+    <Pressable onPress={onPress} onPressIn={jelly.onPressIn} onPressOut={jelly.onPressOut}>
+      <Animated.View style={[styles.settingsRow, styles.settingsRowPressable, jelly.animatedStyle]}>
+        <View style={styles.settingsIcon}>
+          <Feather color={theme.colors.accentStrong} name={icon} size={15} />
+        </View>
+        <Text style={styles.settingsLabel}>{label}</Text>
+        <Text numberOfLines={1} style={styles.settingsValue}>
+          {value}
+        </Text>
+        <Feather color={theme.colors.textSoft} name={'chevron-right' as FeatherName} size={13} />
       </Animated.View>
     </Pressable>
   );
@@ -1639,7 +3000,47 @@ function buildInitialDraft(categories: AppCategory[]): CreateDraft {
   };
 }
 
-function validateRequiredStep(draft: CreateDraft) {
+function buildDraftFromEvent(event: AppEvent, categories: AppCategory[]): CreateDraft {
+  const scheduled = buildScheduledAtFromEvent(event);
+
+  return {
+    artist: event.artist,
+    title: event.title,
+    venue: event.venue,
+    city: event.city,
+    categoryId: event.categories[0]?.id ?? categories[0]?.id ?? '',
+    tagsText: '',
+    heroImage: null,
+    ticketImage: null,
+    galleryMedia: [],
+    scheduledAt: scheduled,
+    dateLabel: event.dateLabel,
+    day: event.day,
+    month: event.month,
+    weekday: event.weekday,
+    time: event.time,
+    price: event.price,
+    priceRange: normalizePriceRange(event.price),
+    blurb: event.blurb,
+    about: event.about,
+    highlightsText: event.highlights.join('\n'),
+    address: event.location.address,
+    locationLabel: event.location.label,
+    locationNote: event.location.note,
+    latitude: event.location.latitude ? String(event.location.latitude) : '',
+    longitude: event.location.longitude ? String(event.location.longitude) : '',
+    phone: event.contacts.find((contact) => contact.id === 'phone')?.url.replace(/^tel:/, '') ?? '',
+    email: event.contacts.find((contact) => contact.id === 'mail')?.url.replace(/^mailto:/, '') ?? '',
+    website: event.contacts.find((contact) => contact.id === 'web')?.url ?? '',
+    tiktok: event.socials.find((social) => social.platform === 'tiktok')?.url ?? '',
+    youtube: event.socials.find((social) => social.platform === 'youtube')?.url ?? '',
+    facebook: event.socials.find((social) => social.platform === 'facebook')?.url ?? '',
+    instagram: event.socials.find((social) => social.platform === 'instagram')?.url ?? '',
+    x: event.socials.find((social) => social.platform === 'x')?.url ?? '',
+  };
+}
+
+function validateRequiredStep(draft: CreateDraft, isEditing = false) {
   if (!draft.title.trim()) {
     return 'Add a listing title first.';
   }
@@ -1652,14 +3053,14 @@ function validateRequiredStep(draft: CreateDraft) {
     return 'Pick a primary category.';
   }
 
-  if (!draft.heroImage) {
+  if (!isEditing && !draft.heroImage) {
     return 'Upload the hero image before publishing.';
   }
 
   return null;
 }
 
-function buildCreateInput(draft: CreateDraft): CreateAppEventInput {
+function buildCreateInput(draft: CreateDraft, existingMedia: AppEvent['media'] = []): CreateAppEventInput {
   const title = draft.title.trim();
   const venue = draft.venue.trim();
   const blurb = draft.blurb.trim();
@@ -1674,7 +3075,7 @@ function buildCreateInput(draft: CreateDraft): CreateAppEventInput {
   const fallbackTime = draft.time.trim() || 'TBA';
 
   return {
-    artist: draft.artist.trim(),
+    artist: categorySupportsArtist(draft.categoryId) ? draft.artist.trim() : '',
     title,
     venue,
     city: draft.city.trim(),
@@ -1698,9 +3099,10 @@ function buildCreateInput(draft: CreateDraft): CreateAppEventInput {
     phone: draft.phone.trim(),
     email: draft.email.trim(),
     website,
-    heroImage: draft.heroImage as LocalUploadImage,
+    heroImage: draft.heroImage,
     ticketImage: draft.ticketImage,
     galleryMedia: draft.galleryMedia,
+    existingMedia,
     socials: {
       tiktok: normalizeUrl(draft.tiktok),
       youtube: normalizeUrl(draft.youtube),
@@ -1718,6 +3120,28 @@ function splitCommaList(value: string) {
     .filter(Boolean);
 }
 
+function buildScheduledAtFromEvent(event: AppEvent) {
+  const parsed = new Date(`${event.dateLabel} ${event.time}`);
+  return Number.isNaN(parsed.getTime()) ? '' : parsed.toISOString();
+}
+
+function normalizePriceRange(value: string): PriceRange {
+  if (value.includes('$$$$')) {
+    return '$$$$';
+  }
+  if (value.includes('$$$')) {
+    return '$$$';
+  }
+  if (value.includes('$$')) {
+    return '$$';
+  }
+  return '$';
+}
+
+function categorySupportsArtist(categoryId: string) {
+  return ['bars-lounges', 'chill-spots'].includes(categoryId);
+}
+
 function splitLines(value: string) {
   return value
     .split('\n')
@@ -1731,7 +3155,15 @@ function parseOptionalNumber(value: string) {
   }
 
   const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
+  return Number.isFinite(parsed) ? clampCoordinatePrecision(parsed) : null;
+}
+
+function clampCoordinatePrecision(value: number) {
+  return Number(value.toFixed(6));
+}
+
+function formatCoordinate(value: number) {
+  return clampCoordinatePrecision(value).toFixed(6);
 }
 
 function normalizeUrl(value: string) {
@@ -1747,19 +3179,43 @@ function normalizeUrl(value: string) {
   return `https://${trimmed}`;
 }
 
-function toLocalUploadImage(asset: ImagePicker.ImagePickerAsset, prefix: string): LocalUploadImage {
+async function toLocalUploadImage(asset: ImagePicker.ImagePickerAsset, prefix: string): Promise<LocalUploadImage> {
   const extension = guessExtension(asset.mimeType);
   const webFile =
     typeof File !== 'undefined'
       ? ((asset as ImagePicker.ImagePickerAsset & { file?: File | null }).file ?? null)
       : null;
+  const mimeType = asset.mimeType ?? 'image/jpeg';
+  const isVideo = mimeType.startsWith('video/');
+  const posterImage = isVideo ? await buildVideoPosterUpload(asset, prefix) : null;
 
   return {
     uri: asset.uri,
     name: asset.fileName ?? `${prefix}-${Date.now()}${extension}`,
-    mimeType: asset.mimeType ?? 'image/jpeg',
+    mimeType,
     webFile,
+    previewUri: posterImage?.uri ?? null,
+    fileSize: asset.fileSize ?? null,
+    durationMs: asset.duration ?? null,
+    posterImage,
   };
+}
+
+async function buildVideoPosterUpload(asset: ImagePicker.ImagePickerAsset, prefix: string) {
+  try {
+    const thumbnail = await VideoThumbnails.getThumbnailAsync(asset.uri, {
+      time: Math.max(320, Math.min(asset.duration ?? 1200, 1600)),
+    });
+
+    return {
+      uri: thumbnail.uri,
+      name: `${prefix}-poster-${Date.now()}.jpg`,
+      mimeType: 'image/jpeg',
+      webFile: null,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function guessExtension(mimeType?: string | null) {
@@ -1854,6 +3310,38 @@ function formatRelativeDate(value: string) {
     day: 'numeric',
     month: 'short',
   });
+}
+
+function formatTicketDate(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return 'Recently';
+  }
+
+  return date.toLocaleDateString(undefined, {
+    day: 'numeric',
+    month: 'short',
+  });
+}
+
+function formatEditWindowHint(event: AppEvent) {
+  if (event.ownerCanEdit === false) {
+    return 'Edit window closed';
+  }
+
+  if (!event.ownerEditExpiresAt) {
+    return 'Editable now';
+  }
+
+  const expiresAt = new Date(event.ownerEditExpiresAt);
+  if (Number.isNaN(expiresAt.getTime())) {
+    return 'Editable now';
+  }
+
+  return `Edit until ${expiresAt.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })} ${expiresAt.toLocaleTimeString(undefined, {
+    hour: 'numeric',
+    minute: '2-digit',
+  })}`;
 }
 
 const styles = StyleSheet.create({
@@ -2275,7 +3763,7 @@ const styles = StyleSheet.create({
   },
   uploadRow: {
     flexDirection: 'row',
-    gap: 10,
+    gap: 8,
   },
   uploadCell: {
     flex: 1,
@@ -2292,6 +3780,26 @@ const styles = StyleSheet.create({
     width: '100%',
     height: 116,
     borderRadius: 12,
+  },
+  uploadVideoBadge: {
+    position: 'absolute',
+    top: 10,
+    left: 10,
+    minHeight: 24,
+    paddingHorizontal: 10,
+    borderRadius: 999,
+    backgroundColor: 'rgba(8,10,14,0.78)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  uploadVideoBadgeText: {
+    color: theme.colors.white,
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 0.2,
   },
   uploadEmpty: {
     width: '100%',
@@ -2371,6 +3879,19 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  galleryMediaVideoBadge: {
+    position: 'absolute',
+    right: 6,
+    bottom: 6,
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: 'rgba(8,10,14,0.82)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   galleryRemoveButton: {
     position: 'absolute',
     top: 6,
@@ -2387,6 +3908,21 @@ const styles = StyleSheet.create({
     fontSize: 10,
     lineHeight: 14,
     fontWeight: '700',
+  },
+  galleryExistingBadge: {
+    position: 'absolute',
+    top: 6,
+    left: 6,
+    borderRadius: 999,
+    backgroundColor: 'rgba(8,10,14,0.82)',
+    paddingHorizontal: 7,
+    paddingVertical: 4,
+  },
+  galleryExistingBadgeText: {
+    color: theme.colors.white,
+    fontSize: 9,
+    fontWeight: '800',
+    letterSpacing: 0.3,
   },
   progressCard: {
     borderRadius: 15,
@@ -2487,14 +4023,37 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 17,
   },
-  formActions: {
+  inlineSuccess: {
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(139,226,139,0.24)',
+    backgroundColor: 'rgba(139,226,139,0.08)',
+    paddingHorizontal: 12,
+    paddingVertical: 11,
     flexDirection: 'row',
     alignItems: 'center',
+    gap: 8,
+  },
+  inlineSuccessText: {
+    flex: 1,
+    color: theme.colors.text,
+    fontSize: 12,
+    lineHeight: 17,
+  },
+  formActions: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
     justifyContent: 'space-between',
+    flexWrap: 'wrap',
+    rowGap: 8,
     gap: 10,
   },
   formActionRight: {
     flexDirection: 'row',
+    flex: 1,
+    flexWrap: 'wrap',
+    justifyContent: 'flex-end',
+    rowGap: 8,
     gap: 8,
   },
   actionSpacer: {
@@ -2502,15 +4061,18 @@ const styles = StyleSheet.create({
   },
   actionButtonPressable: {
     alignSelf: 'flex-start',
+    flexShrink: 1,
+    maxWidth: '100%',
   },
   actionButton: {
-    minHeight: 42,
-    borderRadius: 14,
-    paddingHorizontal: 14,
+    minHeight: 38,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    maxWidth: '100%',
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 8,
+    gap: 6,
   },
   actionButtonAccent: {
     backgroundColor: theme.colors.accent,
@@ -2524,7 +4086,7 @@ const styles = StyleSheet.create({
     opacity: 0.55,
   },
   actionButtonText: {
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: '800',
   },
   actionButtonTextAccent: {
@@ -2534,12 +4096,12 @@ const styles = StyleSheet.create({
     color: theme.colors.textMuted,
   },
   profileCard: {
-    borderRadius: 18,
+    borderRadius: 12,
     borderWidth: 1,
     borderColor: theme.colors.border,
     backgroundColor: theme.colors.surfaceStrong,
-    padding: 14,
-    gap: 12,
+    padding: 12,
+    gap: 10,
   },
   profileTopRow: {
     flexDirection: 'row',
@@ -2578,15 +4140,62 @@ const styles = StyleSheet.create({
   },
   profileActionRow: {
     paddingTop: 2,
-    alignItems: 'flex-start',
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 8,
   },
-  miniStatCard: {
-    flex: 1,
-    borderRadius: 14,
+  profilePanel: {
+    borderRadius: 12,
     borderWidth: 1,
     borderColor: theme.colors.border,
     backgroundColor: 'rgba(255,255,255,0.04)',
-    paddingVertical: 10,
+    padding: 12,
+    gap: 10,
+  },
+  profilePanelHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  profilePanelTitle: {
+    color: theme.colors.text,
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  profileEditorTop: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  profileEditorAvatar: {
+    width: 54,
+    height: 54,
+    borderRadius: 14,
+    overflow: 'hidden',
+    backgroundColor: theme.colors.surfaceMuted,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+  },
+  profileEditorHint: {
+    flex: 1,
+    color: theme.colors.textMuted,
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  profilePanelActions: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  miniStatCard: {
+    flex: 1,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    paddingVertical: 9,
     alignItems: 'center',
     justifyContent: 'center',
     gap: 3,
@@ -2606,14 +4215,87 @@ const styles = StyleSheet.create({
   profileSection: {
     gap: 10,
   },
+  hostingSummaryCard: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  hostedPageHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  hostedPageTitleWrap: {
+    flex: 1,
+    gap: 3,
+  },
+  hostedPageTitle: {
+    color: theme.colors.text,
+    fontSize: 20,
+    fontWeight: '800',
+    letterSpacing: 0.1,
+  },
+  hostedPageHint: {
+    color: theme.colors.textSoft,
+    fontSize: 10,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  hostedSearchShell: {
+    minHeight: 42,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    paddingHorizontal: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  hostedSearchInput: {
+    flex: 1,
+    color: theme.colors.text,
+    fontSize: 13,
+    fontWeight: '600',
+    paddingVertical: 0,
+  },
+  hostedToolbar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+    flexWrap: 'wrap',
+  },
+  hostedToolbarMeta: {
+    color: theme.colors.textSoft,
+    fontSize: 11,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  hostedToolbarActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    flexWrap: 'wrap',
+    justifyContent: 'flex-end',
+  },
+  hostedManagerList: {
+    gap: 10,
+  },
   compactSectionHeader: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
+    gap: 10,
+  },
+  compactSectionCopy: {
+    flex: 1,
+    gap: 3,
   },
   compactSectionTitle: {
     color: theme.colors.text,
-    fontSize: 16,
+    fontSize: 15,
     fontWeight: '800',
   },
   compactSectionHint: {
@@ -2623,9 +4305,201 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
     letterSpacing: 0.5,
   },
+  sectionHeaderActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  ticketManagementList: {
+    gap: 8,
+  },
+  ticketManagementRow: {
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    paddingHorizontal: 11,
+    paddingVertical: 10,
+    gap: 8,
+  },
+  ticketManagementTop: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 10,
+  },
+  ticketManagementCopy: {
+    flex: 1,
+    gap: 4,
+  },
+  ticketManagementTitle: {
+    color: theme.colors.text,
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  ticketManagementSubtitle: {
+    color: theme.colors.textMuted,
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  ticketManagementMeta: {
+    color: theme.colors.textSoft,
+    fontSize: 11,
+    lineHeight: 15,
+  },
+  ticketManagementActions: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  ticketStatusPill: {
+    minHeight: 24,
+    paddingHorizontal: 9,
+    borderRadius: 8,
+    backgroundColor: 'rgba(88,195,132,0.14)',
+    borderWidth: 1,
+    borderColor: 'rgba(88,195,132,0.26)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  ticketStatusPillUsed: {
+    backgroundColor: 'rgba(255,184,77,0.14)',
+    borderColor: 'rgba(255,184,77,0.26)',
+  },
+  ticketStatusPillCancelled: {
+    backgroundColor: 'rgba(255,107,61,0.14)',
+    borderColor: 'rgba(255,107,61,0.26)',
+  },
+  ticketStatusText: {
+    color: '#8BE28B',
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 0.5,
+    textTransform: 'uppercase',
+  },
+  ticketStatusTextUsed: {
+    color: '#FFCF76',
+  },
+  ticketStatusTextCancelled: {
+    color: theme.colors.accentStrong,
+  },
   ticketRail: {
     gap: 10,
     paddingRight: 10,
+  },
+  managedListingStack: {
+    gap: 8,
+  },
+  managedListingRowShell: {
+    flexDirection: 'row',
+    alignItems: 'stretch',
+    gap: 8,
+  },
+  managedListingRowPressable: {
+    flex: 1,
+  },
+  managedListingRow: {
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    padding: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  managedListingImage: {
+    width: 54,
+    height: 54,
+    borderRadius: 9,
+    backgroundColor: theme.colors.surfaceMuted,
+  },
+  managedListingBody: {
+    flex: 1,
+    gap: 4,
+  },
+  managedListingAction: {
+    justifyContent: 'center',
+  },
+  managedListingTitle: {
+    color: theme.colors.text,
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  managedListingMeta: {
+    color: theme.colors.textMuted,
+    fontSize: 11,
+    lineHeight: 15,
+  },
+  managedListingHint: {
+    color: theme.colors.textSoft,
+    fontSize: 10,
+    lineHeight: 14,
+    fontWeight: '700',
+  },
+  hostedListingRow: {
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    padding: 9,
+    gap: 8,
+  },
+  hostedListingRowSelected: {
+    borderColor: 'rgba(255,107,61,0.34)',
+    backgroundColor: 'rgba(255,107,61,0.08)',
+  },
+  hostedListingRowPressable: {
+    alignSelf: 'stretch',
+  },
+  hostedListingRowInner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  hostedListingSelectCircle: {
+    width: 24,
+    height: 24,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  hostedListingSelectCircleActive: {
+    backgroundColor: theme.colors.accentSoft,
+    borderColor: 'rgba(255,107,61,0.34)',
+  },
+  hostedListingImage: {
+    width: 58,
+    height: 58,
+    borderRadius: 13,
+    backgroundColor: theme.colors.surfaceMuted,
+  },
+  hostedListingCopy: {
+    flex: 1,
+    gap: 4,
+  },
+  hostedListingTitle: {
+    color: theme.colors.text,
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  hostedListingMeta: {
+    color: theme.colors.textMuted,
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  hostedListingHint: {
+    color: theme.colors.textSoft,
+    fontSize: 10,
+    lineHeight: 14,
+    fontWeight: '700',
+  },
+  hostedListingActions: {
+    flexDirection: 'row',
+    gap: 8,
+    flexWrap: 'wrap',
   },
   ticketCard: {
     width: 188,
@@ -2660,21 +4534,131 @@ const styles = StyleSheet.create({
   settingsStack: {
     gap: 8,
   },
-  settingsRow: {
-    minHeight: 48,
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(8,10,14,0.76)',
+    paddingHorizontal: 12,
+    paddingBottom: 16,
+  },
+  modalShell: {
+    flex: 1,
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: '#111621',
+    paddingHorizontal: 14,
+    paddingTop: 14,
+    ...shadow,
+  },
+  modalTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+    paddingBottom: 10,
+  },
+  modalTitle: {
+    flex: 1,
+    color: theme.colors.text,
+    fontSize: 18,
+    fontWeight: '800',
+  },
+  modalScrollContent: {
+    paddingBottom: 20,
+    gap: 12,
+  },
+  modalStack: {
+    gap: 12,
+  },
+  modalHeaderActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+  },
+  notificationPrefCard: {
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    padding: 12,
+    gap: 10,
+  },
+  notificationPrefCopy: {
+    gap: 4,
+  },
+  notificationPrefTitle: {
+    color: theme.colors.text,
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  notificationPrefDescription: {
+    color: theme.colors.textMuted,
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  historyList: {
+    gap: 8,
+  },
+  historyRow: {
+    flexDirection: 'row',
+    alignItems: 'stretch',
+    gap: 8,
+  },
+  historyRowPressable: {
+    flex: 1,
+  },
+  historyRowCard: {
     borderRadius: 14,
     borderWidth: 1,
     borderColor: theme.colors.border,
     backgroundColor: 'rgba(255,255,255,0.04)',
-    paddingHorizontal: 12,
+    padding: 10,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
   },
-  settingsIcon: {
-    width: 30,
-    height: 30,
+  historyRowImage: {
+    width: 48,
+    height: 48,
+    borderRadius: 11,
+    backgroundColor: theme.colors.surfaceMuted,
+  },
+  historyRowCopy: {
+    flex: 1,
+    gap: 4,
+  },
+  historyRowTitle: {
+    color: theme.colors.text,
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  historyRowMeta: {
+    color: theme.colors.textMuted,
+    fontSize: 11,
+    lineHeight: 15,
+  },
+  categoryShortcutWrap: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  settingsRow: {
+    minHeight: 42,
     borderRadius: 10,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    paddingHorizontal: 11,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  settingsRowPressable: {
+    paddingRight: 8,
+  },
+  settingsIcon: {
+    width: 26,
+    height: 26,
+    borderRadius: 8,
     backgroundColor: 'rgba(255,107,61,0.1)',
     alignItems: 'center',
     justifyContent: 'center',
@@ -2682,12 +4666,12 @@ const styles = StyleSheet.create({
   settingsLabel: {
     flex: 1,
     color: theme.colors.text,
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: '700',
   },
   settingsValue: {
     color: theme.colors.textMuted,
-    fontSize: 12,
+    fontSize: 11,
     fontWeight: '600',
   },
   emptyState: {

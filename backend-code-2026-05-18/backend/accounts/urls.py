@@ -3,7 +3,7 @@ from .views import (
     UserRegistrationView, user_profile, update_profile,
     change_password, password_reset_request, password_reset_confirm,
     google_login, google_oauth_url, google_oauth_callback, email_login_request, email_login_verify,
-    subscribe_newsletter, app_session
+    subscribe_newsletter, app_session, register_push_device, unregister_push_device
 )
 
 urlpatterns = [
@@ -20,5 +20,7 @@ urlpatterns = [
     path('change-password/', change_password, name='change-password'),
     path('password-reset/', password_reset_request, name='password-reset-request'),
     path('password-reset/confirm/', password_reset_confirm, name='password-reset-confirm'),
+    path('push/register/', register_push_device, name='push-register'),
+    path('push/unregister/', unregister_push_device, name='push-unregister'),
     path('newsletter/subscribe/', subscribe_newsletter, name='newsletter-subscribe'),
 ]

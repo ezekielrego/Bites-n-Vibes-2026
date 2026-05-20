@@ -10,12 +10,16 @@ import {
   AppEventCategory,
   AppIconName,
   AppNotification,
+  AppTicket,
   AppUser,
+  ChangePasswordInput,
   CreateAppCommentInput,
   CreateAppEventInput,
   EventContactLink,
   EventSocialLink,
+  LocalUploadFile,
   LocalUploadImage,
+  UpdateProfileInput,
 } from './types';
 import { API_ROOT, BACKEND_ORIGIN } from './config';
 import {
@@ -76,8 +80,11 @@ type BackendListing = {
   rating_count?: number;
   comment_count?: number;
   owner_name?: string | null;
+  owner_can_edit?: boolean;
+  owner_edit_expires_at?: string | null;
   created_at?: string;
   user_has_saved?: boolean;
+  user_has_ticket?: boolean;
   app_data?: Record<string, unknown> | null;
   images?: BackendListingMedia[];
 };
@@ -158,9 +165,28 @@ type BackendBootstrapResponse = {
   listings: BackendListing[];
   my_listings?: BackendListing[];
   history?: BackendListing[];
+  tickets?: BackendTicket[];
+  received_tickets?: BackendTicket[];
   notifications?: BackendNotification[];
   unread_notification_count?: number;
   profile?: BackendUser | null;
+};
+
+type BackendTicket = {
+  id: number;
+  listing?: BackendListing;
+  listing_id: number;
+  listing_name?: string | null;
+  buyer_name?: string | null;
+  buyer_email?: string | null;
+  reference_code: string;
+  qr_payload: string;
+  status: AppTicket['status'];
+  can_cancel?: boolean;
+  can_mark_used?: boolean;
+  can_manage?: boolean;
+  booked_at: string;
+  updated_at: string;
 };
 
 type AuthResponse = {
@@ -239,6 +265,21 @@ export async function requestEmailMagicLink(email: string, redirectTo: string) {
   });
 }
 
+export async function requestPasswordReset(email: string, redirectTo: string) {
+  return postJson<MessageResponse>('/auth/password-reset/', {
+    email,
+    redirect_to: redirectTo,
+  });
+}
+
+export async function confirmPasswordReset(token: string, password: string, password2: string) {
+  return postJson<MessageResponse>('/auth/password-reset/confirm/', {
+    token,
+    password,
+    password2,
+  });
+}
+
 export async function signInWithPassword(email: string, password: string) {
   const response = await fetch(`${API_ROOT}/auth/token/`, {
     method: 'POST',
@@ -277,6 +318,53 @@ export async function getGoogleAuthUrl(redirectTo: string) {
 export async function fetchUserProfile() {
   const payload = await apiFetchJson<BackendUser>('/auth/profile/');
   return mapUser(payload);
+}
+
+export async function updateUserProfile(input: UpdateProfileInput) {
+  if (input.avatar) {
+    const formData = new FormData();
+    formData.append('name', input.name.trim());
+    formData.append('phone', input.phone.trim());
+    formData.append('email_notifications_enabled', input.emailNotificationsEnabled ? 'true' : 'false');
+    formData.append('push_notifications_enabled', input.pushNotificationsEnabled ? 'true' : 'false');
+    appendUploadFile(formData, 'avatar', input.avatar);
+
+    const payload = await uploadFormDataJson<BackendUser>('/auth/profile/update/', formData, undefined, 'PATCH');
+    return mapUser(payload);
+  }
+
+  const payload = await apiFetchJson<BackendUser>('/auth/profile/update/', {
+    method: 'PATCH',
+    body: JSON.stringify({
+      name: input.name.trim(),
+      phone: input.phone.trim(),
+      email_notifications_enabled: input.emailNotificationsEnabled,
+      push_notifications_enabled: input.pushNotificationsEnabled,
+    }),
+  });
+  return mapUser(payload);
+}
+
+export async function changeUserPassword(input: ChangePasswordInput) {
+  return postJson<MessageResponse>('/auth/change-password/', {
+    old_password: input.oldPassword?.trim() || '',
+    new_password: input.newPassword,
+    new_password2: input.confirmPassword,
+  });
+}
+
+export async function registerPushDevice(token: string, platform: string, deviceName?: string) {
+  return postJson<MessageResponse>('/auth/push/register/', {
+    token,
+    platform,
+    device_name: deviceName ?? '',
+  });
+}
+
+export async function unregisterPushDevice(token?: string) {
+  return postJson<MessageResponse>('/auth/push/unregister/', {
+    token: token ?? '',
+  });
 }
 
 export async function signOut() {
@@ -419,6 +507,48 @@ export async function markAllNotificationsRead() {
   });
 }
 
+export async function bookEventTicket(eventId: string, categories: AppCategory[]) {
+  const response = await apiFetchJson<{ created: boolean; ticket: BackendTicket }>(`/listings/${eventId}/book/`, {
+    method: 'POST',
+  });
+  const categoryLookup = new Map(categories.map((category) => [category.id, category]));
+  return mapTicket(response.ticket, categoryLookup);
+}
+
+export async function cancelTicket(ticketId: string, categories: AppCategory[]) {
+  const response = await apiFetchJson<{ message?: string; ticket: BackendTicket }>(`/listings/tickets/${ticketId}/cancel/`, {
+    method: 'POST',
+  });
+  const categoryLookup = new Map(categories.map((category) => [category.id, category]));
+  return {
+    message: response.message ?? 'Ticket cancelled.',
+    ticket: mapTicket(response.ticket, categoryLookup),
+  };
+}
+
+export async function markTicketUsed(ticketId: string, categories: AppCategory[]) {
+  const response = await apiFetchJson<{ message?: string; ticket: BackendTicket }>(`/listings/tickets/${ticketId}/mark-used/`, {
+    method: 'POST',
+  });
+  const categoryLookup = new Map(categories.map((category) => [category.id, category]));
+  return {
+    message: response.message ?? 'Ticket marked as used.',
+    ticket: mapTicket(response.ticket, categoryLookup),
+  };
+}
+
+export async function clearHistory() {
+  return apiFetchJson<{ message: string; deleted_count: number }>('/listings/clear-history/', {
+    method: 'POST',
+  });
+}
+
+export async function removeHistoryItem(eventId: string) {
+  return apiFetchJson<{ listing_id: number; removed: boolean }>(`/listings/${eventId}/remove-from-history/`, {
+    method: 'POST',
+  });
+}
+
 export async function createEventListing(
   input: CreateAppEventInput,
   categories: AppCategory[],
@@ -427,6 +557,10 @@ export async function createEventListing(
     onStageChange?: (stage: string) => void;
   } = {},
 ) {
+  if (!input.heroImage) {
+    throw new Error('Upload the hero image before publishing.');
+  }
+
   const primaryCategory = categories.find((category) => category.id === input.categoryId);
   if (!primaryCategory) {
     throw new Error('Select a valid category before publishing.');
@@ -500,6 +634,114 @@ export async function createEventListing(
   callbacks.onProgress?.(1);
   const categoryLookup = new Map(categories.map((category) => [category.id, category]));
   return mapListingToEvent(hydrated, categoryLookup);
+}
+
+export async function updateEventListing(
+  eventId: string,
+  input: CreateAppEventInput,
+  categories: AppCategory[],
+  existingEvent: AppEvent,
+  callbacks: {
+    onProgress?: (progress: number) => void;
+    onStageChange?: (stage: string) => void;
+  } = {},
+) {
+  const primaryCategory = categories.find((category) => category.id === input.categoryId);
+  if (!primaryCategory) {
+    throw new Error('Select a valid category before saving.');
+  }
+
+  const socials = buildSocials(input);
+  const contacts = buildContacts(input);
+  const fallbackAddress = [input.venue, input.city].filter(Boolean).join(', ') || input.venue;
+  const preservedMedia = (input.existingMedia ?? existingEvent.media).map((media, index) => ({
+    image_type: media.role,
+    media_kind: media.kind,
+    image_url: media.kind === 'image' ? media.source : media.preview ?? existingEvent.image,
+    video_url: media.kind === 'video' ? media.source : null,
+    alt_text: media.altText ?? `${input.title} media`,
+    is_primary: media.role === 'hero' && media.kind === 'image',
+    order: index,
+  }));
+
+  const payload = {
+    listing_kind: 'event',
+    name: input.venue,
+    category: resolveCategoryNumericId(primaryCategory.id, categories),
+    description: input.about || input.blurb || `${input.title} at ${input.venue}`,
+    address: input.address || fallbackAddress,
+    latitude: input.latitude,
+    longitude: input.longitude,
+    phone: input.phone || null,
+    website: input.website || null,
+    email: input.email || null,
+    price_range: input.priceRange,
+    display_price: input.price,
+    images_payload: preservedMedia,
+    app_data: {
+      artist: input.artist,
+      title: input.title,
+      venue: input.venue,
+      city: input.city,
+      date_label: input.dateLabel,
+      day: input.day,
+      month: input.month,
+      weekday: input.weekday,
+      time: input.time,
+      price: input.price,
+      blurb: input.blurb,
+      highlights: input.highlights,
+      location: {
+        label: input.locationLabel,
+        address: input.address || fallbackAddress,
+        note: input.locationNote,
+        latitude_delta: existingEvent.location.latitudeDelta,
+        longitude_delta: existingEvent.location.longitudeDelta,
+      },
+      contacts,
+      socials,
+    },
+    tag_names: input.tags,
+  };
+
+  callbacks.onStageChange?.('Saving changes');
+  callbacks.onProgress?.(0.08);
+
+  await apiFetchJson<BackendListing>(`/listings/${eventId}/`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  });
+
+  const hasNewMedia = Boolean(input.heroImage || input.ticketImage || input.galleryMedia.length > 0);
+  if (hasNewMedia) {
+    callbacks.onStageChange?.('Uploading new media');
+    callbacks.onProgress?.(0.24);
+    await uploadListingMedia(
+      Number(eventId),
+      {
+        ...input,
+        heroImage: input.heroImage ?? null,
+      } as CreateAppEventInput,
+      (ratio) => callbacks.onProgress?.(0.24 + ratio * 0.58),
+      {
+        includeHero: Boolean(input.heroImage),
+        includeTicket: Boolean(input.ticketImage),
+      },
+    );
+  }
+
+  callbacks.onStageChange?.('Finishing');
+  callbacks.onProgress?.(0.94);
+  const hydrated = await apiFetchJson<BackendListing>(`/listings/${eventId}/`);
+  callbacks.onProgress?.(1);
+  const categoryLookup = new Map(categories.map((category) => [category.id, category]));
+  return mapListingToEvent(hydrated, categoryLookup);
+}
+
+export async function deleteEventListing(eventId: string) {
+  await apiFetch(`/listings/${eventId}/`, {
+    method: 'DELETE',
+  });
 }
 
 async function apiFetchJson<T>(path: string, init: RequestInit = {}) {
@@ -584,7 +826,7 @@ function buildHeaders(
   return headers;
 }
 
-function appendUploadFile(formData: FormData, fieldName: string, file: LocalUploadImage) {
+function appendUploadFile(formData: FormData, fieldName: string, file: LocalUploadFile) {
   if (file.webFile) {
     formData.append(fieldName, file.webFile);
     return;
@@ -678,10 +920,15 @@ function flattenApiErrorValues(value: unknown): string[] {
   return [];
 }
 
-async function uploadFormDataJson<T>(path: string, formData: FormData, onProgress?: (progress: number) => void) {
+async function uploadFormDataJson<T>(
+  path: string,
+  formData: FormData,
+  onProgress?: (progress: number) => void,
+  method: 'POST' | 'PATCH' = 'POST',
+) {
   return new Promise<T>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', `${API_ROOT}${path}`);
+    xhr.open(method, `${API_ROOT}${path}`);
 
     const headers = buildHeaders(undefined, { includeJsonContentType: false });
     headers.forEach((value, key) => {
@@ -746,6 +993,10 @@ async function uploadListingMedia(
   listingId: number,
   input: CreateAppEventInput,
   onProgress?: (progress: number) => void,
+  options: {
+    includeHero?: boolean;
+    includeTicket?: boolean;
+  } = {},
 ) {
   const files: Array<{
     file: LocalUploadImage;
@@ -753,23 +1004,25 @@ async function uploadListingMedia(
     altText: string;
     isPrimary: boolean;
     order: number;
-  }> = [
-    {
+  }> = [];
+
+  if ((options.includeHero ?? true) && input.heroImage) {
+    files.push({
       file: input.heroImage,
       imageType: 'hero',
-      altText: `${input.title} hero image`,
+      altText: `${input.title} hero media`,
       isPrimary: true,
-      order: 0,
-    },
-  ];
+      order: files.length,
+    });
+  }
 
-  if (input.ticketImage) {
+  if ((options.includeTicket ?? true) && input.ticketImage) {
     files.push({
       file: input.ticketImage,
       imageType: 'ticket',
       altText: `${input.title} ticket art`,
       isPrimary: false,
-      order: 1,
+      order: files.length,
     });
   }
 
@@ -787,12 +1040,20 @@ async function uploadListingMedia(
 
   files.forEach((entry, index) => {
     appendUploadFile(formData, 'media', entry.file);
+    if (entry.file.posterImage) {
+      appendUploadFile(formData, `poster_${index}`, entry.file.posterImage);
+    }
     formData.append(`alt_text_${index}`, entry.altText);
     formData.append(`image_type_${index}`, entry.imageType);
     formData.append(`media_kind_${index}`, isVideoUpload(entry.file) ? 'video' : 'image');
     formData.append(`is_primary_${index}`, entry.isPrimary ? 'true' : 'false');
     formData.append(`order_${index}`, String(entry.order));
   });
+
+  if (files.length === 0) {
+    onProgress?.(1);
+    return;
+  }
 
   await uploadFormDataJson(`/listings/${listingId}/upload_images/`, formData, onProgress);
 }
@@ -806,6 +1067,8 @@ function mapBootstrap(payload: BackendBootstrapResponse): AppBootstrap {
     events: (payload.listings ?? []).map((listing) => mapListingToEvent(listing, categoryLookup)),
     myListings: (payload.my_listings ?? []).map((listing) => mapListingToEvent(listing, categoryLookup)),
     history: (payload.history ?? []).map((listing) => mapListingToEvent(listing, categoryLookup)),
+    tickets: (payload.tickets ?? []).map((ticket) => mapTicket(ticket, categoryLookup)),
+    receivedTickets: (payload.received_tickets ?? []).map((ticket) => mapTicket(ticket, categoryLookup)),
     notifications: (payload.notifications ?? []).map(mapNotification),
     unreadNotificationCount: payload.unread_notification_count ?? 0,
     profile: payload.profile ? mapUser(payload.profile) : null,
@@ -844,7 +1107,9 @@ function mapListingToEvent(listing: BackendListing, categoryLookup: Map<string, 
   const socials = readSocials(appData.socials);
   const ratingFromBackend = toNumber(listing.average_rating);
   const rating = ratingFromBackend && ratingFromBackend > 0 ? ratingFromBackend : toNumber(appData.rating) ?? 0;
+  const heroMedia = media.find((item) => item.role === 'hero');
   const heroImage =
+    (heroMedia?.kind === 'image' ? heroMedia.source : heroMedia?.preview) ??
     media.find((item) => item.kind === 'image')?.source ??
     media.find((item) => item.preview)?.preview ??
     normalizeBackendMediaUrl(listing.primary_image) ??
@@ -884,8 +1149,46 @@ function mapListingToEvent(listing: BackendListing, categoryLookup: Map<string, 
     contacts,
     socials,
     isSaved: Boolean(listing.user_has_saved),
+    hasTicket: Boolean((listing as BackendListing & { user_has_ticket?: boolean }).user_has_ticket),
     ownerName: listing.owner_name ?? null,
+    ownerCanEdit: Boolean(listing.owner_can_edit),
+    ownerEditExpiresAt: listing.owner_edit_expires_at ?? null,
     createdAt: listing.created_at,
+  };
+}
+
+function mapTicket(ticket: BackendTicket, categoryLookup: Map<string, AppCategory>): AppTicket {
+  const fallbackListing: BackendListing = ticket.listing ?? {
+    id: ticket.listing_id,
+    name: ticket.listing_name ?? 'Ticket',
+    category_name: '',
+    category_slug: '',
+    description: '',
+    address: '',
+    app_data: {},
+  };
+  const event = mapListingToEvent(
+    {
+      ...fallbackListing,
+      user_has_ticket: true,
+    },
+    categoryLookup,
+  );
+
+  return {
+    id: String(ticket.id),
+    eventId: String(ticket.listing_id),
+    event,
+    buyerName: ticket.buyer_name ?? null,
+    buyerEmail: ticket.buyer_email ?? null,
+    referenceCode: ticket.reference_code,
+    qrValue: ticket.qr_payload,
+    status: ticket.status,
+    canCancel: Boolean(ticket.can_cancel),
+    canMarkUsed: Boolean(ticket.can_mark_used),
+    canManage: Boolean(ticket.can_manage),
+    bookedAt: ticket.booked_at,
+    updatedAt: ticket.updated_at,
   };
 }
 

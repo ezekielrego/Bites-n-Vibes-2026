@@ -5,6 +5,7 @@ import {
   FlatList,
   FlatListProps,
   NativeSyntheticEvent,
+  type ViewToken,
   Pressable,
   ScrollView,
   StyleProp,
@@ -18,6 +19,7 @@ import {
 } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { Image } from 'expo-image';
+import { ResizeMode, type AVPlaybackStatus, Video } from 'expo-av';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { APP_VERSION, TAB_ITEMS } from '../constants';
@@ -26,10 +28,13 @@ import {
   AppCategory,
   AppEvent,
   AppNotification,
+  AppTicket,
   AppUser,
   CategoryId,
+  ChangePasswordInput,
   CreateAppEventInput,
   TabId,
+  UpdateProfileInput,
 } from '../types';
 import {
   CategoryPill,
@@ -55,6 +60,7 @@ const SEARCH_HINTS = [
 const FLOATING_SEARCH_THRESHOLD = 86;
 const FLOATING_HEADER_HEIGHT = 50;
 const FLOATING_HEADER_GAP = 14;
+const CARD_VIDEO_PREVIEW_DELAY_MS = 640;
 
 export function HomeScreen({
   activeTab,
@@ -63,20 +69,36 @@ export function HomeScreen({
   createProgress,
   createStage,
   createError,
+  editingListing,
   events,
   historyEvents,
   myListings,
   notifications,
+  receivedTickets,
+  tickets,
   unreadNotificationCount,
   profile,
+  onCancelTicket,
+  onClearHistory,
   onSelectEvent,
   onTabChange,
+  onOpenTicket,
+  onOpenNearby,
+  onRemoveHistoryItem,
   onToggleSave,
   onOpenNotification,
   onMarkAllRead,
+  onMarkTicketUsed,
   onCreateEvent,
+  onCancelEditListing,
+  onChangePassword,
+  onDeleteListings,
   onSignOut,
+  onStartEditListing,
   tabDirection,
+  onToggleEmailNotifications,
+  onTogglePushNotifications,
+  onUpdateProfile,
 }: {
   activeTab: TabId;
   categories: AppCategory[];
@@ -84,20 +106,36 @@ export function HomeScreen({
   createProgress: number;
   createStage: string | null;
   createError: string | null;
+  editingListing: AppEvent | null;
   events: AppEvent[];
   historyEvents: AppEvent[];
   myListings: AppEvent[];
   notifications: AppNotification[];
+  receivedTickets: AppTicket[];
+  tickets: AppTicket[];
   unreadNotificationCount: number;
   profile: AppUser | null;
+  onCancelTicket: (ticket: AppTicket) => Promise<void>;
+  onClearHistory: () => Promise<void>;
   onSelectEvent: (event: AppEvent) => void;
+  onOpenTicket: (ticket: AppTicket) => void;
+  onOpenNearby: () => void;
+  onRemoveHistoryItem: (event: AppEvent) => Promise<void>;
   onTabChange: (tab: TabId) => void;
   onToggleSave: (event: AppEvent) => void;
   onOpenNotification: (notification: AppNotification) => void;
   onMarkAllRead: () => void;
+  onMarkTicketUsed: (ticket: AppTicket) => Promise<void>;
   onCreateEvent: (input: CreateAppEventInput) => Promise<void>;
+  onCancelEditListing: () => void;
+  onChangePassword: (input: ChangePasswordInput) => Promise<{ message: string }>;
+  onDeleteListings: (eventIds: string[]) => Promise<void>;
   onSignOut: () => void;
+  onStartEditListing: (event: AppEvent) => void;
   tabDirection: 1 | -1;
+  onToggleEmailNotifications: (enabled: boolean) => Promise<AppUser>;
+  onTogglePushNotifications: (enabled: boolean) => Promise<AppUser>;
+  onUpdateProfile: (input: UpdateProfileInput) => Promise<AppUser>;
 }) {
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
@@ -115,6 +153,25 @@ export function HomeScreen({
   const menuTranslate = useRef(new Animated.Value(-Math.min(width * 0.76, 320))).current;
   const menuOverlayOpacity = useRef(new Animated.Value(0)).current;
   const scrollY = useRef(new Animated.Value(0)).current;
+  const previewEventIdRef = useRef<string | null>(null);
+  const [previewEventId, setPreviewEventId] = useState<string | null>(null);
+  const viewabilityConfig = useRef({
+    itemVisiblePercentThreshold: 72,
+    minimumViewTime: 280,
+  }).current;
+  const onViewableItemsChanged = useRef(({ viewableItems }: { viewableItems: Array<ViewToken<AppEvent>> }) => {
+    const nextPreviewEvent = viewableItems
+      .map((entry) => entry.item)
+      .find((item): item is AppEvent => Boolean(item && hasCardPreviewVideo(item)));
+    const nextPreviewId = nextPreviewEvent?.id ?? null;
+
+    if (nextPreviewId === previewEventIdRef.current) {
+      return;
+    }
+
+    previewEventIdRef.current = nextPreviewId;
+    setPreviewEventId(nextPreviewId);
+  }).current;
 
   useEffect(() => {
     const drawerWidth = Math.min(width * 0.76, 320);
@@ -195,6 +252,13 @@ export function HomeScreen({
     }
   };
 
+  const handleOpenCategory = (categoryId: CategoryId) => {
+    setActiveCategory(categoryId);
+    if (activeTab !== 'discover') {
+      onTabChange('discover');
+    }
+  };
+
   const query = deferredSearchQuery.trim().toLowerCase();
   const filteredEvents = events.filter((event) => {
     const matchesCategory =
@@ -208,10 +272,23 @@ export function HomeScreen({
     return matchesCategory && matchesQuery;
   });
 
+  useEffect(() => {
+    if (!previewEventId) {
+      return;
+    }
+
+    const stillVisible = filteredEvents.some((event) => event.id === previewEventId);
+    if (!stillVisible) {
+      previewEventIdRef.current = null;
+      setPreviewEventId(null);
+    }
+  }, [filteredEvents, previewEventId]);
+
   const spotlightEvent = filteredEvents[0] ?? events[0];
   const savedEvents = events.filter((event) => event.isSaved);
   const discoverContentPadding: StyleProp<ViewStyle> = [
     styles.content,
+    styles.discoverContent,
     {
       paddingTop: insets.top + FLOATING_HEADER_HEIGHT + FLOATING_HEADER_GAP,
       paddingBottom: insets.bottom + 110,
@@ -219,6 +296,7 @@ export function HomeScreen({
   ];
   const contentPadding: StyleProp<ViewStyle> = [
     styles.content,
+    activeTab === 'create' ? styles.createContent : null,
     { paddingTop: insets.top + 8, paddingBottom: insets.bottom + 110 },
   ];
   const floatingSearchProgress = scrollY.interpolate({
@@ -242,6 +320,7 @@ export function HomeScreen({
         categories={categories}
         contentPadding={contentPadding}
         createError={createError}
+        editingListing={editingListing}
         createPending={createPending}
         createProgress={createProgress}
         createStage={createStage}
@@ -249,13 +328,30 @@ export function HomeScreen({
         menuOpen={menuOpen}
         myListings={myListings}
         notifications={notifications}
+        onCancelTicket={onCancelTicket}
+        onClearHistory={onClearHistory}
+        tickets={tickets}
+        receivedTickets={receivedTickets}
+        onCancelEditListing={onCancelEditListing}
+        onChangePassword={onChangePassword}
+        onDeleteListings={onDeleteListings}
         onCreateEvent={onCreateEvent}
         onMarkAllRead={onMarkAllRead}
+        onMarkTicketUsed={onMarkTicketUsed}
         onOpenNotification={onOpenNotification}
+        onOpenNearby={onOpenNearby}
+        onOpenTicket={onOpenTicket}
+        onOpenCategory={handleOpenCategory}
+        onRemoveHistoryItem={onRemoveHistoryItem}
         onSelectEvent={onSelectEvent}
         onSignOut={onSignOut}
+        onStartEditListing={onStartEditListing}
+        onTabChange={onTabChange}
         onToggleMenu={() => setMenuOpen((current) => !current)}
+        onToggleEmailNotifications={onToggleEmailNotifications}
+        onTogglePushNotifications={onTogglePushNotifications}
         onToggleSave={onToggleSave}
+        onUpdateProfile={onUpdateProfile}
         profile={profile}
         savedEvents={savedEvents}
         unreadNotificationCount={unreadNotificationCount}
@@ -267,6 +363,7 @@ export function HomeScreen({
         contentContainerStyle={discoverContentPadding}
         initialNumToRender={4}
         maxToRenderPerBatch={4}
+        onViewableItemsChanged={onViewableItemsChanged}
         onScroll={Animated.event(
           [{ nativeEvent: { contentOffset: { y: scrollY } } }],
           {
@@ -276,6 +373,7 @@ export function HomeScreen({
         )}
         scrollEventThrottle={16}
         updateCellsBatchingPeriod={48}
+        viewabilityConfig={viewabilityConfig}
         windowSize={5}
         removeClippedSubviews
         showsVerticalScrollIndicator={false}
@@ -344,7 +442,12 @@ export function HomeScreen({
           </>
         }
         renderItem={({ item }) => (
-          <EventCard event={item} onPress={() => onSelectEvent(item)} onToggleSave={() => onToggleSave(item)} />
+          <EventCard
+            event={item}
+            isPreviewActive={previewEventId === item.id}
+            onPress={() => onSelectEvent(item)}
+            onToggleSave={() => onToggleSave(item)}
+          />
         )}
       />
     );
@@ -362,6 +465,7 @@ export function HomeScreen({
         inputRef={floatingSearchInputRef}
         isFocused={isSearchFocused}
         menuOpen={menuOpen}
+        onOpenNearby={onOpenNearby}
         profile={profile}
         query={searchQuery}
         safeTop={insets.top}
@@ -526,6 +630,7 @@ function SecondaryTabContent({
   categories,
   contentPadding,
   createError,
+  editingListing,
   createPending,
   createProgress,
   createStage,
@@ -533,13 +638,30 @@ function SecondaryTabContent({
   menuOpen,
   myListings,
   notifications,
+  onCancelTicket,
+  onClearHistory,
+  tickets,
+  receivedTickets,
+  onCancelEditListing,
+  onChangePassword,
+  onDeleteListings,
   onCreateEvent,
   onMarkAllRead,
+  onMarkTicketUsed,
+  onOpenNearby,
   onOpenNotification,
+  onOpenTicket,
+  onOpenCategory,
+  onRemoveHistoryItem,
   onSelectEvent,
   onSignOut,
+  onStartEditListing,
+  onTabChange,
   onToggleMenu,
+  onToggleEmailNotifications,
+  onTogglePushNotifications,
   onToggleSave,
+  onUpdateProfile,
   profile,
   savedEvents,
   unreadNotificationCount,
@@ -548,6 +670,7 @@ function SecondaryTabContent({
   categories: AppCategory[];
   contentPadding: StyleProp<ViewStyle>;
   createError: string | null;
+  editingListing: AppEvent | null;
   createPending: boolean;
   createProgress: number;
   createStage: string | null;
@@ -555,20 +678,37 @@ function SecondaryTabContent({
   menuOpen: boolean;
   myListings: AppEvent[];
   notifications: AppNotification[];
+  onCancelTicket: (ticket: AppTicket) => Promise<void>;
+  onClearHistory: () => Promise<void>;
+  tickets: AppTicket[];
+  receivedTickets: AppTicket[];
+  onCancelEditListing: () => void;
+  onChangePassword: (input: ChangePasswordInput) => Promise<{ message: string }>;
+  onDeleteListings: (eventIds: string[]) => Promise<void>;
   onCreateEvent: (input: CreateAppEventInput) => Promise<void>;
   onMarkAllRead: () => void;
+  onMarkTicketUsed: (ticket: AppTicket) => Promise<void>;
+  onOpenNearby: () => void;
   onOpenNotification: (notification: AppNotification) => void;
+  onOpenTicket: (ticket: AppTicket) => void;
+  onOpenCategory: (categoryId: CategoryId) => void;
+  onRemoveHistoryItem: (event: AppEvent) => Promise<void>;
   onSelectEvent: (event: AppEvent) => void;
   onSignOut: () => void;
+  onStartEditListing: (event: AppEvent) => void;
+  onTabChange: (tab: TabId) => void;
   onToggleMenu: () => void;
+  onToggleEmailNotifications: (enabled: boolean) => Promise<AppUser>;
+  onTogglePushNotifications: (enabled: boolean) => Promise<AppUser>;
   onToggleSave: (event: AppEvent) => void;
+  onUpdateProfile: (input: UpdateProfileInput) => Promise<AppUser>;
   profile: AppUser | null;
   savedEvents: AppEvent[];
   unreadNotificationCount: number;
 }) {
   return (
     <ScrollView contentContainerStyle={contentPadding} showsVerticalScrollIndicator={false}>
-      <HomeHeader menuOpen={menuOpen} onToggleMenu={onToggleMenu} profile={profile} />
+      <HomeHeader menuOpen={menuOpen} onOpenNearby={onOpenNearby} onToggleMenu={onToggleMenu} profile={profile} />
 
       {activeTab === 'saved' ? (
         <SavedTabView events={savedEvents} onSelectEvent={onSelectEvent} />
@@ -577,7 +717,9 @@ function SecondaryTabContent({
       {activeTab === 'create' ? (
         <CreateTabView
           categories={categories}
+          editingEvent={editingListing}
           isSubmitting={createPending}
+          onCancelEdit={onCancelEditListing}
           submitProgress={createProgress}
           submitStage={createStage}
           submitError={createError}
@@ -596,11 +738,31 @@ function SecondaryTabContent({
 
       {activeTab === 'profile' ? (
         <ProfileTabView
+          categories={categories}
           historyEvents={historyEvents}
           myListings={myListings}
+          onCancelTicket={onCancelTicket}
+          onChangePassword={onChangePassword}
+          onDeleteListings={onDeleteListings}
+          onClearHistory={onClearHistory}
+          onEditListing={onStartEditListing}
+          onMarkTicketUsed={onMarkTicketUsed}
+          onOpenCategory={onOpenCategory}
+          onOpenSavedTab={() => onTabChange('saved')}
           onSignOut={onSignOut}
+          onStartCreate={() => {
+            onCancelEditListing();
+            onTabChange('create');
+          }}
+          onToggleEmailNotifications={onToggleEmailNotifications}
+          onTogglePushNotifications={onTogglePushNotifications}
+          onUpdateProfile={onUpdateProfile}
           profile={profile}
+          receivedTickets={receivedTickets}
+          onOpenTicket={onOpenTicket}
+          onRemoveHistoryItem={onRemoveHistoryItem}
           savedEvents={savedEvents}
+          tickets={tickets}
           unreadCount={unreadNotificationCount}
           onSelectEvent={onSelectEvent}
         />
@@ -611,10 +773,12 @@ function SecondaryTabContent({
 
 function HomeHeader({
   menuOpen,
+  onOpenNearby,
   onToggleMenu,
   profile,
 }: {
   menuOpen: boolean;
+  onOpenNearby: () => void;
   onToggleMenu: () => void;
   profile?: AppUser | null;
 }) {
@@ -627,14 +791,33 @@ function HomeHeader({
         onPress={onToggleMenu}
         accessibilityLabel={menuOpen ? 'Close menu' : 'Open menu'}
       />
-      <View style={styles.locationChip}>
-        <Feather color={theme.colors.accentStrong} name={'map-pin' as FeatherName} size={15} />
-        <Text style={styles.locationText}>Explore nearby</Text>
-      </View>
+      <NearbyTrigger onPress={onOpenNearby} />
       <View style={styles.avatar}>
         <Image source={avatarSource} contentFit="cover" style={styles.avatarImage} transition={120} />
       </View>
     </View>
+  );
+}
+
+function NearbyTrigger({
+  onPress,
+  style,
+}: {
+  onPress: () => void;
+  style?: StyleProp<ViewStyle>;
+}) {
+  const jelly = useJellyPressAnimation({
+    pressedScaleX: 1.02,
+    pressedScaleY: 0.95,
+  });
+
+  return (
+    <Pressable onPress={onPress} onPressIn={jelly.onPressIn} onPressOut={jelly.onPressOut}>
+      <Animated.View style={[styles.locationChip, style, jelly.animatedStyle]}>
+        <Feather color={theme.colors.accentStrong} name={'map-pin' as FeatherName} size={15} />
+        <Text style={styles.locationText}>Explore nearby</Text>
+      </Animated.View>
+    </Pressable>
   );
 }
 
@@ -644,6 +827,7 @@ function DiscoverFloatingHeaderLayer({
   inputRef,
   isFocused,
   menuOpen,
+  onOpenNearby,
   profile,
   query,
   safeTop,
@@ -657,6 +841,7 @@ function DiscoverFloatingHeaderLayer({
   inputRef: React.RefObject<TextInput | null>;
   isFocused: boolean;
   menuOpen: boolean;
+  onOpenNearby: () => void;
   profile?: AppUser | null;
   query: string;
   safeTop: number;
@@ -679,7 +864,7 @@ function DiscoverFloatingHeaderLayer({
 
         <View pointerEvents="box-none" style={styles.floatingCenterRail}>
           <Animated.View
-            pointerEvents="none"
+            pointerEvents={floatingSearchVisible || isFocused ? 'none' : 'auto'}
             style={[
               styles.floatingLocationLayer,
               {
@@ -714,10 +899,7 @@ function DiscoverFloatingHeaderLayer({
               },
             ]}
           >
-            <View style={[styles.locationChip, styles.floatingLocationChip]}>
-              <Feather color={theme.colors.accentStrong} name={'map-pin' as FeatherName} size={15} />
-              <Text style={styles.locationText}>Explore nearby</Text>
-            </View>
+            <NearbyTrigger onPress={onOpenNearby} style={styles.floatingLocationChip} />
           </Animated.View>
 
           <Animated.View
@@ -977,10 +1159,12 @@ function DrawerSearchShortcut({ onPress }: { onPress: () => void }) {
 
 function EventCard({
   event,
+  isPreviewActive,
   onPress,
   onToggleSave,
 }: {
   event: AppEvent;
+  isPreviewActive: boolean;
   onPress: () => void;
   onToggleSave: () => void;
 }) {
@@ -988,6 +1172,87 @@ function EventCard({
     pressedScaleX: 1.012,
     pressedScaleY: 0.972,
   });
+  const previewVideo = getCardPreviewVideo(event);
+  const previewVideoRef = useRef<Video>(null);
+  const previewSegmentsRef = useRef<Array<{ start: number; end: number }>>([]);
+  const previewSegmentIndexRef = useRef(0);
+  const previewDelayTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [showVideoPreview, setShowVideoPreview] = useState(false);
+  const [videoReady, setVideoReady] = useState(false);
+
+  useEffect(() => {
+    if (!previewVideo || !isPreviewActive) {
+      if (previewDelayTimeout.current) {
+        clearTimeout(previewDelayTimeout.current);
+        previewDelayTimeout.current = null;
+      }
+      previewSegmentsRef.current = [];
+      previewSegmentIndexRef.current = 0;
+      setShowVideoPreview(false);
+      setVideoReady(false);
+      previewVideoRef.current?.stopAsync().catch(() => undefined);
+      return;
+    }
+
+    previewDelayTimeout.current = setTimeout(() => {
+      previewSegmentsRef.current = [];
+      previewSegmentIndexRef.current = 0;
+      setVideoReady(false);
+      setShowVideoPreview(true);
+      previewDelayTimeout.current = null;
+    }, CARD_VIDEO_PREVIEW_DELAY_MS);
+
+    return () => {
+      if (previewDelayTimeout.current) {
+        clearTimeout(previewDelayTimeout.current);
+        previewDelayTimeout.current = null;
+      }
+    };
+  }, [isPreviewActive, previewVideo]);
+
+  useEffect(() => {
+    return () => {
+      if (previewDelayTimeout.current) {
+        clearTimeout(previewDelayTimeout.current);
+      }
+    };
+  }, []);
+
+  const handleVideoLoad = (status: AVPlaybackStatus) => {
+    if (!previewVideo || !isPreviewActive || !('isLoaded' in status) || !status.isLoaded) {
+      return;
+    }
+
+    previewSegmentsRef.current = buildCardPreviewSegments(status.durationMillis ?? 0);
+    previewSegmentIndexRef.current = 0;
+    setVideoReady(true);
+    const firstSegment = previewSegmentsRef.current[0];
+    previewVideoRef.current?.playFromPositionAsync(firstSegment?.start ?? 0).catch(() => undefined);
+  };
+
+  const handleVideoStatusUpdate = (status: AVPlaybackStatus) => {
+    if (!previewVideo || !isPreviewActive || !('isLoaded' in status) || !status.isLoaded) {
+      return;
+    }
+
+    if (previewSegmentsRef.current.length === 0) {
+      previewSegmentsRef.current = buildCardPreviewSegments(status.durationMillis ?? 0);
+    }
+
+    const activeSegment = previewSegmentsRef.current[previewSegmentIndexRef.current];
+    if (!activeSegment || status.positionMillis + 140 < activeSegment.end) {
+      return;
+    }
+
+    const nextSegment = previewSegmentsRef.current[previewSegmentIndexRef.current + 1];
+    if (!nextSegment) {
+      previewVideoRef.current?.pauseAsync().catch(() => undefined);
+      return;
+    }
+
+    previewSegmentIndexRef.current += 1;
+    previewVideoRef.current?.playFromPositionAsync(nextSegment.start).catch(() => undefined);
+  };
 
   return (
     <Pressable
@@ -1000,6 +1265,19 @@ function EventCard({
       <Animated.View style={jelly.animatedStyle}>
         <View style={styles.card}>
           <Image source={event.image} contentFit="cover" style={styles.cardImage} transition={200} />
+          {previewVideo && showVideoPreview ? (
+            <Video
+              isMuted
+              onLoad={handleVideoLoad}
+              onPlaybackStatusUpdate={handleVideoStatusUpdate}
+              ref={previewVideoRef}
+              resizeMode={ResizeMode.COVER}
+              shouldPlay={false}
+              source={{ uri: previewVideo.source }}
+              style={[styles.cardVideo, !videoReady && styles.cardVideoHidden]}
+              usePoster={false}
+            />
+          ) : null}
           <LinearGradient
             colors={['rgba(8,10,14,0.02)', 'rgba(8,10,14,0.88)']}
             start={{ x: 0.4, y: 0.1 }}
@@ -1029,12 +1307,22 @@ function EventCard({
               <Text numberOfLines={1} style={styles.cardMeta}>
                 {event.city}  -  {event.time}
               </Text>
+              <Text numberOfLines={2} style={styles.cardAbout}>
+                {event.blurb || event.about}
+              </Text>
             </View>
 
             <View style={styles.priceChip}>
               <Text style={styles.priceText}>{event.price}</Text>
             </View>
           </View>
+
+          {previewVideo ? (
+            <View style={styles.cardVideoChip}>
+              <Feather color={theme.colors.white} name={'play-circle' as FeatherName} size={14} />
+              <Text style={styles.cardVideoChipText}>Preview</Text>
+            </View>
+          ) : null}
         </View>
       </Animated.View>
     </Pressable>
@@ -1070,12 +1358,52 @@ function MiniSaveAction({
   );
 }
 
+function hasCardPreviewVideo(event: AppEvent) {
+  return Boolean(getCardPreviewVideo(event));
+}
+
+function getCardPreviewVideo(event: AppEvent) {
+  return event.media.find((item) => item.kind === 'video' && item.role === 'hero')
+    ?? event.media.find((item) => item.kind === 'video');
+}
+
+function buildCardPreviewSegments(durationMillis: number) {
+  if (!Number.isFinite(durationMillis) || durationMillis <= 1800) {
+    return [{ start: 0, end: Math.max(1200, durationMillis - 120) }];
+  }
+
+  const clipLength = Math.min(2400, Math.max(1500, Math.round(durationMillis * 0.14)));
+  const maxStart = Math.max(durationMillis - clipLength - 120, 0);
+  const anchorRatios = [0.02, 0.34, 0.68];
+  const segments: Array<{ start: number; end: number }> = [];
+
+  for (const ratio of anchorRatios) {
+    const start = Math.min(Math.round(durationMillis * ratio), maxStart);
+    if (segments.length > 0 && start - segments[segments.length - 1].start < 520) {
+      continue;
+    }
+
+    segments.push({
+      start,
+      end: Math.min(start + clipLength, durationMillis - 120),
+    });
+  }
+
+  return segments.length > 0 ? segments : [{ start: 0, end: Math.max(1200, durationMillis - 120) }];
+}
+
 const styles = StyleSheet.create({
   root: {
     flex: 1,
   },
   content: {
     paddingHorizontal: 20,
+  },
+  discoverContent: {
+    paddingHorizontal: 12,
+  },
+  createContent: {
+    paddingHorizontal: 8,
   },
   separator: {
     height: 14,
@@ -1272,13 +1600,19 @@ const styles = StyleSheet.create({
     ...shadow,
   },
   card: {
-    height: 208,
+    minHeight: 252,
     borderRadius: theme.radius.lg,
     overflow: 'hidden',
     backgroundColor: theme.colors.surfaceStrong,
   },
   cardImage: {
     ...StyleSheet.absoluteFillObject,
+  },
+  cardVideo: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  cardVideoHidden: {
+    opacity: 0,
   },
   dateBadge: {
     position: 'absolute',
@@ -1354,25 +1688,31 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'flex-end',
     justifyContent: 'space-between',
-    gap: 10,
+    gap: 12,
   },
   cardTextBlock: {
     flex: 1,
-    gap: 6,
+    gap: 7,
   },
   cardTitle: {
     color: theme.colors.white,
-    fontSize: 22,
+    fontSize: 24,
     fontWeight: '800',
     letterSpacing: 0.2,
   },
   cardMeta: {
     color: theme.colors.textMuted,
     fontSize: 13,
+    fontWeight: '600',
+  },
+  cardAbout: {
+    color: 'rgba(245,247,252,0.78)',
+    fontSize: 12,
+    lineHeight: 18,
     fontWeight: '500',
   },
   priceChip: {
-    minHeight: 36,
+    minHeight: 38,
     paddingHorizontal: 14,
     borderRadius: theme.radius.pill,
     backgroundColor: theme.colors.paper,
@@ -1383,6 +1723,26 @@ const styles = StyleSheet.create({
     color: theme.colors.paperInk,
     fontSize: 14,
     fontWeight: '800',
+  },
+  cardVideoChip: {
+    position: 'absolute',
+    right: 16,
+    bottom: 82,
+    minHeight: 28,
+    paddingHorizontal: 10,
+    borderRadius: theme.radius.pill,
+    backgroundColor: 'rgba(8,10,14,0.78)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  cardVideoChipText: {
+    color: theme.colors.white,
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 0.2,
   },
   emptyCard: {
     marginTop: 8,

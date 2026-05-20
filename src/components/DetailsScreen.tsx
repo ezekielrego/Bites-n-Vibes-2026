@@ -7,6 +7,7 @@ import {
   NativeSyntheticEvent,
   Platform,
   Pressable,
+  Share,
   ScrollView,
   StyleSheet,
   Text,
@@ -69,6 +70,12 @@ export function DetailsScreen({
   const tags = event.categories.map((category) => category.name);
   const heroMedia = useMemo(() => buildHeroMedia(event), [event]);
   const activeMedia = heroMedia[activeMediaIndex] ?? heroMedia[0] ?? null;
+  const heroLead = useMemo(() => (shouldShowArtist(event) ? event.artist : event.title), [event]);
+  const heroSupporting = useMemo(
+    () => (event.city ? `${event.venue} - ${event.city}` : event.venue),
+    [event.city, event.venue],
+  );
+  const actionBarInset = insets.bottom + 96;
   const heroPagerRef = useRef<ScrollView>(null);
   const autoplayHoldUntil = useRef(0);
   const mapPreviewJelly = useJellyPressAnimation({
@@ -197,6 +204,13 @@ export function DetailsScreen({
     onCommentCountChange(nextCount);
   };
 
+  const handleShareEvent = async () => {
+    await Share.share({
+      title: event.title,
+      message: `${event.title}\n${event.venue} • ${event.dateLabel} • ${event.time}\n${event.location.address}`,
+    });
+  };
+
   return (
     <View style={styles.container}>
       <ScrollView contentContainerStyle={{ paddingBottom: insets.bottom + 132 }} showsVerticalScrollIndicator={false}>
@@ -228,6 +242,7 @@ export function DetailsScreen({
             colors={['rgba(8,10,14,0.10)', 'rgba(8,10,14,0.86)']}
             start={{ x: 0.5, y: 0.1 }}
             end={{ x: 0.5, y: 1 }}
+            pointerEvents="none"
             style={StyleSheet.absoluteFillObject}
           />
 
@@ -243,17 +258,15 @@ export function DetailsScreen({
             <IconButton icon="chevron-left" onPress={onBack} accessibilityLabel="Go back" />
             <View style={styles.heroActionRow}>
               <SaveHeroButton saved={isSaved} onPress={onToggleSave} />
-              <IconButton icon="share-2" accessibilityLabel="Share event" />
+              <IconButton icon="share-2" onPress={() => void handleShareEvent()} accessibilityLabel="Share event" />
             </View>
           </View>
 
           <View style={styles.heroFooter}>
             <View style={styles.heroCopy}>
-              <Text style={styles.heroLabel}>Featured concert</Text>
-              <Text style={styles.heroTitle}>{event.artist}</Text>
-              <Text style={styles.heroSubtitle}>
-                {event.venue} - {event.city}
-              </Text>
+              <Text style={styles.heroLabel}>{event.categories[0]?.name ?? 'Featured'}</Text>
+              <Text style={styles.heroTitle}>{heroLead}</Text>
+              <Text style={styles.heroSubtitle}>{heroSupporting}</Text>
             </View>
 
             <View style={styles.heroPriceChip}>
@@ -377,7 +390,7 @@ export function DetailsScreen({
 
       <View style={[styles.bottomBar, { paddingBottom: insets.bottom + 12 }]}>
         <View style={styles.bottomBarInner}>
-          <PrimaryButton label="Get ticket" onPress={onBook} />
+          <PrimaryButton label={event.hasTicket ? 'View ticket' : 'Get ticket'} onPress={onBook} />
           <RatingDock
             isOpen={ratingOpen}
             isSubmitting={ratingPending}
@@ -398,18 +411,18 @@ export function DetailsScreen({
         visible={commentsOpen}
       />
 
-      <Modal animationType="fade" onRequestClose={() => setMapExpanded(false)} transparent visible={mapExpanded}>
-        <View style={styles.mapModalBackdrop}>
-          <View style={[styles.mapModalShell, { paddingTop: insets.top + 8, paddingBottom: insets.bottom + 12 }]}>
-            <View style={styles.mapModalHeader}>
-              <View style={styles.mapModalHeaderCopy}>
+      {mapExpanded ? (
+        <View pointerEvents="box-none" style={StyleSheet.absoluteFillObject}>
+          <View style={[styles.mapExpandedOverlay, { bottom: actionBarInset, paddingTop: insets.top + 8 }]}>
+            <View style={styles.mapExpandedHeader}>
+              <View style={styles.mapExpandedHeaderCopy}>
                 <Text style={styles.mapModalTitle}>{event.venue}</Text>
                 <Text style={styles.mapModalSubtitle}>{event.location.address}</Text>
               </View>
               <IconButton icon="x" onPress={() => setMapExpanded(false)} accessibilityLabel="Close map" />
             </View>
 
-            <View style={styles.mapModalFrame}>
+            <View style={styles.mapExpandedFrame}>
               <MapView
                 key={`${event.id}-expanded`}
                 initialRegion={{
@@ -420,7 +433,8 @@ export function DetailsScreen({
                 }}
                 loadingEnabled
                 showsCompass
-                style={styles.mapModalMap}
+                showsScale
+                style={styles.mapExpandedMap}
                 toolbarEnabled
               >
                 <Marker
@@ -432,17 +446,14 @@ export function DetailsScreen({
                   title={event.venue}
                 />
               </MapView>
-            </View>
 
-            <View style={styles.mapModalMeta}>
-              <Text style={styles.mapAddress}>{event.location.address}</Text>
-              <Text style={styles.mapNote}>{event.location.note}</Text>
+              <View pointerEvents="box-none" style={styles.mapExpandedFloatingAction}>
+                <MapDirectionsButton onPress={() => void handleOpenDirections()} />
+              </View>
             </View>
-
-            <MapDirectionsButton onPress={() => void handleOpenDirections()} />
           </View>
         </View>
-      </Modal>
+      ) : null}
 
       <Modal
         animationType="fade"
@@ -461,11 +472,13 @@ export function DetailsScreen({
 
           {fullscreenVideo ? (
             <Video
+              posterSource={fullscreenVideo.preview ? { uri: fullscreenVideo.preview } : undefined}
               shouldPlay
               source={{ uri: fullscreenVideo.source }}
               style={styles.fullscreenVideoPlayer}
               resizeMode={ResizeMode.CONTAIN}
               useNativeControls
+              usePoster={Boolean(fullscreenVideo.preview)}
             />
           ) : null}
         </View>
@@ -509,7 +522,7 @@ function MapDirectionsButton({
     <Pressable onPress={onPress} onPressIn={jelly.onPressIn} onPressOut={jelly.onPressOut} style={styles.mapDirectionsPressable}>
       <Animated.View style={[styles.mapDirectionsButton, jelly.animatedStyle]}>
         <Feather color={theme.colors.white} name="navigation" size={15} />
-        <Text style={styles.mapDirectionsText}>Open in Google Maps</Text>
+        <Text style={styles.mapDirectionsText}>Directions</Text>
       </Animated.View>
     </Pressable>
   );
@@ -536,6 +549,7 @@ function HeroMediaSlide({
         <Video
           isLooping={false}
           onPlaybackStatusUpdate={(status) => onVideoFinish(status, media.id)}
+          pointerEvents="none"
           posterSource={media.preview ? { uri: media.preview } : undefined}
           posterStyle={styles.heroMedia}
           resizeMode={ResizeMode.COVER}
@@ -849,6 +863,15 @@ function buildHeroMedia(event: AppEvent) {
   return [];
 }
 
+function shouldShowArtist(event: AppEvent) {
+  const primaryCategory = event.categories[0]?.id ?? '';
+  if (!event.artist || event.artist.trim().length === 0) {
+    return false;
+  }
+
+  return ['bars-lounges', 'chill-spots'].includes(primaryCategory);
+}
+
 const styles = StyleSheet.create({
   container: {
     flex: 1,
@@ -1103,28 +1126,19 @@ const styles = StyleSheet.create({
   mapMeta: {
     gap: 6,
   },
-  mapModalBackdrop: {
-    flex: 1,
-    backgroundColor: 'rgba(6,8,12,0.72)',
-    justifyContent: 'center',
-    paddingHorizontal: 12,
-  },
-  mapModalShell: {
-    borderRadius: 26,
-    borderWidth: 1,
-    borderColor: theme.colors.border,
-    backgroundColor: 'rgba(12,15,23,0.98)',
+  mapExpandedOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(6,8,12,0.78)',
     paddingHorizontal: 12,
     gap: 12,
-    ...shadow,
   },
-  mapModalHeader: {
+  mapExpandedHeader: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     gap: 12,
   },
-  mapModalHeaderCopy: {
+  mapExpandedHeaderCopy: {
     flex: 1,
     gap: 4,
   },
@@ -1138,26 +1152,31 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 18,
   },
-  mapModalFrame: {
+  mapExpandedFrame: {
+    flex: 1,
     overflow: 'hidden',
-    borderRadius: 20,
+    borderRadius: 24,
     borderWidth: 1,
     borderColor: theme.colors.border,
     backgroundColor: theme.colors.surfaceStrong,
+    ...shadow,
   },
-  mapModalMap: {
+  mapExpandedMap: {
     width: '100%',
-    height: 420,
+    height: '100%',
   },
-  mapModalMeta: {
-    gap: 6,
+  mapExpandedFloatingAction: {
+    position: 'absolute',
+    right: 16,
+    bottom: 16,
   },
   mapDirectionsPressable: {
-    alignSelf: 'stretch',
+    alignSelf: 'flex-end',
   },
   mapDirectionsButton: {
-    minHeight: 46,
-    borderRadius: 16,
+    minHeight: 48,
+    paddingHorizontal: 16,
+    borderRadius: 999,
     backgroundColor: theme.colors.accentStrong,
     alignItems: 'center',
     justifyContent: 'center',

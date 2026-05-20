@@ -1,6 +1,9 @@
 from django.db import models
 from django.core.validators import MinValueValidator, MaxValueValidator, RegexValidator
 from django.conf import settings
+from django.utils.crypto import get_random_string
+from django.utils import timezone
+from datetime import timedelta
 
 
 class Category(models.Model):
@@ -120,7 +123,7 @@ class Listing(models.Model):
     @property
     def primary_image(self):
         """Get primary/cover image."""
-        hero = self.images.filter(media_kind='image', image_type='hero').first()
+        hero = self.images.filter(image_type='hero').first()
         if hero:
             if hero.image_url:
                 return hero.image_url
@@ -155,6 +158,21 @@ class Listing(models.Model):
     def saved_count(self):
         """Get the number of times this listing was saved."""
         return self.saved_by.count()
+
+    @property
+    def owner_edit_expires_at(self):
+        """Time until which the owner can still edit the listing."""
+        return self.created_at + timedelta(hours=24)
+
+    def owner_can_edit(self, user):
+        """Whether the given user can still edit this listing."""
+        if not user or not getattr(user, 'is_authenticated', False):
+            return False
+        if user.is_superuser:
+            return True
+        if self.owner_id != getattr(user, 'id', None):
+            return False
+        return timezone.now() <= self.owner_edit_expires_at
 
 
 class ListingImage(models.Model):
@@ -199,6 +217,64 @@ class ListingImage(models.Model):
                 is_primary=True
             ).exclude(pk=self.pk).update(is_primary=False)
         super().save(*args, **kwargs)
+
+
+class ListingMediaPolicy(models.Model):
+    """Admin-controlled retention policy for listing videos."""
+
+    singleton_guard = models.BooleanField(default=True, unique=True, editable=False)
+    name = models.CharField(max_length=80, default='Global media policy')
+    video_retention_days = models.PositiveIntegerField(
+        default=30,
+        help_text='Videos older than this many days are removed automatically. Use 0 to keep them indefinitely.',
+    )
+    cleanup_interval_hours = models.PositiveSmallIntegerField(
+        default=12,
+        help_text='How often automatic cleanup is allowed to run when the app or API is active.',
+    )
+    last_video_cleanup_at = models.DateTimeField(blank=True, null=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'listing_media_policy'
+        verbose_name_plural = 'Listing media policies'
+
+    def __str__(self):
+        return self.name
+
+    @classmethod
+    def get_solo(cls):
+        policy, _ = cls.objects.get_or_create(pk=1, defaults={'singleton_guard': True})
+        return policy
+
+    def cleanup_expired_videos(self, force=False, reference_time=None):
+        reference_time = reference_time or timezone.now()
+        if self.video_retention_days <= 0:
+            return 0
+
+        interval_hours = max(int(self.cleanup_interval_hours or 0), 1)
+        if (
+            not force
+            and self.last_video_cleanup_at
+            and reference_time - self.last_video_cleanup_at < timedelta(hours=interval_hours)
+        ):
+            return 0
+
+        cutoff = reference_time - timedelta(days=self.video_retention_days)
+        expired_videos = list(
+            ListingImage.objects.filter(media_kind='video', created_at__lt=cutoff).order_by('created_at')
+        )
+
+        for media in expired_videos:
+            if media.video:
+                media.video.delete(save=False)
+            if media.image:
+                media.image.delete(save=False)
+            media.delete()
+
+        self.last_video_cleanup_at = reference_time
+        self.save(update_fields=['last_video_cleanup_at', 'updated_at'])
+        return len(expired_videos)
 
 
 class Rating(models.Model):
@@ -283,3 +359,42 @@ class ListingViewHistory(models.Model):
 
     def __str__(self):
         return f"{self.user.email} viewed {self.listing.name}"
+
+
+class Ticket(models.Model):
+    """A lightweight booked ticket for a user and listing."""
+
+    STATUS_CHOICES = [
+        ('confirmed', 'Confirmed'),
+        ('used', 'Used'),
+        ('cancelled', 'Cancelled'),
+    ]
+
+    listing = models.ForeignKey(Listing, on_delete=models.CASCADE, related_name='tickets')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='tickets')
+    reference_code = models.CharField(max_length=32, unique=True, blank=True)
+    qr_payload = models.TextField(blank=True)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default='confirmed')
+    booked_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'tickets'
+        unique_together = ['listing', 'user']
+        ordering = ['-booked_at']
+        indexes = [
+            models.Index(fields=['user', 'status', 'booked_at']),
+            models.Index(fields=['listing', 'status']),
+        ]
+
+    def __str__(self):
+        return f"{self.user.email} ticket for {self.listing.name}"
+
+    def save(self, *args, **kwargs):
+        if not self.reference_code:
+            self.reference_code = get_random_string(length=10, allowed_chars='ABCDEFGHJKLMNPQRSTUVWXYZ23456789')
+
+        if not self.qr_payload:
+            self.qr_payload = f"BNV:{self.reference_code}:{self.user_id}:{self.listing_id}"
+
+        super().save(*args, **kwargs)

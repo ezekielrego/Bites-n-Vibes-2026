@@ -12,7 +12,7 @@ from django.conf import settings
 from django.http import HttpResponseRedirect
 from django.utils.html import strip_tags
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
-from .models import PasswordResetToken, EmailLoginToken
+from .models import PasswordResetToken, EmailLoginToken, PushDevice
 from .serializers import (
     UserSerializer, UserRegistrationSerializer,
     PasswordResetRequestSerializer, PasswordResetConfirmSerializer,
@@ -194,6 +194,7 @@ def password_reset_request(request):
     serializer = PasswordResetRequestSerializer(data=request.data)
     if serializer.is_valid():
         email = serializer.validated_data['email']
+        redirect_to = _resolve_auth_redirect(request.data.get('redirect_to'), '/auth/reset')
         try:
             user = User.objects.get(email=email)
             # Generate reset token
@@ -206,15 +207,44 @@ def password_reset_request(request):
                 expires_at=expires_at
             )
             
-            # Send email
-            reset_link = f"{settings.FRONTEND_URL}/reset-password?token={token}"
-            send_mail(
-                'Password Reset Request - Bites n Vibes',
-                f'Click the link to reset your password: {reset_link}',
-                settings.DEFAULT_FROM_EMAIL,
-                [email],
-                fail_silently=False,
+            reset_link = _append_query_params(redirect_to, {'token': token})
+
+            html_message = f"""
+                <html>
+                  <body style="font-family: Arial, sans-serif; background: #0b0f17; color: #f7f8fb; padding: 24px;">
+                    <div style="max-width: 520px; margin: 0 auto; background: #111827; border-radius: 18px; padding: 28px; border: 1px solid rgba(255,255,255,0.08);">
+                      <p style="margin: 0 0 16px; color: #a7b0c2;">Bites &amp; Vibes</p>
+                      <h1 style="margin: 0 0 12px; font-size: 24px; color: #ffffff;">Reset your password</h1>
+                      <p style="margin: 0 0 18px; line-height: 1.6; color: #d7dce7;">
+                        Tap the button below to choose a new password. This link stays active for 24 hours.
+                      </p>
+                      <p style="margin: 24px 0;">
+                        <a href="{reset_link}" style="display: inline-block; padding: 12px 18px; border-radius: 999px; background: #ff6b3d; color: #ffffff; text-decoration: none; font-weight: 700;">
+                          Reset password
+                        </a>
+                      </p>
+                      <p style="margin: 0; line-height: 1.6; color: #a7b0c2;">
+                        If you did not request this, you can ignore this email.
+                      </p>
+                    </div>
+                  </body>
+                </html>
+            """
+            text_message = (
+                'Reset your Bites & Vibes password with this link:\n'
+                f'{reset_link}\n\n'
+                'If you did not request this, you can ignore this email.'
             )
+
+            email_msg = EmailMultiAlternatives(
+                subject='Password Reset Request - Bites n Vibes',
+                body=text_message,
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                to=[email],
+                headers=settings.EMAIL_HEADERS if hasattr(settings, 'EMAIL_HEADERS') else {},
+            )
+            email_msg.attach_alternative(html_message, "text/html")
+            email_msg.send(fail_silently=False)
             
             return Response({
                 'message': 'Password reset link has been sent to your email'
@@ -253,6 +283,63 @@ def password_reset_confirm(request):
                 status=status.HTTP_400_BAD_REQUEST
             )
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated])
+def register_push_device(request):
+    """Register or refresh a push-capable device token for the current user."""
+    token = (request.data.get('token') or '').strip()
+    platform = (request.data.get('platform') or 'unknown').strip().lower()
+    device_name = (request.data.get('device_name') or '').strip()
+
+    if not token:
+        return Response(
+            {'token': 'Push token is required'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    if platform not in {'android', 'ios', 'web'}:
+        platform = 'unknown'
+
+    device, _ = PushDevice.objects.update_or_create(
+        token=token,
+        defaults={
+            'user': request.user,
+            'platform': platform,
+            'device_name': device_name[:120],
+            'is_active': True,
+        },
+    )
+
+    return Response(
+        {
+            'id': device.id,
+            'message': 'Push device registered successfully',
+            'push_notifications_enabled': request.user.push_notifications_enabled,
+        },
+        status=status.HTTP_200_OK,
+    )
+
+
+@api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated])
+def unregister_push_device(request):
+    """Deactivate one push device token, or all user devices when omitted."""
+    token = (request.data.get('token') or '').strip()
+    queryset = PushDevice.objects.filter(user=request.user, is_active=True)
+
+    if token:
+        queryset = queryset.filter(token=token)
+
+    count = queryset.update(is_active=False)
+
+    return Response(
+        {
+            'message': f'{count} push device{"s" if count != 1 else ""} removed',
+        },
+        status=status.HTTP_200_OK,
+    )
 
 
 @api_view(['GET'])

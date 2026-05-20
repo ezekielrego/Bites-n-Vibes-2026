@@ -1,7 +1,8 @@
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from django.utils.text import slugify
-from .models import Category, Tag, Listing, ListingImage, Rating, Vibe
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from .models import Category, Tag, Listing, ListingImage, Rating, Ticket, Vibe
 
 User = get_user_model()
 
@@ -92,6 +93,9 @@ class ListingSerializer(serializers.ModelSerializer):
     vibe_count = serializers.SerializerMethodField()
     user_is_vibing = serializers.SerializerMethodField()
     user_has_saved = serializers.SerializerMethodField()
+    user_has_ticket = serializers.SerializerMethodField()
+    owner_can_edit = serializers.SerializerMethodField()
+    owner_edit_expires_at = serializers.SerializerMethodField()
     saved_count = serializers.ReadOnlyField()
     tag_names = serializers.ListField(child=serializers.CharField(), required=False, write_only=True)
     images_payload = serializers.ListField(child=serializers.DictField(), required=False, write_only=True)
@@ -114,6 +118,12 @@ class ListingSerializer(serializers.ModelSerializer):
             if not value.startswith(('http://', 'https://')):
                 raise serializers.ValidationError("Website must start with http:// or https://")
         return value
+
+    def validate_latitude(self, value):
+        return self._normalize_coordinate(value, 'latitude')
+
+    def validate_longitude(self, value):
+        return self._normalize_coordinate(value, 'longitude')
     
     class Meta:
         model = Listing
@@ -125,11 +135,13 @@ class ListingSerializer(serializers.ModelSerializer):
             'tags', 'tags_display', 'images', 'primary_image', 'ticket_image', 'owner', 'owner_name',
             'average_rating', 'rating_count', 'comment_count',
             'vibe_percentage', 'vibe_count', 'user_is_vibing', 'user_has_saved', 'saved_count',
+            'user_has_ticket', 'owner_can_edit', 'owner_edit_expires_at',
             'tag_names', 'images_payload',
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at', 'average_rating', 'rating_count', 'comment_count',
                           'vibe_percentage', 'vibe_count', 'user_is_vibing', 'user_has_saved', 'saved_count',
+                          'user_has_ticket', 'owner_can_edit', 'owner_edit_expires_at',
                           'images', 'primary_image', 'ticket_image', 'tags_display']
         extra_kwargs = {
             'category': {'write_only': True},
@@ -150,6 +162,17 @@ class ListingSerializer(serializers.ModelSerializer):
         if isinstance(value, str) and value.isdigit():
             return int(value)
         return value
+
+    def _normalize_coordinate(self, value, field_name):
+        if value in (None, ''):
+            return None
+
+        try:
+            decimal_value = Decimal(str(value)).quantize(Decimal('0.000001'), rounding=ROUND_HALF_UP)
+        except (InvalidOperation, ValueError, TypeError):
+            raise serializers.ValidationError(f'Enter a valid {field_name}.')
+
+        return decimal_value
     
     def get_primary_image(self, obj):
         """Get primary image URL - return full URL if it's a relative path."""
@@ -229,6 +252,23 @@ class ListingSerializer(serializers.ModelSerializer):
         if request and request.user.is_authenticated:
             return obj.saved_by.filter(user=request.user).exists()
         return False
+
+    def get_user_has_ticket(self, obj):
+        """Check if current user already has a confirmed ticket for this listing."""
+        request = self.context.get('request')
+        if request and request.user.is_authenticated:
+            return obj.tickets.filter(user=request.user, status='confirmed').exists()
+        return False
+
+    def get_owner_can_edit(self, obj):
+        request = self.context.get('request')
+        if not request:
+            return False
+        return obj.owner_can_edit(request.user)
+
+    def get_owner_edit_expires_at(self, obj):
+        expires_at = getattr(obj, 'owner_edit_expires_at', None)
+        return expires_at.isoformat() if expires_at else None
     
     def validate(self, data):
         """Validate the entire data object."""
@@ -354,6 +394,9 @@ class ListingListSerializer(serializers.ModelSerializer):
     tags = TagSerializer(many=True, read_only=True)
     vibe_percentage = serializers.SerializerMethodField()
     user_has_saved = serializers.SerializerMethodField()
+    user_has_ticket = serializers.SerializerMethodField()
+    owner_can_edit = serializers.SerializerMethodField()
+    owner_edit_expires_at = serializers.SerializerMethodField()
     saved_count = serializers.ReadOnlyField()
     
     class Meta:
@@ -362,7 +405,7 @@ class ListingListSerializer(serializers.ModelSerializer):
             'id', 'name', 'listing_kind', 'category_name', 'category_slug', 'category_icon',
             'address', 'phone', 'price_range', 'display_price', 'app_data',
             'primary_image', 'ticket_image', 'average_rating', 'rating_count', 'comment_count', 'is_trending', 'is_verified',
-            'tags', 'vibe_percentage', 'user_has_saved', 'saved_count',
+            'tags', 'vibe_percentage', 'user_has_saved', 'user_has_ticket', 'owner_can_edit', 'owner_edit_expires_at', 'saved_count',
             'owner', 'owner_name', 'created_at', 'latitude', 'longitude'
         ]
     
@@ -418,18 +461,84 @@ class ListingListSerializer(serializers.ModelSerializer):
         vibing_count = obj.vibes.filter(is_vibing=True).count()
         return round((vibing_count / total_vibes) * 100)
 
-    def get_comment_count(self, obj):
-        annotated = getattr(obj, 'comment_count', None)
-        if annotated is not None:
-            return int(annotated)
-        return obj.comments.filter(is_deleted=False).count()
-
     def get_user_has_saved(self, obj):
-        """Check if current user has saved this listing."""
         request = self.context.get('request')
         if request and request.user.is_authenticated:
             return obj.saved_by.filter(user=request.user).exists()
         return False
+
+    def get_user_has_ticket(self, obj):
+        request = self.context.get('request')
+        if request and request.user.is_authenticated:
+            return obj.tickets.filter(user=request.user, status='confirmed').exists()
+        return False
+
+    def get_owner_can_edit(self, obj):
+        request = self.context.get('request')
+        if not request:
+            return False
+        return obj.owner_can_edit(request.user)
+
+    def get_owner_edit_expires_at(self, obj):
+        expires_at = getattr(obj, 'owner_edit_expires_at', None)
+        return expires_at.isoformat() if expires_at else None
+
+
+class TicketSerializer(serializers.ModelSerializer):
+    """Serializer for booked tickets."""
+
+    listing = ListingSerializer(read_only=True)
+    listing_id = serializers.IntegerField(source='listing.id', read_only=True)
+    listing_name = serializers.CharField(source='listing.name', read_only=True)
+    buyer_name = serializers.CharField(source='user.name', read_only=True, allow_null=True)
+    buyer_email = serializers.CharField(source='user.email', read_only=True, allow_null=True)
+    can_cancel = serializers.SerializerMethodField()
+    can_mark_used = serializers.SerializerMethodField()
+    can_manage = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Ticket
+        fields = [
+            'id',
+            'listing',
+            'listing_id',
+            'listing_name',
+            'buyer_name',
+            'buyer_email',
+            'reference_code',
+            'qr_payload',
+            'status',
+            'can_cancel',
+            'can_mark_used',
+            'can_manage',
+            'booked_at',
+            'updated_at',
+        ]
+        read_only_fields = fields
+
+    def _request_user(self):
+        request = self.context.get('request')
+        if not request:
+            return None
+        return request.user
+
+    def get_can_cancel(self, obj):
+        user = self._request_user()
+        if not user or not user.is_authenticated or obj.status != 'confirmed':
+            return False
+        return user.is_superuser or user.id == obj.user_id or user.id == obj.listing.owner_id
+
+    def get_can_mark_used(self, obj):
+        user = self._request_user()
+        if not user or not user.is_authenticated or obj.status != 'confirmed':
+            return False
+        return user.is_superuser or user.id == obj.listing.owner_id
+
+    def get_can_manage(self, obj):
+        user = self._request_user()
+        if not user or not user.is_authenticated:
+            return False
+        return user.is_superuser or user.id == obj.listing.owner_id
 
 
 class RatingCreateSerializer(serializers.ModelSerializer):

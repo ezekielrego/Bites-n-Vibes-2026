@@ -3,16 +3,39 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticatedOrReadOnly, IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
-from django.shortcuts import get_object_or_404
-from django.db.models import F
+from django.db.models import F, Q
+from django.utils import timezone
 from accounts.serializers import UserSerializer
+from notifications.models import Notification
 from notifications.serializers import NotificationSerializer
-from .models import Category, Tag, Listing, ListingImage, Rating, Vibe, SavedListing, ListingViewHistory
+from .models import (
+    Category,
+    Tag,
+    Listing,
+    ListingImage,
+    ListingMediaPolicy,
+    Rating,
+    Ticket,
+    Vibe,
+    SavedListing,
+    ListingViewHistory,
+)
 from .serializers import (
     CategorySerializer, TagSerializer, ListingSerializer,
     ListingListSerializer, ListingImageSerializer,
-    RatingSerializer, RatingCreateSerializer, VibeSerializer
+    RatingSerializer, RatingCreateSerializer, TicketSerializer, VibeSerializer
 )
+
+
+def build_ticket_queryset():
+    return Ticket.objects.select_related('listing__category', 'listing__owner', 'user').prefetch_related(
+        'listing__tags',
+        'listing__images',
+        'listing__ratings',
+        'listing__vibes',
+        'listing__saved_by',
+        'listing__tickets',
+    )
 
 
 class CategoryViewSet(viewsets.ReadOnlyModelViewSet):
@@ -34,7 +57,7 @@ class TagViewSet(viewsets.ReadOnlyModelViewSet):
 class ListingViewSet(viewsets.ModelViewSet):
     """ViewSet for Listing."""
     queryset = Listing.objects.filter(is_active=True).prefetch_related(
-        'tags', 'images', 'category', 'owner', 'ratings', 'vibes', 'saved_by', 'view_histories'
+        'tags', 'images', 'category', 'owner', 'ratings', 'vibes', 'saved_by', 'view_histories', 'tickets'
     ).select_related('category', 'owner')
     permission_classes = [IsAuthenticatedOrReadOnly]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
@@ -54,9 +77,47 @@ class ListingViewSet(viewsets.ModelViewSet):
         context['request'] = self.request
         return context
 
+    def _can_manage_listing(self, listing, user):
+        return bool(user and user.is_authenticated and (user.is_superuser or listing.owner_id == user.id))
+
+    def _edit_window_error(self, listing):
+        expires_at = timezone.localtime(listing.owner_edit_expires_at)
+        formatted = expires_at.strftime('%d %b at %H:%M')
+        return Response(
+            {'detail': f'This listing can only be edited in the first 24 hours after posting. The edit window closed on {formatted}.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    def _ensure_editable(self, listing, user):
+        if not self._can_manage_listing(listing, user):
+            return Response(
+                {'detail': 'You do not have permission to edit this listing.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        if not listing.owner_can_edit(user):
+            return self._edit_window_error(listing)
+
+        return None
+
+    def _run_media_cleanup(self):
+        try:
+            ListingMediaPolicy.get_solo().cleanup_expired_videos()
+        except Exception:
+            return
+
+    def list(self, request, *args, **kwargs):
+        self._run_media_cleanup()
+        return super().list(request, *args, **kwargs)
+
+    def retrieve(self, request, *args, **kwargs):
+        self._run_media_cleanup()
+        return super().retrieve(request, *args, **kwargs)
+
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticatedOrReadOnly], url_path='app-feed')
     def app_feed(self, request):
         """Compact app bootstrap payload for the mobile client."""
+        self._run_media_cleanup()
         categories = CategorySerializer(
             Category.objects.filter(is_active=True),
             many=True,
@@ -78,6 +139,7 @@ class ListingViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticatedOrReadOnly], url_path='app-bootstrap')
     def app_bootstrap(self, request):
         """Full app payload with authenticated user context."""
+        self._run_media_cleanup()
         listings = self.get_queryset()
         payload = {
             'categories': CategorySerializer(
@@ -96,7 +158,7 @@ class ListingViewSet(viewsets.ModelViewSet):
             history_entries = (
                 request.user.listing_view_histories.select_related('listing__category', 'listing__owner')
                 .prefetch_related('listing__tags', 'listing__images', 'listing__ratings', 'listing__vibes', 'listing__saved_by')
-                .order_by('-viewed_at')[:20]
+                .order_by('-viewed_at')[:60]
             )
             history_listings = [entry.listing for entry in history_entries if entry.listing.is_active]
             payload.update(
@@ -117,6 +179,16 @@ class ListingViewSet(viewsets.ModelViewSet):
                         many=True,
                         context={'request': request},
                     ).data,
+                    'tickets': TicketSerializer(
+                        build_ticket_queryset().filter(user=request.user)[:40],
+                        many=True,
+                        context={'request': request},
+                    ).data,
+                    'received_tickets': TicketSerializer(
+                        build_ticket_queryset().filter(listing__owner=request.user)[:60],
+                        many=True,
+                        context={'request': request},
+                    ).data,
                 }
             )
 
@@ -125,6 +197,7 @@ class ListingViewSet(viewsets.ModelViewSet):
     def create(self, request, *args, **kwargs):
         """Override create to provide user-friendly error messages."""
         try:
+            self._run_media_cleanup()
             serializer = self.get_serializer(data=request.data)
             if not serializer.is_valid():
                 # Build user-friendly error messages
@@ -153,13 +226,10 @@ class ListingViewSet(viewsets.ModelViewSet):
         """Upload multiple listing media files for a listing."""
         try:
             listing = self.get_object()
-            
-            # Check if user owns the listing or is superuser
-            if listing.owner != request.user and not request.user.is_superuser:
-                return Response(
-                    {'detail': 'You do not have permission to upload images to this listing.'},
-                    status=status.HTTP_403_FORBIDDEN
-                )
+
+            permission_error = self._ensure_editable(listing, request.user)
+            if permission_error:
+                return permission_error
             
             media_files = request.FILES.getlist('media') or request.FILES.getlist('images')
             
@@ -177,8 +247,7 @@ class ListingViewSet(viewsets.ModelViewSet):
                 if media_kind not in {'image', 'video'}:
                     content_type = getattr(media_file, 'content_type', '') or ''
                     media_kind = 'video' if content_type.startswith('video/') else 'image'
-                if media_kind == 'video' and image_type != 'gallery':
-                    image_type = 'gallery'
+                poster_file = request.FILES.get(f'poster_{idx}')
                 requested_primary = str(request.data.get(f'is_primary_{idx}', '')).lower() in {'1', 'true', 'yes', 'on'}
                 is_primary = media_kind == 'image' and (requested_primary or not has_primary_image)
                 if is_primary:
@@ -194,6 +263,8 @@ class ListingViewSet(viewsets.ModelViewSet):
                 )
                 if media_kind == 'video':
                     payload['video'] = media_file
+                    if poster_file:
+                        payload['image'] = poster_file
                 else:
                     payload['image'] = media_file
                 listing_image = ListingImage.objects.create(**payload)
@@ -201,7 +272,8 @@ class ListingViewSet(viewsets.ModelViewSet):
                     listing_image,
                     context={'request': request}
                 ).data)
-            
+
+            self._run_media_cleanup()
             return Response(uploaded_images, status=status.HTTP_201_CREATED)
         except Exception as e:
             return Response(
@@ -259,6 +331,20 @@ class ListingViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(listings, many=True)
         return Response(serializer.data)
 
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated], url_path='my-tickets')
+    def my_tickets(self, request):
+        """Get the current user's booked tickets."""
+        tickets = build_ticket_queryset().filter(user=request.user)
+        serializer = TicketSerializer(tickets, many=True, context={'request': request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated], url_path='received-tickets')
+    def received_tickets(self, request):
+        """Get tickets booked for the current user's hosted listings."""
+        tickets = build_ticket_queryset().filter(listing__owner=request.user)
+        serializer = TicketSerializer(tickets, many=True, context={'request': request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated], url_path='saved')
     def saved(self, request):
         """Get listings saved by the current user."""
@@ -269,14 +355,11 @@ class ListingViewSet(viewsets.ModelViewSet):
     def update(self, request, *args, **kwargs):
         """Update listing - allow superusers to update any listing."""
         listing = self.get_object()
-        
-        # Check permissions: owner or superuser
-        if listing.owner != request.user and not request.user.is_superuser:
-            return Response(
-                {'detail': 'You do not have permission to edit this listing.'},
-                status=status.HTTP_403_FORBIDDEN
-            )
-        
+
+        permission_error = self._ensure_editable(listing, request.user)
+        if permission_error:
+            return permission_error
+
         return super().update(request, *args, **kwargs)
     
     def destroy(self, request, *args, **kwargs):
@@ -345,6 +428,72 @@ class ListingViewSet(viewsets.ModelViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated], url_path='book')
+    def book(self, request, pk=None):
+        """Create or fetch a confirmed ticket for the current user."""
+        listing = self.get_object()
+        ticket, created = Ticket.objects.get_or_create(
+            listing=listing,
+            user=request.user,
+            defaults={'status': 'confirmed'},
+        )
+
+        if ticket.status != 'confirmed':
+            ticket.status = 'confirmed'
+            ticket.save(update_fields=['status', 'updated_at'])
+
+        Notification.objects.create(
+            user=request.user,
+            notification_type='ticket',
+            title='Ticket ready',
+            message=f'Your pass for {listing.name} is now ready in the app.',
+            listing=listing,
+        )
+
+        if listing.owner_id and listing.owner_id != request.user.id:
+            buyer_name = getattr(request.user, 'name', '') or request.user.email
+            Notification.objects.create(
+                user=listing.owner,
+                notification_type='booking',
+                title='New ticket booked',
+                message=f'{buyer_name} booked a ticket for {listing.name}.',
+                listing=listing,
+            )
+
+        serializer = TicketSerializer(ticket, context={'request': request})
+        return Response(
+            {
+                'created': created,
+                'ticket': serializer.data,
+            },
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated], url_path='clear-history')
+    def clear_history(self, request):
+        """Clear the current user's viewed listing history."""
+        deleted_count, _ = request.user.listing_view_histories.all().delete()
+        return Response(
+            {
+                'message': 'History cleared.',
+                'deleted_count': deleted_count,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated], url_path='remove-from-history')
+    def remove_from_history(self, request, pk=None):
+        """Remove a single listing from the current user's view history."""
+        listing = self.get_object()
+        deleted_count, _ = request.user.listing_view_histories.filter(listing=listing).delete()
+        return Response(
+            {
+                'listing_id': listing.id,
+                'removed': deleted_count > 0,
+            },
+            status=status.HTTP_200_OK,
+        )
+
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated], url_path='record-view')
     def record_view(self, request, pk=None):
         """Persist a user's viewed listing history."""
@@ -383,3 +532,111 @@ class ListingViewSet(viewsets.ModelViewSet):
             return Response(serializer.data)
         except Vibe.DoesNotExist:
             return Response({'is_vibing': None}, status=status.HTTP_200_OK)
+
+
+class TicketViewSet(viewsets.ReadOnlyModelViewSet):
+    """ViewSet for user and owner ticket management."""
+
+    serializer_class = TicketSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = None
+
+    def get_queryset(self):
+        user = self.request.user
+        return build_ticket_queryset().filter(
+            Q(user=user) | Q(listing__owner=user) | Q(listing__owner__isnull=True, user=user)
+        ).distinct()
+
+    def list(self, request, *args, **kwargs):
+        serializer = self.get_serializer(build_ticket_queryset().filter(user=request.user), many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get'], url_path='received')
+    def received(self, request):
+        serializer = self.get_serializer(build_ticket_queryset().filter(listing__owner=request.user), many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        ticket = self.get_object()
+
+        if ticket.status != 'confirmed':
+            return Response(
+                {'detail': 'Only confirmed tickets can be cancelled.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        is_owner = request.user.is_superuser or request.user.id == ticket.listing.owner_id
+        is_buyer = request.user.id == ticket.user_id
+        if not (is_owner or is_buyer):
+            return Response(
+                {'detail': 'You do not have permission to cancel this ticket.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        ticket.status = 'cancelled'
+        ticket.save(update_fields=['status', 'updated_at'])
+
+        if is_buyer and ticket.listing.owner_id and ticket.listing.owner_id != request.user.id:
+            buyer_name = getattr(request.user, 'name', '') or request.user.email
+            Notification.objects.create(
+                user=ticket.listing.owner,
+                notification_type='booking',
+                title='Ticket cancelled',
+                message=f'{buyer_name} cancelled their ticket for {ticket.listing.name}.',
+                listing=ticket.listing,
+            )
+        elif is_owner and ticket.user_id != request.user.id:
+            Notification.objects.create(
+                user=ticket.user,
+                notification_type='ticket',
+                title='Ticket cancelled',
+                message=f'Your ticket for {ticket.listing.name} was cancelled by the host.',
+                listing=ticket.listing,
+            )
+
+        serializer = self.get_serializer(ticket)
+        return Response(
+            {
+                'message': 'Ticket cancelled.',
+                'ticket': serializer.data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=['post'], url_path='mark-used')
+    def mark_used(self, request, pk=None):
+        ticket = self.get_object()
+
+        if ticket.status != 'confirmed':
+            return Response(
+                {'detail': 'Only confirmed tickets can be marked as used.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not (request.user.is_superuser or request.user.id == ticket.listing.owner_id):
+            return Response(
+                {'detail': 'You do not have permission to manage this ticket.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        ticket.status = 'used'
+        ticket.save(update_fields=['status', 'updated_at'])
+
+        if ticket.user_id != request.user.id:
+            Notification.objects.create(
+                user=ticket.user,
+                notification_type='ticket',
+                title='Ticket checked in',
+                message=f'Your ticket for {ticket.listing.name} has been marked as used.',
+                listing=ticket.listing,
+            )
+
+        serializer = self.get_serializer(ticket)
+        return Response(
+            {
+                'message': 'Ticket marked as used.',
+                'ticket': serializer.data,
+            },
+            status=status.HTTP_200_OK,
+        )

@@ -14,18 +14,27 @@ export function AuthScreen({
   authMessage,
   busyProvider,
   onEmailLogin,
+  onForgotPassword,
   onGoogleLogin,
+  onCancelReset,
   onPasswordLogin,
+  onResetPassword,
+  passwordResetToken,
 }: {
   authError: string | null;
   authMessage: string | null;
-  busyProvider: 'google' | 'email' | 'password' | null;
+  busyProvider: 'google' | 'email' | 'password' | 'reset' | null;
   onEmailLogin: (email: string) => Promise<void>;
+  onForgotPassword: (email: string) => Promise<void>;
   onGoogleLogin: () => Promise<void>;
+  onCancelReset: () => void;
   onPasswordLogin: (email: string, password: string) => Promise<void>;
+  onResetPassword: (password: string, confirmPassword: string) => Promise<void>;
+  passwordResetToken: string | null;
 }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
   const [localError, setLocalError] = useState<string | null>(null);
 
   const validateEmail = () => {
@@ -63,6 +72,30 @@ export function AuthScreen({
     await onPasswordLogin(trimmed, password);
   };
 
+  const handleForgotPassword = async () => {
+    const trimmed = validateEmail();
+    if (!trimmed) {
+      return;
+    }
+
+    await onForgotPassword(trimmed);
+  };
+
+  const handleResetPassword = async () => {
+    if (!password.trim()) {
+      setLocalError('Enter your new password first.');
+      return;
+    }
+
+    if (!confirmPassword.trim()) {
+      setLocalError('Confirm your new password to continue.');
+      return;
+    }
+
+    setLocalError(null);
+    await onResetPassword(password, confirmPassword);
+  };
+
   return (
     <ScrollView
       bounces={false}
@@ -75,72 +108,122 @@ export function AuthScreen({
       </View>
 
       <View style={styles.copyWrap}>
-        <Text style={styles.title}>Welcome back</Text>
+        <Text style={styles.title}>{passwordResetToken ? 'Reset password' : 'Welcome back'}</Text>
       </View>
 
       <View style={styles.authCard}>
-        <AuthButton
-          disabled={busyProvider !== null}
-          icon="chrome"
-          label={busyProvider === 'google' ? 'Opening Google...' : 'Continue with Google'}
-          onPress={() => void onGoogleLogin()}
-          tone="paper"
-        />
+        {passwordResetToken ? (
+          <>
+            <View style={styles.fieldGroup}>
+              <Text style={styles.fieldLabel}>New password</Text>
+              <TextInput
+                autoCapitalize="none"
+                autoCorrect={false}
+                placeholder="Choose a new password"
+                placeholderTextColor={theme.colors.textSoft}
+                secureTextEntry
+                style={styles.input}
+                value={password}
+                onChangeText={setPassword}
+              />
+            </View>
 
-        <View style={styles.dividerRow}>
-          <View style={styles.divider} />
-          <Text style={styles.dividerText}>or</Text>
-          <View style={styles.divider} />
-        </View>
+            <View style={styles.fieldGroup}>
+              <Text style={styles.fieldLabel}>Confirm password</Text>
+              <TextInput
+                autoCapitalize="none"
+                autoCorrect={false}
+                placeholder="Repeat the password"
+                placeholderTextColor={theme.colors.textSoft}
+                secureTextEntry
+                style={styles.input}
+                value={confirmPassword}
+                onChangeText={setConfirmPassword}
+              />
+            </View>
 
-        <View style={styles.fieldGroup}>
-          <Text style={styles.fieldLabel}>Email</Text>
-          <TextInput
-            autoCapitalize="none"
-            autoCorrect={false}
-            keyboardType="email-address"
-            placeholder="you@example.com"
-            placeholderTextColor={theme.colors.textSoft}
-            style={styles.input}
-            value={email}
-            onChangeText={setEmail}
-          />
-        </View>
+            <AuthButton
+              disabled={busyProvider !== null}
+              icon="lock"
+              label={busyProvider === 'reset' ? 'Updating...' : 'Update password'}
+              onPress={() => void handleResetPassword()}
+              tone="accent"
+            />
 
-        <View style={styles.fieldGroup}>
-          <View style={styles.fieldLabelRow}>
-            <Text style={styles.fieldLabel}>Password</Text>
-            <Pressable onPress={() => void handleEmailLogin()}>
-              <Text style={styles.inlineLink}>Forgot password?</Text>
-            </Pressable>
-          </View>
-          <TextInput
-            autoCapitalize="none"
-            autoCorrect={false}
-            placeholder="Enter your password"
-            placeholderTextColor={theme.colors.textSoft}
-            secureTextEntry
-            style={styles.input}
-            value={password}
-            onChangeText={setPassword}
-          />
-        </View>
+            <AuthButton
+              disabled={busyProvider !== null}
+              icon="chevron-left"
+              label="Back to sign in"
+              onPress={onCancelReset}
+              tone="paper"
+            />
+          </>
+        ) : (
+          <>
+            <AuthButton
+              disabled={busyProvider !== null}
+              icon="chrome"
+              label={busyProvider === 'google' ? 'Opening Google...' : 'Continue with Google'}
+              onPress={() => void onGoogleLogin()}
+              tone="paper"
+            />
 
-        <AuthButton
-          disabled={busyProvider !== null}
-          icon="lock"
-          label={busyProvider === 'password' ? 'Signing in...' : 'Sign in'}
-          onPress={() => void handlePasswordLogin()}
-          tone="accent"
-        />
+            <View style={styles.dividerRow}>
+              <View style={styles.divider} />
+              <Text style={styles.dividerText}>or</Text>
+              <View style={styles.divider} />
+            </View>
 
-        <AuthButton
-          disabled={busyProvider !== null}
-          icon="mail"
-          label={busyProvider === 'email' ? 'Sending link...' : 'Send login link'}
-          onPress={() => void handleEmailLogin()}
-          tone="paper"
-        />
+            <View style={styles.fieldGroup}>
+              <Text style={styles.fieldLabel}>Email</Text>
+              <TextInput
+                autoCapitalize="none"
+                autoCorrect={false}
+                keyboardType="email-address"
+                placeholder="you@example.com"
+                placeholderTextColor={theme.colors.textSoft}
+                style={styles.input}
+                value={email}
+                onChangeText={setEmail}
+              />
+            </View>
+
+            <View style={styles.fieldGroup}>
+              <View style={styles.fieldLabelRow}>
+                <Text style={styles.fieldLabel}>Password</Text>
+                <Pressable onPress={() => void handleForgotPassword()}>
+                  <Text style={styles.inlineLink}>Forgot password?</Text>
+                </Pressable>
+              </View>
+              <TextInput
+                autoCapitalize="none"
+                autoCorrect={false}
+                placeholder="Enter your password"
+                placeholderTextColor={theme.colors.textSoft}
+                secureTextEntry
+                style={styles.input}
+                value={password}
+                onChangeText={setPassword}
+              />
+            </View>
+
+            <AuthButton
+              disabled={busyProvider !== null}
+              icon="lock"
+              label={busyProvider === 'password' ? 'Signing in...' : 'Sign in'}
+              onPress={() => void handlePasswordLogin()}
+              tone="accent"
+            />
+
+            <AuthButton
+              disabled={busyProvider !== null}
+              icon="mail"
+              label={busyProvider === 'email' ? 'Sending link...' : 'Send login link'}
+              onPress={() => void handleEmailLogin()}
+              tone="paper"
+            />
+          </>
+        )}
 
         {localError || authError ? (
           <StatusCard icon="info" message={localError ?? authError ?? ''} tone="error" />

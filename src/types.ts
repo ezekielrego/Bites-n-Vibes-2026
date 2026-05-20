@@ -1,6 +1,6 @@
 import type { ImageSourcePropType } from 'react-native';
 
-export type Screen = 'home' | 'details' | 'ticket';
+export type Screen = 'home' | 'details' | 'ticket' | 'nearby';
 export type TabId = 'discover' | 'saved' | 'create' | 'inbox' | 'profile';
 export type CategoryId = string;
 export type ContactIconName = 'phone-call' | 'mail' | 'globe';
@@ -104,10 +104,29 @@ export interface AppEvent {
   contacts: EventContactLink[];
   socials: EventSocialLink[];
   isSaved: boolean;
+  hasTicket: boolean;
   ownerName?: string | null;
+  ownerCanEdit?: boolean;
+  ownerEditExpiresAt?: string | null;
   createdAt?: string;
   ratingCount?: number;
   commentCount?: number;
+}
+
+export interface AppTicket {
+  id: string;
+  eventId: string;
+  event: AppEvent;
+  buyerName?: string | null;
+  buyerEmail?: string | null;
+  referenceCode: string;
+  qrValue: string;
+  status: 'confirmed' | 'used' | 'cancelled';
+  canCancel: boolean;
+  canMarkUsed: boolean;
+  canManage: boolean;
+  bookedAt: string;
+  updatedAt: string;
 }
 
 export type CommentAttachmentType = 'image' | 'video' | 'link';
@@ -184,16 +203,25 @@ export interface AppBootstrap {
   events: AppEvent[];
   myListings: AppEvent[];
   history: AppEvent[];
+  tickets: AppTicket[];
+  receivedTickets: AppTicket[];
   notifications: AppNotification[];
   unreadNotificationCount: number;
   profile: AppUser | null;
 }
 
-export interface LocalUploadImage {
+export interface LocalUploadFile {
   uri: string;
   name: string;
   mimeType: string;
   webFile?: File | null;
+}
+
+export interface LocalUploadImage extends LocalUploadFile {
+  previewUri?: string | null;
+  fileSize?: number | null;
+  durationMs?: number | null;
+  posterImage?: LocalUploadFile | null;
 }
 
 export interface AppCommentPage {
@@ -234,8 +262,23 @@ export interface CreateAppEventInput {
   phone: string;
   email: string;
   website: string;
-  heroImage: LocalUploadImage;
+  heroImage: LocalUploadImage | null;
   ticketImage?: LocalUploadImage | null;
   galleryMedia: LocalUploadImage[];
+  existingMedia?: AppEventMedia[];
   socials: Partial<Record<SocialPlatform, string>>;
+}
+
+export interface UpdateProfileInput {
+  name: string;
+  phone: string;
+  emailNotificationsEnabled: boolean;
+  pushNotificationsEnabled: boolean;
+  avatar?: LocalUploadImage | null;
+}
+
+export interface ChangePasswordInput {
+  oldPassword?: string;
+  newPassword: string;
+  confirmPassword: string;
 }

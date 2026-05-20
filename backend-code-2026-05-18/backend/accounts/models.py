@@ -123,3 +123,33 @@ class EmailLoginToken(models.Model):
     def __str__(self):
         return f"Email login for {self.user.email}"
 
+
+class PushDevice(models.Model):
+    """Registered push-capable client devices for a user."""
+
+    PLATFORM_CHOICES = [
+        ('android', 'Android'),
+        ('ios', 'iOS'),
+        ('web', 'Web'),
+        ('unknown', 'Unknown'),
+    ]
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='push_devices')
+    token = models.CharField(max_length=255, unique=True)
+    platform = models.CharField(max_length=20, choices=PLATFORM_CHOICES, default='unknown')
+    device_name = models.CharField(max_length=120, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    last_registered_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'push_devices'
+        ordering = ['-last_registered_at']
+        indexes = [
+            models.Index(fields=['user', 'is_active']),
+            models.Index(fields=['platform', 'is_active']),
+        ]
+
+    def __str__(self):
+        return f"{self.user.email} - {self.platform} push device"
