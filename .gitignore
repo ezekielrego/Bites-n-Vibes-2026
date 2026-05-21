@@ -11,6 +11,8 @@ web-build/
 __pycache__/
 *.py[cod]
 *.sqlite3
+backend-code-2026-05-18/backend/*firebase-adminsdk*.json
+backend-code-2026-05-18/backend/firebase-service-account*.json
 **/.venv/
 **/venv/
 Thumbs.db

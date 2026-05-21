@@ -19,6 +19,7 @@
     },
     "android": {
       "package": "zw.co.bitesnvibes.app",
+      "googleServicesFile": "./google-services.json",
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
       "adaptiveIcon": {

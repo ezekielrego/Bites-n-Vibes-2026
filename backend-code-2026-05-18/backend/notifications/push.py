@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from django.conf import settings
 
@@ -88,7 +89,10 @@ def _load_firebase():
         if settings.FIREBASE_CREDENTIALS_JSON:
             credential = credentials.Certificate(json.loads(settings.FIREBASE_CREDENTIALS_JSON))
         elif settings.FIREBASE_CREDENTIALS_PATH:
-            credential = credentials.Certificate(settings.FIREBASE_CREDENTIALS_PATH)
+            credentials_path = Path(settings.FIREBASE_CREDENTIALS_PATH)
+            if not credentials_path.is_absolute():
+                credentials_path = Path(settings.BASE_DIR) / credentials_path
+            credential = credentials.Certificate(str(credentials_path))
 
         if not credential:
             return None

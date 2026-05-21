@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "691119173881",
+    "project_id": "hatapp-856bb",
+    "storage_bucket": "hatapp-856bb.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:691119173881:android:825b99f86761e1efb77228",
+        "android_client_info": {
+          "package_name": "zw.co.bitesnvibes.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBtAB8uFPVCV6GlrPRHxspjrvp7Q0z6z6Y"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
