@@ -1,8 +1,10 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
   Animated,
+  FlatList,
+  Linking,
   Modal,
   Platform,
   Pressable,
@@ -10,16 +12,23 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  type ImageSourcePropType,
+  useWindowDimensions,
+  type ViewToken,
   View,
 } from 'react-native';
 import DateTimePicker, { type DateTimePickerEvent } from '@react-native-community/datetimepicker';
+import { CameraView, useCameraPermissions } from 'expo-camera';
 import { Feather } from '@expo/vector-icons';
 import { Image } from 'expo-image';
+import { ResizeMode, Video } from 'expo-av';
 import * as ImagePicker from 'expo-image-picker';
 import * as Location from 'expo-location';
 import * as VideoThumbnails from 'expo-video-thumbnails';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { APP_VERSION } from '../constants';
+import { setListingInternalPayments, verifyTicketQr, verifyTicketReference } from '../api';
+import { BACKEND_ORIGIN } from '../config';
 import { shadow, theme } from '../theme';
 import {
   AppCategory,
@@ -101,6 +110,7 @@ type CreateDraft = {
   facebook: string;
   instagram: string;
   x: string;
+  acceptsInternalPayments: boolean;
 };
 
 export function SavedTabView({
@@ -134,33 +144,203 @@ export function SavedTabView({
   );
 }
 
+type StreamVideoItem = {
+  id: string;
+  event: AppEvent;
+  source: string;
+  poster: string | ImageSourcePropType | null;
+};
+
+export function StreamTabView({
+  events,
+  onSelectEvent,
+  onToggleSave,
+}: {
+  events: AppEvent[];
+  onSelectEvent: (event: AppEvent) => void;
+  onToggleSave: (event: AppEvent) => void;
+}) {
+  const insets = useSafeAreaInsets();
+  const { height } = useWindowDimensions();
+  const [activeVideoId, setActiveVideoId] = useState<string | null>(null);
+  const [viewerItem, setViewerItem] = useState<StreamVideoItem | null>(null);
+  const streamItems = useMemo(
+    () =>
+      events.flatMap((event) =>
+        event.media
+          .filter((item) => item.kind === 'video')
+          .map((item) => ({
+            id: `${event.id}:${item.id}`,
+            event,
+            source: item.source,
+            poster: item.preview ?? event.image ?? null,
+          })),
+      ),
+    [events],
+  );
+  const itemHeight = Math.max(height - insets.bottom, 560);
+  const viewabilityConfig = useRef({
+    itemVisiblePercentThreshold: 48,
+    minimumViewTime: 60,
+  }).current;
+  const onViewableItemsChanged = useRef(({ viewableItems }: { viewableItems: Array<ViewToken<StreamVideoItem>> }) => {
+    setActiveVideoId(viewableItems[0]?.item.id ?? null);
+  }).current;
+
+  useEffect(() => {
+    if (!activeVideoId && streamItems.length > 0) {
+      setActiveVideoId(streamItems[0].id);
+    }
+  }, [activeVideoId, streamItems]);
+
+  if (streamItems.length === 0) {
+    return (
+      <View style={[styles.streamEmpty, { paddingTop: insets.top + 24, paddingBottom: insets.bottom + 110 }]}>
+        <Feather color={theme.colors.accentStrong} name={'play-circle' as FeatherName} size={26} />
+        <Text style={styles.streamEmptyTitle}>No stream videos yet</Text>
+        <Text style={styles.streamEmptyCopy}>Videos attached to listings will play here once creators add them.</Text>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.streamRoot}>
+      <FlatList
+        data={streamItems}
+        keyExtractor={(item) => item.id}
+        getItemLayout={(_, index) => ({
+          length: itemHeight,
+          offset: itemHeight * index,
+          index,
+        })}
+        initialNumToRender={2}
+        maxToRenderPerBatch={2}
+        snapToAlignment="start"
+        snapToInterval={itemHeight}
+        decelerationRate="fast"
+        windowSize={3}
+        removeClippedSubviews
+        onViewableItemsChanged={onViewableItemsChanged}
+        viewabilityConfig={viewabilityConfig}
+        showsVerticalScrollIndicator={false}
+        renderItem={({ item }) => (
+          <StreamVideoCard
+            active={item.id === activeVideoId}
+            height={itemHeight}
+            item={item}
+            safeTop={insets.top}
+            onOpen={() => onSelectEvent(item.event)}
+            onOpenViewer={() => setViewerItem(item)}
+            onToggleSave={() => onToggleSave(item.event)}
+          />
+        )}
+      />
+
+      <Modal
+        animationType="fade"
+        onRequestClose={() => setViewerItem(null)}
+        statusBarTranslucent
+        visible={Boolean(viewerItem)}
+      >
+        <View style={styles.streamViewerRoot}>
+          <View style={[styles.streamViewerHeader, { paddingTop: insets.top + 8 }]}>
+            <View style={styles.streamViewerCopy}>
+              <Text numberOfLines={1} style={styles.streamViewerTitle}>{viewerItem?.event.title ?? 'Stream video'}</Text>
+              <Text numberOfLines={1} style={styles.streamViewerSubtitle}>{viewerItem?.event.venue ?? ''}</Text>
+            </View>
+            <Pressable onPress={() => setViewerItem(null)} style={styles.streamViewerClose}>
+              <Feather color={theme.colors.white} name="x" size={20} />
+            </Pressable>
+          </View>
+
+          {viewerItem ? (
+            <Video
+              isLooping={false}
+              resizeMode={ResizeMode.CONTAIN}
+              shouldPlay
+              source={{ uri: viewerItem.source }}
+              style={styles.streamViewerVideo}
+              useNativeControls
+            />
+          ) : null}
+        </View>
+      </Modal>
+    </View>
+  );
+}
+
 export function InboxTabView({
   notifications,
+  receivedTickets,
+  tickets,
   unreadCount,
   onMarkAllRead,
   onOpenNotification,
+  onOpenTicket,
 }: {
   notifications: AppNotification[];
+  receivedTickets: AppTicket[];
+  tickets: AppTicket[];
   unreadCount: number;
   onMarkAllRead: () => void;
   onOpenNotification: (notification: AppNotification) => void;
+  onOpenTicket: (ticket: AppTicket) => void;
 }) {
+  const ticketActivity = useMemo(
+    () =>
+      [
+        ...tickets.map((ticket) => ({ ticket, title: ticket.event.title, subtitle: ticket.event.venue, kind: 'Booked' })),
+        ...receivedTickets.map((ticket) => ({
+          ticket,
+          title: ticket.buyerName || 'Guest',
+          subtitle: ticket.event.title,
+          kind: 'Received',
+        })),
+      ]
+        .sort((left, right) => Date.parse(right.ticket.updatedAt || right.ticket.bookedAt) - Date.parse(left.ticket.updatedAt || left.ticket.bookedAt))
+        .slice(0, 8),
+    [receivedTickets, tickets],
+  );
+
   return (
     <View style={styles.sectionStack}>
       <View style={[styles.sectionHeading, styles.sectionHeadingTight]}>
-        <View>
+        <View style={styles.inboxHeadingCopy}>
           <Text style={styles.sectionTitle}>Inbox</Text>
           <Text style={styles.sectionCopy}>Tickets, booking moves, and event nudges land here.</Text>
         </View>
 
-        <CompactActionButton
-          label={unreadCount > 0 ? `Read all (${unreadCount})` : 'All caught up'}
-          icon="check"
+        <InboxReadAllButton
           disabled={unreadCount === 0}
+          label={unreadCount > 0 ? `Read all ${unreadCount}` : 'Caught up'}
           onPress={onMarkAllRead}
-          tone="muted"
         />
       </View>
+
+      {ticketActivity.length > 0 ? (
+        <View style={styles.profileSection}>
+          <View style={styles.compactSectionHeader}>
+            <View style={styles.compactSectionCopy}>
+              <Text style={styles.compactSectionTitle}>Ticket activity</Text>
+              <Text style={styles.compactSectionHint}>Bookings and received tickets</Text>
+            </View>
+          </View>
+
+          <View style={styles.ticketManagementList}>
+            {ticketActivity.map(({ ticket, title, subtitle, kind }) => (
+              <TicketManagementRow
+                key={`inbox-ticket-${kind}-${ticket.id}`}
+                title={title}
+                subtitle={subtitle}
+                meta={`${kind} ticket | Ref ${ticket.referenceCode} | ${formatTicketDate(ticket.bookedAt)}`}
+                status={ticket.status}
+                primaryActionLabel="Open"
+                onPrimaryAction={() => onOpenTicket(ticket)}
+              />
+            ))}
+          </View>
+        </View>
+      ) : null}
 
       {notifications.length === 0 ? (
         <EmptyState
@@ -183,11 +363,42 @@ export function InboxTabView({
   );
 }
 
+function InboxReadAllButton({
+  disabled,
+  label,
+  onPress,
+}: {
+  disabled: boolean;
+  label: string;
+  onPress: () => void;
+}) {
+  const jelly = useJellyPressAnimation({
+    pressedScaleX: 1.018,
+    pressedScaleY: 0.94,
+  });
+
+  return (
+    <Pressable
+      disabled={disabled}
+      onPress={onPress}
+      onPressIn={jelly.onPressIn}
+      onPressOut={jelly.onPressOut}
+      style={styles.inboxReadAllPressable}
+    >
+      <Animated.View style={[styles.inboxReadAllButton, disabled && styles.inboxReadAllButtonDisabled, jelly.animatedStyle]}>
+        <Feather color={disabled ? theme.colors.textSoft : theme.colors.accentStrong} name="check" size={13} />
+        <Text style={[styles.inboxReadAllText, disabled && styles.inboxReadAllTextDisabled]}>{label}</Text>
+      </Animated.View>
+    </Pressable>
+  );
+}
+
 export function CreateTabView({
   categories,
   editingEvent,
   isSubmitting,
   onCancelEdit,
+  profile,
   submitProgress,
   submitStage,
   submitError,
@@ -197,6 +408,7 @@ export function CreateTabView({
   editingEvent: AppEvent | null;
   isSubmitting: boolean;
   onCancelEdit: () => void;
+  profile: AppUser | null;
   submitProgress: number;
   submitStage: string | null;
   submitError: string | null;
@@ -211,6 +423,8 @@ export function CreateTabView({
   const [localError, setLocalError] = useState<string | null>(null);
   const [pickerMode, setPickerMode] = useState<'date' | 'time' | null>(null);
   const [detectingLocation, setDetectingLocation] = useState(false);
+  const [activeQuickSheet, setActiveQuickSheet] = useState<'details' | 'schedule' | 'location' | 'tags' | null>(null);
+  const insets = useSafeAreaInsets();
   const selectedTags = useMemo(() => splitCommaList(draft.tagsText), [draft.tagsText]);
   const selectedSchedule = useMemo(() => readScheduledDate(draft.scheduledAt), [draft.scheduledAt]);
   const scheduleSummary = useMemo(
@@ -246,6 +460,19 @@ export function CreateTabView({
     [draft.priceRange],
   );
   const showArtistField = useMemo(() => categorySupportsArtist(draft.categoryId), [draft.categoryId]);
+  const creatorAvatarSource = profile?.avatar ? profile.avatar : APP_LOGO;
+  const creatorName = profile?.name ?? 'Your profile';
+  const locationChipLabel = draft.locationLabel.trim() || draft.city.trim() || 'Location';
+  const scheduleChipLabel = selectedSchedule
+    ? selectedSchedule.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })
+    : 'When';
+  const tagChipLabel = selectedTags.length > 0 ? `${selectedTags.length} tags` : 'Tags';
+  const categoryChipLabel = selectedCategoryOption?.label ?? 'Category';
+  const hostChipLabel = draft.artist.trim() || 'Host';
+  const mediaCount =
+    draft.galleryMedia.length +
+    (draft.heroImage || editingEvent?.image ? 1 : 0) +
+    (draft.ticketImage || editingEvent?.ticketImage ? 1 : 0);
   useEffect(() => {
     if (selectableCategories.length === 0) {
       return;
@@ -469,6 +696,14 @@ export function CreateTabView({
     );
   };
 
+  const handleStoryChange = (value: string) => {
+    setDraft((current) => ({
+      ...current,
+      about: value,
+      blurb: current.blurb.trim() ? current.blurb : value.split('\n').map((item) => item.trim()).find(Boolean) ?? '',
+    }));
+  };
+
   const handleNext = () => {
     const validation = validateRequiredStep(draft, Boolean(editingEvent));
     if (validation) {
@@ -516,121 +751,132 @@ export function CreateTabView({
 
   return (
     <View style={styles.sectionStack}>
-      <View style={styles.sectionHeading}>
-        <View>
-          <Text style={styles.sectionTitle}>{editingEvent ? 'Edit listing' : 'Create'}</Text>
-          <Text style={styles.sectionCopy}>
-            {editingEvent
-              ? 'Update the important pieces now. Existing media stays in place unless you add more.'
-              : 'Start with the essentials, then add the extras when you are ready.'}
-          </Text>
+      <View style={styles.createComposerTopBar}>
+        <Pressable
+          disabled={!editingEvent}
+          onPress={onCancelEdit}
+          style={styles.createComposerTopIcon}
+        >
+          <Feather color={editingEvent ? theme.colors.text : theme.colors.textSoft} name={'x' as FeatherName} size={24} />
+        </Pressable>
+        <Text style={styles.createComposerTopTitle}>{editingEvent ? 'Edit post' : 'New post'}</Text>
+        <View style={styles.createComposerTopIcon}>
+          <Feather color={theme.colors.textSoft} name={'more-horizontal' as FeatherName} size={22} />
         </View>
-        {editingEvent ? (
-          <CompactActionButton icon="x" label="Close edit" onPress={onCancelEdit} tone="muted" />
-        ) : null}
       </View>
-
-      <StepStrip currentStep={step} />
 
       <View style={styles.formCard}>
         {step === 0 ? (
-          <View style={styles.formStepStack}>
-            <StepIntro
-              title="Basics and images"
-              copy="Collect the name, tags, and artwork first. Hero image or video is required, and you can add more gallery images or video for the details slider."
-            />
-
-            <CompactField
-              label="Listing title"
-              placeholder="Late Night Brunch"
-              value={draft.title}
-              onChangeText={(value) => setField('title', value)}
-            />
-            <CompactField
-              label="Venue"
-              placeholder="Moonline Lounge"
-              value={draft.venue}
-              onChangeText={(value) => setField('venue', value)}
-            />
-            <CompactField
-              label="City"
-              placeholder="Harare"
-              value={draft.city}
-              onChangeText={(value) => setField('city', value)}
-              optional
-            />
-            <SingleSelectDropdown
-              label="Primary category"
-              options={categoryOptions}
-              placeholder="Choose a category"
-              selectedValue={draft.categoryId}
-              selectedLabel={selectedCategoryOption?.label}
-              onSelect={handlePrimaryCategorySelect}
-            />
-
-            {showArtistField ? (
-              <CompactField
-                label="Artist or host"
-                placeholder="DJ Nova"
-                value={draft.artist}
-                onChangeText={(value) => setField('artist', value)}
-                optional
-              />
-            ) : null}
-
-            <SingleSelectDropdown
-              label="Price range"
-              options={PRICE_RANGE_SELECT_OPTIONS}
-              placeholder="Choose price range"
-              selectedValue={draft.priceRange}
-              selectedLabel={selectedPriceRangeOption?.label}
-              onSelect={(value) => setField('priceRange', value as PriceRange)}
-            />
-
-            <MultiSelectDropdown
-              label="Tags"
-              options={CREATE_TAG_OPTIONS}
-              placeholder="Select tags"
-              selectedValues={selectedTags}
-              onToggle={toggleTagSelection}
-            />
-
-            <CompactField
-              label="Price"
-              placeholder="$18"
-              value={draft.price}
-              onChangeText={(value) => setField('price', value)}
-              optional
-            />
-
-            <View style={styles.uploadRow}>
-              <View style={styles.uploadCell}>
-                <UploadTile
-                  label="Ticket image"
-                  hint="Optional"
-                  image={draft.ticketImage}
-                  remotePreview={editingEvent?.ticketImage ? String(editingEvent.ticketImage) : null}
-                  onPress={() => void handlePickImage('ticketImage')}
-                />
+          <View style={styles.createComposerStep}>
+            <View style={styles.createComposerProfileRow}>
+              <View style={styles.createComposerAvatar}>
+                <Image source={creatorAvatarSource} contentFit="cover" style={styles.createComposerAvatarImage} transition={120} />
               </View>
-              <View style={styles.uploadCell}>
-                <UploadTile
-                  label="Hero media"
-                  hint="Required"
-                  image={draft.heroImage}
-                  remotePreview={editingEvent?.image ? String(editingEvent.image) : null}
-                  onPress={() => void handlePickImage('heroImage')}
-                />
+              <View style={styles.createComposerProfileText}>
+                <Text style={styles.createComposerProfileName}>{creatorName}</Text>
+                <Text style={styles.createComposerProfileMeta}>
+                  {editingEvent ? 'Updating your listing' : 'Creating a new listing'}
+                </Text>
               </View>
             </View>
 
-            <GalleryMediaPicker
-              existingItems={editingEvent?.media ?? []}
-              items={draft.galleryMedia}
-              maxItems={MAX_CREATE_GALLERY_MEDIA}
-              onAdd={() => void handlePickGalleryMedia()}
-              onRemove={handleRemoveGalleryMedia}
-            />
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.createComposerChipRow}>
+              <CreateComposerChip
+                active={Boolean(selectedCategoryOption)}
+                icon="grid"
+                label={categoryChipLabel}
+                onPress={() => setActiveQuickSheet('details')}
+              />
+              {showArtistField ? (
+                <CreateComposerChip
+                  active={Boolean(draft.artist.trim())}
+                  icon="users"
+                  label={hostChipLabel}
+                  onPress={() => setActiveQuickSheet('details')}
+                />
+              ) : null}
+              <CreateComposerChip
+                active={Boolean(draft.locationLabel.trim() || draft.address.trim() || draft.latitude.trim())}
+                icon="map-pin"
+                label={locationChipLabel}
+                onPress={() => setActiveQuickSheet('location')}
+              />
+              <CreateComposerChip
+                active={Boolean(selectedSchedule)}
+                icon="calendar"
+                label={scheduleChipLabel}
+                onPress={() => setActiveQuickSheet('schedule')}
+              />
+              <CreateComposerChip
+                active={selectedTags.length > 0}
+                icon="tag"
+                label={tagChipLabel}
+                onPress={() => setActiveQuickSheet('tags')}
+              />
+            </ScrollView>
+
+            <View style={styles.createComposerTextArea}>
+              <TextInput
+                placeholder="Name this listing"
+                placeholderTextColor={theme.colors.textSoft}
+                style={styles.createComposerTitleInput}
+                value={draft.title}
+                onChangeText={(value) => setField('title', value)}
+              />
+              {draft.venue.trim() || draft.city.trim() ? (
+                <Text style={styles.createComposerVenueText}>
+                  {[draft.venue.trim(), draft.city.trim()].filter(Boolean).join('  |  ')}
+                </Text>
+              ) : null}
+              <TextInput
+                multiline
+                placeholder="What's on your mind?"
+                placeholderTextColor={theme.colors.textSoft}
+                style={styles.createComposerStoryInput}
+                textAlignVertical="top"
+                value={draft.about || draft.blurb}
+                onChangeText={handleStoryChange}
+              />
+            </View>
+
+            <View style={styles.createComposerMediaTray}>
+              <CreateMediaTrayButton
+                icon="image"
+                label="Hero"
+                stateLabel={draft.heroImage || editingEvent?.image ? 'Ready' : 'Required'}
+                onPress={() => void handlePickImage('heroImage')}
+              />
+              <CreateMediaTrayButton
+                icon="credit-card"
+                label="Ticket"
+                stateLabel={draft.ticketImage || editingEvent?.ticketImage ? 'Ready' : 'Optional'}
+                onPress={() => void handlePickImage('ticketImage')}
+              />
+              <CreateMediaTrayButton
+                icon="film"
+                label="Gallery"
+                stateLabel={mediaCount > 0 ? `${mediaCount} media` : 'Add more'}
+                onPress={() => void handlePickGalleryMedia()}
+              />
+            </View>
+
+            {selectedTags.length > 0 ? (
+              <View style={styles.createComposerSelectedTags}>
+                {selectedTags.map((tag) => (
+                  <CompactChip key={tag} active icon={'tag' as FeatherName} label={tag} onPress={() => toggleTagSelection(tag)} />
+                ))}
+              </View>
+            ) : null}
+
+            {(draft.galleryMedia.length > 0 || (editingEvent?.media.length ?? 0) > 0) ? (
+              <GalleryMediaPicker
+                existingItems={editingEvent?.media ?? []}
+                items={draft.galleryMedia}
+                maxItems={MAX_CREATE_GALLERY_MEDIA}
+                onAdd={() => void handlePickGalleryMedia()}
+                onRemove={handleRemoveGalleryMedia}
+              />
+            ) : null}
           </View>
         ) : null}
 
@@ -842,6 +1088,204 @@ export function CreateTabView({
           </View>
         ) : null}
 
+        <SettingsModalShell
+          title="Details"
+          visible={activeQuickSheet === 'details'}
+          onClose={() => setActiveQuickSheet(null)}
+          topInset={insets.top}
+        >
+          <View style={styles.formStepStack}>
+            <CompactField
+              label="Venue"
+              placeholder="Moonline Lounge"
+              value={draft.venue}
+              onChangeText={(value) => setField('venue', value)}
+            />
+            <CompactField
+              label="City"
+              placeholder="Harare"
+              value={draft.city}
+              onChangeText={(value) => setField('city', value)}
+              optional
+            />
+            <SingleSelectDropdown
+              label="Primary category"
+              options={categoryOptions}
+              placeholder="Choose a category"
+              selectedValue={draft.categoryId}
+              selectedLabel={selectedCategoryOption?.label}
+              onSelect={handlePrimaryCategorySelect}
+            />
+            {showArtistField ? (
+              <CompactField
+                label="Artist or host"
+                placeholder="DJ Nova"
+                value={draft.artist}
+                onChangeText={(value) => setField('artist', value)}
+                optional
+              />
+            ) : null}
+            <SingleSelectDropdown
+              label="Price range"
+              options={PRICE_RANGE_SELECT_OPTIONS}
+              placeholder="Choose price range"
+              selectedValue={draft.priceRange}
+              selectedLabel={selectedPriceRangeOption?.label}
+              onSelect={(value) => setField('priceRange', value as PriceRange)}
+            />
+            <CompactField
+              label="Price"
+              placeholder="$18"
+              value={draft.price}
+              onChangeText={(value) => setField('price', value)}
+              optional
+            />
+            <View style={styles.utilityCard}>
+              <View style={styles.utilityCardHeader}>
+                <View style={styles.utilityTextWrap}>
+                  <Text style={styles.utilityTitle}>Internal payments</Text>
+                  <Text style={styles.utilityCopy}>
+                    {draft.acceptsInternalPayments
+                      ? 'Customers can pay in-app and receive a QR reference.'
+                      : 'Customers can contact you, but in-app payments are off.'}
+                  </Text>
+                </View>
+                <CompactActionButton
+                  icon={draft.acceptsInternalPayments ? 'zap' : 'x'}
+                  label={draft.acceptsInternalPayments ? 'On' : 'Off'}
+                  onPress={() => setField('acceptsInternalPayments', !draft.acceptsInternalPayments)}
+                  tone="muted"
+                />
+              </View>
+            </View>
+          </View>
+        </SettingsModalShell>
+
+        <SettingsModalShell
+          title="Tags"
+          visible={activeQuickSheet === 'tags'}
+          onClose={() => setActiveQuickSheet(null)}
+          topInset={insets.top}
+        >
+          <View style={styles.formStepStack}>
+            <MultiSelectDropdown
+              label="Tags"
+              options={CREATE_TAG_OPTIONS}
+              placeholder="Select tags"
+              selectedValues={selectedTags}
+              onToggle={toggleTagSelection}
+            />
+            <CompactField
+              label="Short blurb"
+              placeholder="A rooftop night with warm plates and vinyl textures."
+              value={draft.blurb}
+              onChangeText={(value) => setField('blurb', value)}
+              optional
+              multiline
+            />
+          </View>
+        </SettingsModalShell>
+
+        <SettingsModalShell
+          title="Date and time"
+          visible={activeQuickSheet === 'schedule'}
+          onClose={() => {
+            setPickerMode(null);
+            setActiveQuickSheet(null);
+          }}
+          topInset={insets.top}
+        >
+          <View style={styles.formStepStack}>
+            <View style={styles.utilityCard}>
+              <View style={styles.utilityCardHeader}>
+                <View style={styles.utilityTextWrap}>
+                  <Text style={styles.utilityTitle}>{scheduleSummary}</Text>
+                  <Text style={styles.utilityCopy}>
+                    {selectedSchedule ? 'Update the schedule whenever you need to.' : 'Choose when this listing should happen.'}
+                  </Text>
+                </View>
+                <Feather color={theme.colors.accentStrong} name="calendar" size={16} />
+              </View>
+
+              <View style={styles.utilityButtonRow}>
+                <CompactActionButton
+                  icon="calendar"
+                  label={selectedSchedule ? 'Change date' : 'Pick date'}
+                  onPress={() => handleOpenPicker('date')}
+                  tone="muted"
+                />
+                <CompactActionButton
+                  icon="clock"
+                  label={selectedSchedule ? 'Change time' : 'Pick time'}
+                  onPress={() => handleOpenPicker('time')}
+                  tone="muted"
+                />
+              </View>
+
+              {pickerMode ? (
+                <View style={styles.pickerWrap}>
+                  <DateTimePicker
+                    display={Platform.OS === 'ios' ? 'spinner' : 'default'}
+                    mode={pickerMode}
+                    minimumDate={pickerMode === 'date' ? new Date() : undefined}
+                    onChange={handlePickerChange}
+                    value={selectedSchedule ?? new Date()}
+                  />
+                  {Platform.OS !== 'android' ? (
+                    <View style={styles.pickerActions}>
+                      <CompactActionButton icon="check" label="Done" onPress={() => setPickerMode(null)} tone="accent" />
+                    </View>
+                  ) : null}
+                </View>
+              ) : null}
+            </View>
+          </View>
+        </SettingsModalShell>
+
+        <SettingsModalShell
+          title="Location"
+          visible={activeQuickSheet === 'location'}
+          onClose={() => setActiveQuickSheet(null)}
+          topInset={insets.top}
+        >
+          <View style={styles.formStepStack}>
+            <View style={styles.utilityCard}>
+              <View style={styles.utilityCardHeader}>
+                <View style={styles.utilityTextWrap}>
+                  <Text style={styles.utilityTitle}>{draft.locationLabel.trim() || 'Use current location'}</Text>
+                  <Text style={styles.utilityCopy}>{locationSummary}</Text>
+                </View>
+                <Feather color={theme.colors.accentStrong} name="map-pin" size={16} />
+              </View>
+
+              <View style={styles.utilityButtonRow}>
+                <CompactActionButton
+                  icon={detectingLocation ? 'loader' : 'navigation'}
+                  label={detectingLocation ? 'Detecting...' : 'Use current location'}
+                  onPress={() => void handleDetectLocation()}
+                  tone="muted"
+                  disabled={detectingLocation}
+                />
+              </View>
+            </View>
+
+            <CompactField
+              label="Address"
+              placeholder="12 Sunset Road"
+              value={draft.address}
+              onChangeText={(value) => setField('address', value)}
+              optional
+            />
+            <CompactField
+              label="Location label"
+              placeholder="Harbor front"
+              value={draft.locationLabel}
+              onChangeText={(value) => setField('locationLabel', value)}
+              optional
+            />
+          </View>
+        </SettingsModalShell>
+
         {isSubmitting ? <CreateUploadProgress progress={submitProgress} stage={submitStage} /> : null}
 
         {localError || submitError ? (
@@ -873,7 +1317,7 @@ export function CreateTabView({
               label={
                 isSubmitting
                   ? submitStage
-                    ? `${submitStage} ${Math.max(1, Math.round(submitProgress * 100))}%`
+                    ? `${submitStage} ${Math.max(1, Math.min(100, Math.round(submitProgress * 100)))}%`
                     : 'Publishing...'
                   : step === 2
                     ? editingEvent
@@ -944,9 +1388,9 @@ export function ProfileTabView({
   onSelectEvent: (event: AppEvent) => void;
 }) {
   const insets = useSafeAreaInsets();
-  const [activePanel, setActivePanel] = useState<'profile' | 'password' | 'notifications' | null>(null);
+  const [activePanel, setActivePanel] = useState<'profile' | 'password' | 'notifications' | 'about' | null>(null);
   const [profilePage, setProfilePage] = useState<'main' | 'hosted' | 'tickets'>('main');
-  const [busyKey, setBusyKey] = useState<'profile' | 'password' | 'push' | 'email' | 'hosted-delete' | null>(null);
+  const [busyKey, setBusyKey] = useState<'profile' | 'password' | 'push' | 'email' | 'hosted-delete' | 'hosted-payment' | 'verify' | null>(null);
   const [ticketBusyKey, setTicketBusyKey] = useState<string | null>(null);
   const [historyBusyKey, setHistoryBusyKey] = useState<string | null>(null);
   const [showAllMyTickets, setShowAllMyTickets] = useState(false);
@@ -965,24 +1409,35 @@ export function ProfileTabView({
   const [showAllHostedListings, setShowAllHostedListings] = useState(false);
   const [showAllTicketPage, setShowAllTicketPage] = useState(false);
   const [selectedHostedIds, setSelectedHostedIds] = useState<string[]>([]);
+  const [paymentOverrides, setPaymentOverrides] = useState<Record<string, boolean>>({});
+  const [verifyListing, setVerifyListing] = useState<AppEvent | null>(null);
+  const [verifyReference, setVerifyReference] = useState('');
+  const [verifyResult, setVerifyResult] = useState<string | null>(null);
   const visibleMyTickets = showAllMyTickets ? tickets : tickets.slice(0, 4);
   const visibleReceivedTickets = showAllReceivedTickets ? receivedTickets : receivedTickets.slice(0, 5);
   const recentViews = showAllHistory ? historyEvents : historyEvents.slice(0, 6);
   const activeTicketCount = tickets.filter((ticket) => ticket.status === 'confirmed').length;
   const ticketHistoryCount = tickets.filter((ticket) => ticket.status !== 'confirmed').length;
   const categoryShortcuts = categories.filter((category) => category.id !== 'all');
+  const hostedListings = useMemo(
+    () => myListings.map((event) => ({
+      ...event,
+      acceptsInternalPayments: paymentOverrides[event.id] ?? event.acceptsInternalPayments,
+    })),
+    [myListings, paymentOverrides],
+  );
   const filteredHostedListings = useMemo(() => {
     const query = hostedSearchQuery.trim().toLowerCase();
     if (!query) {
-      return myListings;
+      return hostedListings;
     }
 
-    return myListings.filter((event) =>
+    return hostedListings.filter((event) =>
       [event.title, event.venue, event.city, event.ownerName ?? ''].some((value) =>
         value.toLowerCase().includes(query),
       ),
     );
-  }, [hostedSearchQuery, myListings]);
+  }, [hostedSearchQuery, hostedListings]);
   const visibleHostedListings = showAllHostedListings ? filteredHostedListings : filteredHostedListings.slice(0, 8);
   const visibleTicketPageItems = showAllTicketPage ? tickets : tickets.slice(0, 8);
 
@@ -1232,46 +1687,115 @@ export function ProfileTabView({
     );
   };
 
+  const handleToggleInternalPayments = async (event: AppEvent) => {
+    const nextValue = !event.acceptsInternalPayments;
+    setBusyKey('hosted-payment');
+    setError(null);
+    setNotice(null);
+
+    try {
+      const updated = await setListingInternalPayments(event.id, nextValue, categories);
+      setPaymentOverrides((current) => ({
+        ...current,
+        [event.id]: updated.acceptsInternalPayments,
+      }));
+      setNotice(updated.acceptsInternalPayments ? 'Internal payments enabled.' : 'Internal payments disabled.');
+    } catch (paymentError) {
+      setError(paymentError instanceof Error ? paymentError.message : 'Payment setting could not be updated.');
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const handleVerifyByReference = async () => {
+    if (!verifyReference.trim()) {
+      setVerifyResult('Enter the customer reference first.');
+      return;
+    }
+
+    setBusyKey('verify');
+    setVerifyResult(null);
+    try {
+      const result = await verifyTicketReference(verifyReference.trim(), categories);
+      setVerifyResult(`${result.message} ${result.ticket.referenceCode} is ${result.ticket.status}.`);
+    } catch (verifyError) {
+      setVerifyResult(verifyError instanceof Error ? verifyError.message : 'Could not verify this reference.');
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const handleVerifyByQr = async (value: string) => {
+    setBusyKey('verify');
+    setVerifyResult(null);
+    try {
+      const result = await verifyTicketQr(value, categories);
+      setVerifyResult(`${result.message} ${result.ticket.referenceCode} is ${result.ticket.status}.`);
+    } catch (verifyError) {
+      setVerifyResult(verifyError instanceof Error ? verifyError.message : 'Could not verify this QR code.');
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
   if (profilePage === 'hosted') {
     return (
-      <HostedListingsPage
-        busy={busyKey === 'hosted-delete'}
-        listings={visibleHostedListings}
-        totalShownCount={filteredHostedListings.length}
-        query={hostedSearchQuery}
-        rawCount={myListings.length}
-        selectedIds={selectedHostedIds}
-        showAll={showAllHostedListings}
-        selectionMode={hostedSelectionMode}
-        onBack={() => {
-          setProfilePage('main');
-          setHostedSelectionMode(false);
-          setShowAllHostedListings(false);
-          setSelectedHostedIds([]);
-        }}
-        onChangeQuery={setHostedSearchQuery}
-        onCreate={onStartCreate}
-        onDeleteSelected={handleDeleteHostedListings}
-        onEdit={onEditListing}
-        onOpen={onSelectEvent}
-        onToggleShowAll={() => setShowAllHostedListings((current) => !current)}
-        onSelectAll={() =>
-          setSelectedHostedIds((current) =>
-            filteredHostedListings.every((event) => current.includes(event.id))
-              ? current.filter((id) => !filteredHostedListings.some((event) => event.id === id))
-              : Array.from(new Set([...current, ...filteredHostedListings.map((event) => event.id)])),
-          )
-        }
-        onToggleSelect={handleToggleHostedSelection}
-        onToggleSelectionMode={() => {
-          setHostedSelectionMode((current) => {
-            if (current) {
-              setSelectedHostedIds([]);
-            }
-            return !current;
-          });
-        }}
-      />
+      <>
+        <HostedListingsPage
+          busy={busyKey === 'hosted-delete'}
+          listings={visibleHostedListings}
+          totalShownCount={filteredHostedListings.length}
+          query={hostedSearchQuery}
+          rawCount={myListings.length}
+          selectedIds={selectedHostedIds}
+          showAll={showAllHostedListings}
+          selectionMode={hostedSelectionMode}
+          onBack={() => {
+            setProfilePage('main');
+            setHostedSelectionMode(false);
+            setShowAllHostedListings(false);
+            setSelectedHostedIds([]);
+          }}
+          onChangeQuery={setHostedSearchQuery}
+          onCreate={onStartCreate}
+          onDeleteSelected={handleDeleteHostedListings}
+          onEdit={onEditListing}
+          onOpen={onSelectEvent}
+          onOpenVerifier={(event) => {
+            setVerifyListing(event);
+            setVerifyReference('');
+            setVerifyResult(null);
+          }}
+          onTogglePayments={handleToggleInternalPayments}
+          onToggleShowAll={() => setShowAllHostedListings((current) => !current)}
+          onSelectAll={() =>
+            setSelectedHostedIds((current) =>
+              filteredHostedListings.every((event) => current.includes(event.id))
+                ? current.filter((id) => !filteredHostedListings.some((event) => event.id === id))
+                : Array.from(new Set([...current, ...filteredHostedListings.map((event) => event.id)])),
+            )
+          }
+          onToggleSelect={handleToggleHostedSelection}
+          onToggleSelectionMode={() => {
+            setHostedSelectionMode((current) => {
+              if (current) {
+                setSelectedHostedIds([]);
+              }
+              return !current;
+            });
+          }}
+        />
+        <TicketVerifierModal
+          busy={busyKey === 'verify'}
+          listing={verifyListing}
+          reference={verifyReference}
+          result={verifyResult}
+          onChangeReference={setVerifyReference}
+          onClose={() => setVerifyListing(null)}
+          onVerifyReference={() => void handleVerifyByReference()}
+          onVerifyQr={(value) => void handleVerifyByQr(value)}
+        />
+      </>
     );
   }
 
@@ -1345,6 +1869,10 @@ export function ProfileTabView({
         </View>
       ) : null}
 
+      {false ? (
+        <>
+      {false ? (
+        <>
       <View style={styles.profileSection}>
         <View style={styles.compactSectionHeader}>
           <View style={styles.compactSectionCopy}>
@@ -1389,6 +1917,9 @@ export function ProfileTabView({
           </View>
         )}
       </View>
+
+        </>
+      ) : null}
 
       <View style={styles.profileSection}>
         <View style={styles.compactSectionHeader}>
@@ -1436,6 +1967,8 @@ export function ProfileTabView({
           </View>
         )}
       </View>
+        </>
+      ) : null}
 
       <View style={styles.profileSection}>
         <View style={styles.compactSectionHeader}>
@@ -1566,7 +2099,24 @@ export function ProfileTabView({
             value="Change"
             onPress={() => setActivePanel('password')}
           />
-          <SettingsRow icon="info" label="About app" value="Bites & Vibes" />
+          <SettingsActionRow
+            icon="info"
+            label="Terms"
+            value="Open"
+            onPress={() => void Linking.openURL(`${BACKEND_ORIGIN}/terms/`)}
+          />
+          <SettingsActionRow
+            icon="shield"
+            label="Privacy"
+            value="Open"
+            onPress={() => void Linking.openURL(`${BACKEND_ORIGIN}/privacy/`)}
+          />
+          <SettingsActionRow
+            icon="info"
+            label="About app"
+            value="Bites & Vibes"
+            onPress={() => setActivePanel('about')}
+          />
           <SettingsRow icon="settings" label="Version" value={`v${APP_VERSION}`} />
         </View>
       </View>
@@ -1692,6 +2242,47 @@ export function ProfileTabView({
         </View>
       </SettingsModalShell>
 
+      <SettingsModalShell
+        title="About app"
+        visible={activePanel === 'about'}
+        onClose={() => setActivePanel(null)}
+        topInset={insets.top}
+      >
+        <View style={styles.aboutPanel}>
+          <View style={styles.aboutHero}>
+            <Image source={APP_LOGO} contentFit="contain" style={styles.aboutLogo} transition={120} />
+            <View style={styles.aboutHeroCopy}>
+              <Text style={styles.aboutTitle}>Bites & Vibes</Text>
+              <Text style={styles.aboutMadeBy}>Made by Pavwell Excel Solutions</Text>
+            </View>
+          </View>
+
+          <Text style={styles.aboutBody}>
+            Bites & Vibes helps people discover restaurants, bars, lounges, fast food spots, chill spots, resorts, BnBs,
+            events, and local experiences around them. It brings discovery, bookings, tickets, saved places,
+            notifications, comments, media, and creator tools into one app so customers and business owners can meet in
+            the same place.
+          </Text>
+
+          <View style={styles.aboutLines}>
+            <View style={styles.aboutLineItem}>
+              <Feather color={theme.colors.accentStrong} name="map-pin" size={15} />
+              <Text style={styles.aboutLineText}>Find nearby places and category-based recommendations.</Text>
+            </View>
+            <View style={styles.aboutLineItem}>
+              <Feather color={theme.colors.accentStrong} name="shopping-bag" size={15} />
+              <Text style={styles.aboutLineText}>Reserve, book, buy tickets, and manage activity from your account.</Text>
+            </View>
+            <View style={styles.aboutLineItem}>
+              <Feather color={theme.colors.accentStrong} name="video" size={15} />
+              <Text style={styles.aboutLineText}>Share listings with photos, videos, pricing, location, and updates.</Text>
+            </View>
+          </View>
+
+          <Text style={styles.aboutFooter}>Version v{APP_VERSION}</Text>
+        </View>
+      </SettingsModalShell>
+
     </View>
   );
 }
@@ -1711,7 +2302,9 @@ function HostedListingsPage({
   onDeleteSelected,
   onEdit,
   onOpen,
+  onOpenVerifier,
   onSelectAll,
+  onTogglePayments,
   onToggleShowAll,
   onToggleSelect,
   onToggleSelectionMode,
@@ -1730,7 +2323,9 @@ function HostedListingsPage({
   onDeleteSelected: () => void;
   onEdit: (event: AppEvent) => void;
   onOpen: (event: AppEvent) => void;
+  onOpenVerifier: (event: AppEvent) => void;
   onSelectAll: () => void;
+  onTogglePayments: (event: AppEvent) => void;
   onToggleShowAll: () => void;
   onToggleSelect: (eventId: string) => void;
   onToggleSelectionMode: () => void;
@@ -1822,12 +2417,123 @@ function HostedListingsPage({
               selectionMode={selectionMode}
               onEdit={() => onEdit(event)}
               onOpen={() => onOpen(event)}
+              onOpenVerifier={() => onOpenVerifier(event)}
+              onTogglePayments={() => onTogglePayments(event)}
               onToggleSelect={() => onToggleSelect(event.id)}
             />
           ))}
         </View>
       )}
     </View>
+  );
+}
+
+function TicketVerifierModal({
+  busy,
+  listing,
+  reference,
+  result,
+  onChangeReference,
+  onClose,
+  onVerifyReference,
+  onVerifyQr,
+}: {
+  busy: boolean;
+  listing: AppEvent | null;
+  reference: string;
+  result: string | null;
+  onChangeReference: (value: string) => void;
+  onClose: () => void;
+  onVerifyReference: () => void;
+  onVerifyQr: (value: string) => void;
+}) {
+  const [permission, requestPermission] = useCameraPermissions();
+  const [scannerActive, setScannerActive] = useState(false);
+  const [scannerLocked, setScannerLocked] = useState(false);
+
+  useEffect(() => {
+    if (!listing) {
+      setScannerActive(false);
+      setScannerLocked(false);
+    }
+  }, [listing]);
+
+  const handleScanPress = async () => {
+    if (!permission?.granted) {
+      const nextPermission = await requestPermission();
+      if (!nextPermission.granted) {
+        return;
+      }
+    }
+    setScannerLocked(false);
+    setScannerActive(true);
+  };
+
+  return (
+    <Modal animationType="slide" transparent visible={Boolean(listing)} onRequestClose={onClose}>
+      <View style={styles.verifyBackdrop}>
+        <View style={styles.verifySheet}>
+          <View style={styles.verifyHeader}>
+            <View style={styles.verifyHeaderCopy}>
+              <Text style={styles.verifyEyebrow}>Owner verification</Text>
+              <Text numberOfLines={1} style={styles.verifyTitle}>{listing?.title ?? 'Verify booking'}</Text>
+            </View>
+            <CompactActionButton icon="x" label="Close" onPress={onClose} tone="muted" />
+          </View>
+
+          <View style={styles.verifyCameraFrame}>
+            {scannerActive && permission?.granted ? (
+              <CameraView
+                barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
+                onBarcodeScanned={(scan) => {
+                  if (scannerLocked) {
+                    return;
+                  }
+                  setScannerLocked(true);
+                  setScannerActive(false);
+                  onVerifyQr(scan.data);
+                }}
+                style={StyleSheet.absoluteFillObject}
+              />
+            ) : (
+              <View style={styles.verifyCameraPlaceholder}>
+                <Feather color={theme.colors.accentStrong} name="grid" size={28} />
+                <Text style={styles.verifyPlaceholderText}>Scan the customer QR code here.</Text>
+              </View>
+            )}
+          </View>
+
+          <View style={styles.verifyActions}>
+            <CompactActionButton icon="camera" label="Scan QR" onPress={() => void handleScanPress()} tone="accent" />
+            <CompactActionButton icon="x" label="Stop" onPress={() => setScannerActive(false)} tone="muted" />
+          </View>
+
+          <View style={styles.verifyManualBox}>
+            <Text style={styles.verifyLabel}>Manual reference</Text>
+            <View style={styles.verifyInputLine}>
+              <Feather color={theme.colors.textMuted} name="hash" size={15} />
+              <TextInput
+                autoCapitalize="characters"
+                onChangeText={onChangeReference}
+                placeholder="Enter reference code"
+                placeholderTextColor={theme.colors.textSoft}
+                style={styles.verifyInput}
+                value={reference}
+              />
+            </View>
+            <CompactActionButton
+              disabled={busy}
+              icon="check"
+              label={busy ? 'Checking...' : 'Verify reference'}
+              onPress={onVerifyReference}
+              tone="accent"
+            />
+          </View>
+
+          {result ? <Text style={styles.verifyResult}>{result}</Text> : null}
+        </View>
+      </View>
+    </Modal>
   );
 }
 
@@ -2017,6 +2723,10 @@ function HistoryEventRow({
 }
 
 function StatusPill({ status }: { status: AppTicket['status'] }) {
+  if (status === 'confirmed') {
+    return null;
+  }
+
   return (
     <View
       style={[
@@ -2215,6 +2925,154 @@ function PressableTicketCard({
         </View>
       </Animated.View>
     </Pressable>
+  );
+}
+
+function CreateComposerChip({
+  active,
+  icon,
+  label,
+  onPress,
+}: {
+  active: boolean;
+  icon: FeatherName;
+  label: string;
+  onPress: () => void;
+}) {
+  const jelly = useJellyPressAnimation({
+    pressedScaleX: 1.018,
+    pressedScaleY: 0.95,
+  });
+
+  return (
+    <Pressable onPress={onPress} onPressIn={jelly.onPressIn} onPressOut={jelly.onPressOut}>
+      <Animated.View style={[styles.createComposerChip, active && styles.createComposerChipActive, jelly.animatedStyle]}>
+        <Feather color={active ? theme.colors.white : theme.colors.textMuted} name={icon} size={15} />
+        <Text numberOfLines={1} style={[styles.createComposerChipText, active && styles.createComposerChipTextActive]}>
+          {label}
+        </Text>
+      </Animated.View>
+    </Pressable>
+  );
+}
+
+function CreateMediaTrayButton({
+  icon,
+  label,
+  stateLabel,
+  onPress,
+}: {
+  icon: FeatherName;
+  label: string;
+  stateLabel: string;
+  onPress: () => void;
+}) {
+  const jelly = useJellyPressAnimation({
+    pressedScaleX: 1.024,
+    pressedScaleY: 0.94,
+  });
+
+  return (
+    <Pressable onPress={onPress} onPressIn={jelly.onPressIn} onPressOut={jelly.onPressOut} style={styles.createMediaTrayPressable}>
+      <Animated.View style={[styles.createMediaTrayButton, jelly.animatedStyle]}>
+        <Feather color={theme.colors.text} name={icon} size={20} />
+        <Text style={styles.createMediaTrayLabel}>{label}</Text>
+        <Text style={styles.createMediaTrayState}>{stateLabel}</Text>
+      </Animated.View>
+    </Pressable>
+  );
+}
+
+function StreamVideoCard({
+  active,
+  height,
+  item,
+  safeTop,
+  onOpen,
+  onOpenViewer,
+  onToggleSave,
+}: {
+  active: boolean;
+  height: number;
+  item: StreamVideoItem;
+  safeTop: number;
+  onOpen: () => void;
+  onOpenViewer: () => void;
+  onToggleSave: () => void;
+}) {
+  const videoRef = useRef<Video>(null);
+  const [muted, setMuted] = useState(true);
+  const jelly = useJellyPressAnimation({
+    pressedScaleX: 1.02,
+    pressedScaleY: 0.95,
+  });
+
+  useEffect(() => {
+    if (active) {
+      videoRef.current?.playAsync().catch(() => undefined);
+      return;
+    }
+
+    videoRef.current?.pauseAsync().catch(() => undefined);
+  }, [active]);
+
+  return (
+    <View style={[styles.streamCard, { height }]}>
+      {item.poster ? <Image source={item.poster} contentFit="cover" style={styles.streamPoster} transition={120} /> : null}
+      <Video
+        isLooping
+        isMuted={muted}
+        progressUpdateIntervalMillis={500}
+        ref={videoRef}
+        resizeMode={ResizeMode.COVER}
+        shouldPlay={active}
+        source={{ uri: item.source }}
+        style={styles.streamVideo}
+      />
+      <View pointerEvents="none" style={styles.streamShade} />
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel="Open stream video viewer"
+        onPress={onOpenViewer}
+        style={styles.streamTapTarget}
+      />
+
+      <View style={[styles.streamTopBar, { paddingTop: safeTop + 12 }]}>
+        <Text style={styles.streamTitle}>Stream</Text>
+        <Pressable onPress={() => setMuted((current) => !current)} onPressIn={jelly.onPressIn} onPressOut={jelly.onPressOut}>
+          <Animated.View style={[styles.streamRoundAction, jelly.animatedStyle]}>
+            <Feather color={theme.colors.white} name={muted ? 'volume-x' : 'volume-2'} size={17} />
+          </Animated.View>
+        </Pressable>
+      </View>
+
+      <View style={styles.streamActions}>
+        <Pressable onPress={onToggleSave} style={styles.streamSideAction}>
+          <View style={[styles.streamRoundAction, item.event.isSaved && styles.streamRoundActionActive]}>
+            <Feather color={theme.colors.white} name="heart" size={19} />
+          </View>
+          <Text style={styles.streamActionLabel}>{formatCompactCount(item.event.saveCount)}</Text>
+        </Pressable>
+        <Pressable onPress={onOpen} style={styles.streamSideAction}>
+          <View style={styles.streamRoundAction}>
+            <Feather color={theme.colors.white} name="external-link" size={18} />
+          </View>
+          <Text style={styles.streamActionLabel}>Open</Text>
+        </Pressable>
+      </View>
+
+      <View style={styles.streamCopy}>
+        <Text numberOfLines={1} style={styles.streamEventTitle}>
+          {item.event.title}
+        </Text>
+        <Text numberOfLines={1} style={styles.streamEventMeta}>
+          {item.event.venue} | {item.event.city} | {item.event.price}
+        </Text>
+        <Text numberOfLines={2} style={styles.streamEventBlurb}>
+          {item.event.blurb || item.event.about}
+        </Text>
+      </View>
+    </View>
   );
 }
 
@@ -2804,6 +3662,8 @@ function HostedListingManagementRow({
   selectionMode,
   onEdit,
   onOpen,
+  onOpenVerifier,
+  onTogglePayments,
   onToggleSelect,
 }: {
   event: AppEvent;
@@ -2811,6 +3671,8 @@ function HostedListingManagementRow({
   selectionMode: boolean;
   onEdit: () => void;
   onOpen: () => void;
+  onOpenVerifier: () => void;
+  onTogglePayments: () => void;
   onToggleSelect: () => void;
 }) {
   const jelly = useJellyPressAnimation({
@@ -2849,6 +3711,9 @@ function HostedListingManagementRow({
             <Text numberOfLines={1} style={styles.hostedListingHint}>
               {formatEditWindowHint(event)}
             </Text>
+            <Text numberOfLines={1} style={styles.hostedListingSales}>
+              {event.ownerSoldCount ?? 0} sold | USD {event.ownerRevenueTotal ?? '0.00'}
+            </Text>
           </View>
         </Animated.View>
       </Pressable>
@@ -2856,6 +3721,13 @@ function HostedListingManagementRow({
       {!selectionMode ? (
         <View style={styles.hostedListingActions}>
           <CompactActionButton icon="external-link" label="Open" onPress={onOpen} tone="muted" />
+          <CompactActionButton icon="grid" label="Verify" onPress={onOpenVerifier} tone="muted" />
+          <CompactActionButton
+            icon={event.acceptsInternalPayments ? 'zap' : 'x'}
+            label={event.acceptsInternalPayments ? 'Pay on' : 'Pay off'}
+            onPress={onTogglePayments}
+            tone="muted"
+          />
           <CompactActionButton
             icon={event.ownerCanEdit === false ? 'clock' : 'settings'}
             label={event.ownerCanEdit === false ? 'Locked' : 'Edit'}
@@ -2997,6 +3869,7 @@ function buildInitialDraft(categories: AppCategory[]): CreateDraft {
     facebook: '',
     instagram: '',
     x: '',
+    acceptsInternalPayments: true,
   };
 }
 
@@ -3037,6 +3910,7 @@ function buildDraftFromEvent(event: AppEvent, categories: AppCategory[]): Create
     facebook: event.socials.find((social) => social.platform === 'facebook')?.url ?? '',
     instagram: event.socials.find((social) => social.platform === 'instagram')?.url ?? '',
     x: event.socials.find((social) => social.platform === 'x')?.url ?? '',
+    acceptsInternalPayments: event.acceptsInternalPayments,
   };
 }
 
@@ -3045,8 +3919,15 @@ function validateRequiredStep(draft: CreateDraft, isEditing = false) {
     return 'Add a listing title first.';
   }
 
-  if (!draft.venue.trim()) {
-    return 'Add the venue name before moving on.';
+  const hasPlace = Boolean(
+    draft.venue.trim() ||
+      draft.locationLabel.trim() ||
+      draft.address.trim() ||
+      (draft.latitude.trim() && draft.longitude.trim()),
+  );
+
+  if (!hasPlace) {
+    return 'Add a venue or use your current location before moving on.';
   }
 
   if (!draft.categoryId) {
@@ -3062,7 +3943,7 @@ function validateRequiredStep(draft: CreateDraft, isEditing = false) {
 
 function buildCreateInput(draft: CreateDraft, existingMedia: AppEvent['media'] = []): CreateAppEventInput {
   const title = draft.title.trim();
-  const venue = draft.venue.trim();
+  const venue = draft.venue.trim() || draft.locationLabel.trim() || draft.address.trim() || title;
   const blurb = draft.blurb.trim();
   const about = draft.about.trim() || blurb || `${title} at ${venue}`;
   const website = normalizeUrl(draft.website);
@@ -3103,6 +3984,7 @@ function buildCreateInput(draft: CreateDraft, existingMedia: AppEvent['media'] =
     ticketImage: draft.ticketImage,
     galleryMedia: draft.galleryMedia,
     existingMedia,
+    acceptsInternalPayments: draft.acceptsInternalPayments,
     socials: {
       tiktok: normalizeUrl(draft.tiktok),
       youtube: normalizeUrl(draft.youtube),
@@ -3324,6 +4206,18 @@ function formatTicketDate(value: string) {
   });
 }
 
+function formatCompactCount(value: number) {
+  if (value >= 1000000) {
+    return `${(value / 1000000).toFixed(value >= 10000000 ? 0 : 1)}M`;
+  }
+
+  if (value >= 1000) {
+    return `${(value / 1000).toFixed(value >= 10000 ? 0 : 1)}K`;
+  }
+
+  return String(value);
+}
+
 function formatEditWindowHint(event: AppEvent) {
   if (event.ownerCanEdit === false) {
     return 'Edit window closed';
@@ -3353,8 +4247,38 @@ const styles = StyleSheet.create({
   },
   sectionHeadingTight: {
     flexDirection: 'row',
-    alignItems: 'center',
+    alignItems: 'flex-start',
     justifyContent: 'space-between',
+    gap: 12,
+  },
+  inboxHeadingCopy: {
+    flex: 1,
+    gap: 4,
+  },
+  inboxReadAllPressable: {
+    flexShrink: 0,
+    marginTop: 5,
+  },
+  inboxReadAllButton: {
+    minHeight: 30,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,107,61,0.34)',
+    paddingHorizontal: 2,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+  },
+  inboxReadAllButtonDisabled: {
+    borderBottomColor: 'rgba(255,255,255,0.08)',
+  },
+  inboxReadAllText: {
+    color: theme.colors.accentStrong,
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 0.2,
+  },
+  inboxReadAllTextDisabled: {
+    color: theme.colors.textSoft,
   },
   sectionTitle: {
     color: theme.colors.text,
@@ -3457,28 +4381,181 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
   },
-  notificationList: {
+  streamRoot: {
+    flex: 1,
+    marginTop: -8,
+    marginHorizontal: -4,
+    backgroundColor: '#05070B',
+  },
+  streamCard: {
+    position: 'relative',
+    overflow: 'hidden',
+    backgroundColor: '#05070B',
+  },
+  streamPoster: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  streamVideo: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  streamShade: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.14)',
+  },
+  streamTapTarget: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 1,
+  },
+  streamTopBar: {
+    position: 'absolute',
+    zIndex: 2,
+    top: 0,
+    left: 0,
+    right: 0,
+    paddingHorizontal: 14,
+    paddingBottom: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  streamTitle: {
+    color: theme.colors.white,
+    fontSize: 20,
+    fontWeight: '800',
+  },
+  streamRoundAction: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: 'rgba(8,10,14,0.5)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.12)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  streamRoundActionActive: {
+    backgroundColor: theme.colors.accentSoft,
+    borderColor: 'rgba(255,107,61,0.3)',
+  },
+  streamActions: {
+    position: 'absolute',
+    zIndex: 2,
+    right: 12,
+    bottom: 156,
+    gap: 18,
+    alignItems: 'center',
+  },
+  streamSideAction: {
+    alignItems: 'center',
+    gap: 6,
+  },
+  streamActionLabel: {
+    color: theme.colors.white,
+    fontSize: 11,
+    fontWeight: '800',
+  },
+  streamCopy: {
+    position: 'absolute',
+    zIndex: 2,
+    left: 16,
+    right: 74,
+    bottom: 116,
+    gap: 7,
+  },
+  streamEventTitle: {
+    color: theme.colors.white,
+    fontSize: 24,
+    fontWeight: '800',
+  },
+  streamEventMeta: {
+    color: 'rgba(245,247,252,0.78)',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  streamEventBlurb: {
+    color: 'rgba(245,247,252,0.74)',
+    fontSize: 13,
+    lineHeight: 19,
+    fontWeight: '500',
+  },
+  streamViewerRoot: {
+    flex: 1,
+    backgroundColor: '#05070B',
+  },
+  streamViewerHeader: {
+    paddingHorizontal: 14,
+    paddingBottom: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  streamViewerCopy: {
+    flex: 1,
+    gap: 3,
+  },
+  streamViewerTitle: {
+    color: theme.colors.white,
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  streamViewerSubtitle: {
+    color: theme.colors.textMuted,
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  streamViewerClose: {
+    width: 42,
+    height: 42,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  streamViewerVideo: {
+    flex: 1,
+    backgroundColor: '#05070B',
+  },
+  streamEmpty: {
+    flex: 1,
+    marginHorizontal: -4,
+    alignItems: 'center',
+    justifyContent: 'center',
     gap: 10,
+    paddingHorizontal: 24,
+  },
+  streamEmptyTitle: {
+    color: theme.colors.text,
+    fontSize: 20,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
+  streamEmptyCopy: {
+    color: theme.colors.textMuted,
+    fontSize: 13,
+    lineHeight: 19,
+    textAlign: 'center',
+  },
+  notificationList: {
+    gap: 0,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.08)',
   },
   notificationCard: {
+    minHeight: 76,
     flexDirection: 'row',
     alignItems: 'flex-start',
     gap: 12,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: theme.colors.border,
-    backgroundColor: theme.colors.surfaceStrong,
-    padding: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: 'transparent',
+    paddingHorizontal: 4,
+    paddingVertical: 13,
   },
   notificationCardUnread: {
-    backgroundColor: 'rgba(255,107,61,0.07)',
-    borderColor: 'rgba(255,107,61,0.18)',
+    borderBottomColor: 'rgba(255,107,61,0.24)',
   },
   notificationIcon: {
-    width: 34,
-    height: 34,
-    borderRadius: 12,
-    backgroundColor: 'rgba(255,107,61,0.12)',
+    width: 24,
+    height: 24,
+    backgroundColor: 'transparent',
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -3551,12 +4628,151 @@ const styles = StyleSheet.create({
     color: theme.colors.white,
   },
   formCard: {
-    borderRadius: 20,
+    marginHorizontal: -4,
+    borderTopWidth: 1,
+    borderBottomWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.08)',
+    borderBottomColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: 'transparent',
+    paddingHorizontal: 4,
+    paddingTop: 12,
+    paddingBottom: 14,
+    gap: 14,
+  },
+  createComposerTopBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 2,
+  },
+  createComposerTopIcon: {
+    width: 40,
+    height: 40,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  createComposerTopTitle: {
+    color: theme.colors.text,
+    fontSize: 17,
+    fontWeight: '800',
+  },
+  createComposerStep: {
+    gap: 16,
+  },
+  createComposerProfileRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  createComposerAvatar: {
+    width: 58,
+    height: 58,
+    borderRadius: 29,
+    overflow: 'hidden',
     borderWidth: 1,
     borderColor: theme.colors.border,
-    backgroundColor: theme.colors.surfaceStrong,
-    padding: 14,
-    gap: 14,
+    backgroundColor: theme.colors.surfaceMuted,
+  },
+  createComposerAvatarImage: {
+    width: '100%',
+    height: '100%',
+  },
+  createComposerProfileText: {
+    flex: 1,
+    gap: 4,
+  },
+  createComposerProfileName: {
+    color: theme.colors.text,
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  createComposerProfileMeta: {
+    color: theme.colors.textSoft,
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  createComposerChipRow: {
+    gap: 10,
+    paddingRight: 6,
+  },
+  createComposerChip: {
+    minHeight: 40,
+    borderRadius: 11,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.04)',
+    paddingHorizontal: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  createComposerChipActive: {
+    backgroundColor: theme.colors.accentSoft,
+    borderColor: 'rgba(255,107,61,0.22)',
+  },
+  createComposerChipText: {
+    color: theme.colors.text,
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  createComposerChipTextActive: {
+    color: theme.colors.white,
+  },
+  createComposerTextArea: {
+    minHeight: 250,
+    gap: 10,
+  },
+  createComposerTitleInput: {
+    color: theme.colors.text,
+    fontSize: 19,
+    fontWeight: '800',
+    paddingVertical: 0,
+  },
+  createComposerVenueText: {
+    color: theme.colors.textMuted,
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  createComposerStoryInput: {
+    minHeight: 176,
+    color: theme.colors.text,
+    fontSize: 17,
+    lineHeight: 25,
+    fontWeight: '500',
+    paddingVertical: 0,
+  },
+  createComposerMediaTray: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  createMediaTrayPressable: {
+    flex: 1,
+  },
+  createMediaTrayButton: {
+    minHeight: 108,
+    borderRadius: 11,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.04)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    paddingHorizontal: 10,
+  },
+  createMediaTrayLabel: {
+    color: theme.colors.text,
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  createMediaTrayState: {
+    color: theme.colors.textSoft,
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  createComposerSelectedTags: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
   },
   formStepStack: {
     gap: 12,
@@ -3609,7 +4825,7 @@ const styles = StyleSheet.create({
   },
   compactInput: {
     minHeight: 46,
-    borderRadius: 14,
+    borderRadius: 11,
     borderWidth: 1,
     borderColor: theme.colors.border,
     backgroundColor: 'rgba(255,255,255,0.04)',
@@ -3624,7 +4840,7 @@ const styles = StyleSheet.create({
     paddingBottom: 12,
   },
   utilityCard: {
-    borderRadius: 16,
+    borderRadius: 11,
     borderWidth: 1,
     borderColor: theme.colors.border,
     backgroundColor: 'rgba(255,255,255,0.04)',
@@ -3668,7 +4884,7 @@ const styles = StyleSheet.create({
   },
   dropdownTrigger: {
     minHeight: 46,
-    borderRadius: 14,
+    borderRadius: 11,
     borderWidth: 1,
     borderColor: theme.colors.border,
     backgroundColor: 'rgba(255,255,255,0.04)',
@@ -3688,7 +4904,7 @@ const styles = StyleSheet.create({
     color: theme.colors.textSoft,
   },
   dropdownMenu: {
-    borderRadius: 16,
+    borderRadius: 11,
     borderWidth: 1,
     borderColor: theme.colors.border,
     backgroundColor: 'rgba(16,20,30,0.98)',
@@ -3740,7 +4956,7 @@ const styles = StyleSheet.create({
   },
   compactChip: {
     minHeight: 36,
-    borderRadius: 12,
+    borderRadius: 11,
     borderWidth: 1,
     borderColor: theme.colors.border,
     backgroundColor: theme.colors.surfaceMuted,
@@ -3769,7 +4985,7 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   uploadTile: {
-    borderRadius: 16,
+    borderRadius: 11,
     borderWidth: 1,
     borderColor: theme.colors.border,
     backgroundColor: 'rgba(255,255,255,0.04)',
@@ -3779,7 +4995,7 @@ const styles = StyleSheet.create({
   uploadPreview: {
     width: '100%',
     height: 116,
-    borderRadius: 12,
+    borderRadius: 9,
   },
   uploadVideoBadge: {
     position: 'absolute',
@@ -3804,7 +5020,7 @@ const styles = StyleSheet.create({
   uploadEmpty: {
     width: '100%',
     height: 116,
-    borderRadius: 12,
+    borderRadius: 9,
     backgroundColor: theme.colors.surfaceMuted,
     borderWidth: 1,
     borderColor: theme.colors.border,
@@ -3836,7 +5052,7 @@ const styles = StyleSheet.create({
     alignSelf: 'stretch',
   },
   galleryAddTile: {
-    borderRadius: 16,
+    borderRadius: 11,
     borderWidth: 1,
     borderColor: theme.colors.border,
     backgroundColor: 'rgba(255,255,255,0.04)',
@@ -4066,7 +5282,7 @@ const styles = StyleSheet.create({
   },
   actionButton: {
     minHeight: 38,
-    borderRadius: 10,
+    borderRadius: 7,
     paddingHorizontal: 12,
     maxWidth: '100%',
     flexDirection: 'row',
@@ -4096,12 +5312,13 @@ const styles = StyleSheet.create({
     color: theme.colors.textMuted,
   },
   profileCard: {
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: theme.colors.border,
-    backgroundColor: theme.colors.surfaceStrong,
-    padding: 12,
-    gap: 10,
+    borderTopWidth: 1,
+    borderBottomWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: 'transparent',
+    paddingHorizontal: 4,
+    paddingVertical: 12,
+    gap: 12,
   },
   profileTopRow: {
     flexDirection: 'row',
@@ -4136,7 +5353,10 @@ const styles = StyleSheet.create({
   },
   profileStatsRow: {
     flexDirection: 'row',
-    gap: 8,
+    gap: 0,
+    borderTopWidth: 1,
+    borderBottomWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
   },
   profileActionRow: {
     paddingTop: 2,
@@ -4191,11 +5411,11 @@ const styles = StyleSheet.create({
   },
   miniStatCard: {
     flex: 1,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: theme.colors.border,
-    backgroundColor: 'rgba(255,255,255,0.04)',
-    paddingVertical: 9,
+    borderRadius: 0,
+    borderRightWidth: 1,
+    borderRightColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: 'transparent',
+    paddingVertical: 10,
     alignItems: 'center',
     justifyContent: 'center',
     gap: 3,
@@ -4213,11 +5433,17 @@ const styles = StyleSheet.create({
     letterSpacing: 0.5,
   },
   profileSection: {
-    gap: 10,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.08)',
+    paddingTop: 12,
+    gap: 8,
   },
   hostingSummaryCard: {
     flexDirection: 'row',
-    gap: 8,
+    gap: 0,
+    borderTopWidth: 1,
+    borderBottomWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
   },
   hostedPageHeader: {
     flexDirection: 'row',
@@ -4281,7 +5507,9 @@ const styles = StyleSheet.create({
     justifyContent: 'flex-end',
   },
   hostedManagerList: {
-    gap: 10,
+    gap: 0,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.08)',
   },
   compactSectionHeader: {
     flexDirection: 'row',
@@ -4311,15 +5539,17 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   ticketManagementList: {
-    gap: 8,
+    gap: 0,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.08)',
   },
   ticketManagementRow: {
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: theme.colors.border,
-    backgroundColor: 'rgba(255,255,255,0.04)',
-    paddingHorizontal: 11,
-    paddingVertical: 10,
+    borderRadius: 0,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: 'transparent',
+    paddingHorizontal: 4,
+    paddingVertical: 12,
     gap: 8,
   },
   ticketManagementTop: {
@@ -4387,7 +5617,9 @@ const styles = StyleSheet.create({
     paddingRight: 10,
   },
   managedListingStack: {
-    gap: 8,
+    gap: 0,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.08)',
   },
   managedListingRowShell: {
     flexDirection: 'row',
@@ -4398,11 +5630,12 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   managedListingRow: {
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: theme.colors.border,
-    backgroundColor: 'rgba(255,255,255,0.04)',
-    padding: 10,
+    borderRadius: 0,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: 'transparent',
+    paddingHorizontal: 4,
+    paddingVertical: 10,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
@@ -4437,16 +5670,17 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   hostedListingRow: {
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: theme.colors.border,
-    backgroundColor: 'rgba(255,255,255,0.04)',
-    padding: 9,
+    borderRadius: 0,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: 'transparent',
+    paddingHorizontal: 4,
+    paddingVertical: 10,
     gap: 8,
   },
   hostedListingRowSelected: {
-    borderColor: 'rgba(255,107,61,0.34)',
-    backgroundColor: 'rgba(255,107,61,0.08)',
+    borderBottomColor: 'rgba(255,107,61,0.34)',
+    backgroundColor: 'transparent',
   },
   hostedListingRowPressable: {
     alignSelf: 'stretch',
@@ -4496,10 +5730,113 @@ const styles = StyleSheet.create({
     lineHeight: 14,
     fontWeight: '700',
   },
+  hostedListingSales: {
+    color: theme.colors.accentStrong,
+    fontSize: 10,
+    lineHeight: 14,
+    fontWeight: '800',
+  },
   hostedListingActions: {
     flexDirection: 'row',
     gap: 8,
     flexWrap: 'wrap',
+  },
+  verifyBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(4,7,13,0.68)',
+    justifyContent: 'flex-end',
+  },
+  verifySheet: {
+    backgroundColor: 'rgba(12,15,23,0.98)',
+    borderTopWidth: 1,
+    borderColor: 'rgba(255,255,255,0.1)',
+    borderTopLeftRadius: 22,
+    borderTopRightRadius: 22,
+    padding: 16,
+    gap: 14,
+    ...shadow,
+  },
+  verifyHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  verifyHeaderCopy: {
+    flex: 1,
+    gap: 3,
+  },
+  verifyEyebrow: {
+    color: theme.colors.accentStrong,
+    fontSize: 10,
+    fontWeight: '900',
+    letterSpacing: 0.8,
+    textTransform: 'uppercase',
+  },
+  verifyTitle: {
+    color: theme.colors.text,
+    fontSize: 18,
+    fontWeight: '900',
+  },
+  verifyCameraFrame: {
+    height: 240,
+    overflow: 'hidden',
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: theme.colors.surfaceStrong,
+  },
+  verifyCameraPlaceholder: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+    padding: 18,
+  },
+  verifyPlaceholderText: {
+    color: theme.colors.textMuted,
+    fontSize: 13,
+    fontWeight: '700',
+    textAlign: 'center',
+  },
+  verifyActions: {
+    flexDirection: 'row',
+    gap: 8,
+    flexWrap: 'wrap',
+  },
+  verifyManualBox: {
+    borderTopWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    paddingTop: 12,
+    gap: 10,
+  },
+  verifyLabel: {
+    color: theme.colors.textSoft,
+    fontSize: 10,
+    fontWeight: '900',
+    textTransform: 'uppercase',
+    letterSpacing: 0.7,
+  },
+  verifyInputLine: {
+    minHeight: 44,
+    borderBottomWidth: 1,
+    borderColor: 'rgba(255,255,255,0.14)',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 9,
+  },
+  verifyInput: {
+    flex: 1,
+    color: theme.colors.text,
+    fontSize: 14,
+    fontWeight: '800',
+    paddingVertical: 0,
+  },
+  verifyResult: {
+    color: theme.colors.text,
+    fontSize: 13,
+    fontWeight: '800',
+    lineHeight: 19,
   },
   ticketCard: {
     width: 188,
@@ -4532,17 +5869,22 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   settingsStack: {
-    gap: 8,
+    gap: 0,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.08)',
   },
   modalBackdrop: {
     flex: 1,
     backgroundColor: 'rgba(8,10,14,0.76)',
-    paddingHorizontal: 12,
+    paddingHorizontal: 6,
     paddingBottom: 16,
+    alignItems: 'center',
   },
   modalShell: {
     flex: 1,
-    borderRadius: 22,
+    width: '100%',
+    maxWidth: 560,
+    borderRadius: 14,
     borderWidth: 1,
     borderColor: theme.colors.border,
     backgroundColor: '#111621',
@@ -4574,12 +5916,74 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'flex-end',
   },
+  aboutPanel: {
+    gap: 14,
+  },
+  aboutHero: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.08)',
+    paddingBottom: 14,
+  },
+  aboutLogo: {
+    width: 58,
+    height: 58,
+  },
+  aboutHeroCopy: {
+    flex: 1,
+    gap: 3,
+  },
+  aboutTitle: {
+    color: theme.colors.text,
+    fontSize: 19,
+    fontWeight: '900',
+  },
+  aboutMadeBy: {
+    color: theme.colors.accentStrong,
+    fontSize: 12,
+    fontWeight: '900',
+    letterSpacing: 0.4,
+    textTransform: 'uppercase',
+  },
+  aboutBody: {
+    color: theme.colors.textSoft,
+    fontSize: 13,
+    fontWeight: '600',
+    lineHeight: 20,
+  },
+  aboutLines: {
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.08)',
+  },
+  aboutLineItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.08)',
+    paddingVertical: 12,
+  },
+  aboutLineText: {
+    flex: 1,
+    color: theme.colors.text,
+    fontSize: 13,
+    fontWeight: '700',
+    lineHeight: 18,
+  },
+  aboutFooter: {
+    color: theme.colors.textMuted,
+    fontSize: 12,
+    fontWeight: '800',
+  },
   notificationPrefCard: {
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: theme.colors.border,
-    backgroundColor: 'rgba(255,255,255,0.04)',
-    padding: 12,
+    borderRadius: 0,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: 'transparent',
+    paddingHorizontal: 4,
+    paddingVertical: 12,
     gap: 10,
   },
   notificationPrefCopy: {
@@ -4596,7 +6000,9 @@ const styles = StyleSheet.create({
     lineHeight: 18,
   },
   historyList: {
-    gap: 8,
+    gap: 0,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.08)',
   },
   historyRow: {
     flexDirection: 'row',
@@ -4607,11 +6013,12 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   historyRowCard: {
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: theme.colors.border,
-    backgroundColor: 'rgba(255,255,255,0.04)',
-    padding: 10,
+    borderRadius: 0,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: 'transparent',
+    paddingHorizontal: 4,
+    paddingVertical: 10,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
@@ -4642,12 +6049,12 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   settingsRow: {
-    minHeight: 42,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: theme.colors.border,
-    backgroundColor: 'rgba(255,255,255,0.04)',
-    paddingHorizontal: 11,
+    minHeight: 52,
+    borderRadius: 0,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: 'transparent',
+    paddingHorizontal: 4,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
@@ -4656,10 +6063,9 @@ const styles = StyleSheet.create({
     paddingRight: 8,
   },
   settingsIcon: {
-    width: 26,
-    height: 26,
-    borderRadius: 8,
-    backgroundColor: 'rgba(255,107,61,0.1)',
+    width: 22,
+    height: 22,
+    backgroundColor: 'transparent',
     alignItems: 'center',
     justifyContent: 'center',
   },

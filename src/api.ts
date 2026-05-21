@@ -6,12 +6,15 @@ import {
   AppCommentPage,
   AppCommentUser,
   AppEvent,
+  AppEventPage,
   AppEventMedia,
   AppEventCategory,
   AppIconName,
   AppNotification,
   AppTicket,
+  AppUpdatePolicy,
   AppUser,
+  BookingCheckoutInput,
   ChangePasswordInput,
   CreateAppCommentInput,
   CreateAppEventInput,
@@ -82,8 +85,16 @@ type BackendListing = {
   owner_name?: string | null;
   owner_can_edit?: boolean;
   owner_edit_expires_at?: string | null;
+  owner_sold_count?: number;
+  owner_revenue_total?: string | number;
+  accepts_internal_payments?: boolean;
+  is_trending?: boolean;
+  is_featured?: boolean;
+  is_verified?: boolean;
+  vibe_percentage?: number;
   created_at?: string;
   user_has_saved?: boolean;
+  saved_count?: number;
   user_has_ticket?: boolean;
   app_data?: Record<string, unknown> | null;
   images?: BackendListingMedia[];
@@ -172,6 +183,14 @@ type BackendBootstrapResponse = {
   profile?: BackendUser | null;
 };
 
+type BackendAppVersionResponse = {
+  latest_version: string;
+  min_required_version: string;
+  force_update: boolean;
+  update_url: string;
+  message: string;
+};
+
 type BackendTicket = {
   id: number;
   listing?: BackendListing;
@@ -179,9 +198,18 @@ type BackendTicket = {
   listing_name?: string | null;
   buyer_name?: string | null;
   buyer_email?: string | null;
+  action_type?: AppTicket['actionType'];
+  quantity?: number;
+  unit_price?: string | number;
+  total_amount?: string | number;
+  currency?: string;
   reference_code: string;
   qr_payload: string;
   status: AppTicket['status'];
+  payment_status?: AppTicket['paymentStatus'];
+  payment_method?: string | null;
+  payer_phone?: string | null;
+  paynow_reference?: string | null;
   can_cancel?: boolean;
   can_mark_used?: boolean;
   can_manage?: boolean;
@@ -353,10 +381,11 @@ export async function changeUserPassword(input: ChangePasswordInput) {
   });
 }
 
-export async function registerPushDevice(token: string, platform: string, deviceName?: string) {
+export async function registerPushDevice(token: string, platform: string, provider = 'firebase', deviceName?: string) {
   return postJson<MessageResponse>('/auth/push/register/', {
     token,
     platform,
+    provider,
     device_name: deviceName ?? '',
   });
 }
@@ -378,10 +407,78 @@ export async function fetchAppBootstrap() {
   return mapBootstrap(payload);
 }
 
+export async function fetchAppUpdatePolicy(platform: string): Promise<AppUpdatePolicy> {
+  const params = new URLSearchParams({ platform });
+  const payload = await apiFetchJson<BackendAppVersionResponse>(`/listings/app-version/?${params.toString()}`);
+
+  return {
+    latestVersion: payload.latest_version,
+    minRequiredVersion: payload.min_required_version,
+    forceUpdate: Boolean(payload.force_update),
+    updateUrl: payload.update_url,
+    message: payload.message,
+  };
+}
+
+export async function fetchAppFeed({
+  categories,
+  categoryId = 'all',
+  latitude,
+  longitude,
+  page = 1,
+  pageSize = 10,
+  search = '',
+}: {
+  categories: AppCategory[];
+  categoryId?: string;
+  latitude?: number | null;
+  longitude?: number | null;
+  page?: number;
+  pageSize?: number;
+  search?: string;
+}): Promise<AppEventPage> {
+  const params = new URLSearchParams({
+    page: String(page),
+    page_size: String(pageSize),
+  });
+
+  const trimmedSearch = search.trim();
+  if (trimmedSearch) {
+    params.set('search', trimmedSearch);
+  }
+
+  if (categoryId && categoryId !== 'all') {
+    params.set('category', categoryId);
+  }
+
+  if (typeof latitude === 'number' && Number.isFinite(latitude)) {
+    params.set('lat', latitude.toFixed(6));
+  }
+
+  if (typeof longitude === 'number' && Number.isFinite(longitude)) {
+    params.set('lng', longitude.toFixed(6));
+  }
+
+  const payload = await apiFetchJson<BackendPaginatedResponse<BackendListing>>(`/listings/app-feed/?${params.toString()}`);
+  const categoryLookup = new Map(categories.map((category) => [category.id, category]));
+
+  return {
+    events: (payload.results ?? []).map((listing) => mapListingToEvent(listing, categoryLookup)),
+    nextPage: readNextPage(payload.next),
+    totalCount: payload.count ?? 0,
+  };
+}
+
 export async function recordListingView(eventId: string) {
   await apiFetchJson(`/listings/${eventId}/record-view/`, {
     method: 'POST',
   });
+}
+
+export async function fetchEventListing(eventId: string, categories: AppCategory[]) {
+  const listing = await apiFetchJson<BackendListing>(`/listings/${eventId}/`);
+  const categoryLookup = new Map(categories.map((category) => [category.id, category]));
+  return mapListingToEvent(listing, categoryLookup);
 }
 
 export async function toggleSavedListing(eventId: string) {
@@ -392,6 +489,7 @@ export async function toggleSavedListing(eventId: string) {
   return {
     eventId: String(response.listing_id),
     isSaved: response.is_saved,
+    saveCount: response.saved_count,
   };
 }
 
@@ -507,12 +605,66 @@ export async function markAllNotificationsRead() {
   });
 }
 
-export async function bookEventTicket(eventId: string, categories: AppCategory[]) {
-  const response = await apiFetchJson<{ created: boolean; ticket: BackendTicket }>(`/listings/${eventId}/book/`, {
+export async function bookEventTicket(eventId: string, categories: AppCategory[], input?: BookingCheckoutInput) {
+  const response = await apiFetchJson<{
+    created: boolean;
+    payment_required?: boolean;
+    payment_status?: AppTicket['paymentStatus'];
+    poll_after_seconds?: number | null;
+    ticket: BackendTicket;
+  }>(`/listings/${eventId}/book/`, {
+    method: 'POST',
+    body: JSON.stringify({
+      payment_method: input?.paymentMethod,
+      phone: input?.phone,
+      quantity: input?.quantity ?? 1,
+    }),
+  });
+  const categoryLookup = new Map(categories.map((category) => [category.id, category]));
+  return mapTicket(response.ticket, categoryLookup);
+}
+
+export async function pollTicketPayment(ticketId: string, categories: AppCategory[]) {
+  const response = await apiFetchJson<{ ticket: BackendTicket }>(`/listings/tickets/${ticketId}/poll-payment/`, {
     method: 'POST',
   });
   const categoryLookup = new Map(categories.map((category) => [category.id, category]));
   return mapTicket(response.ticket, categoryLookup);
+}
+
+export async function verifyTicketQr(qr: string, categories: AppCategory[]) {
+  const response = await apiFetchJson<{ valid: boolean; message?: string; ticket: BackendTicket }>('/listings/tickets/verify-qr/', {
+    method: 'POST',
+    body: JSON.stringify({ qr }),
+  });
+  const categoryLookup = new Map(categories.map((category) => [category.id, category]));
+  return {
+    valid: response.valid,
+    message: response.message ?? 'Booking verified.',
+    ticket: mapTicket(response.ticket, categoryLookup),
+  };
+}
+
+export async function verifyTicketReference(reference: string, categories: AppCategory[]) {
+  const response = await apiFetchJson<{ valid: boolean; message?: string; ticket: BackendTicket }>('/listings/tickets/verify-qr/', {
+    method: 'POST',
+    body: JSON.stringify({ reference }),
+  });
+  const categoryLookup = new Map(categories.map((category) => [category.id, category]));
+  return {
+    valid: response.valid,
+    message: response.message ?? 'Booking verified.',
+    ticket: mapTicket(response.ticket, categoryLookup),
+  };
+}
+
+export async function setListingInternalPayments(eventId: string, acceptsInternalPayments: boolean, categories: AppCategory[]) {
+  const listing = await apiFetchJson<BackendListing>(`/listings/${eventId}/`, {
+    method: 'PATCH',
+    body: JSON.stringify({ accepts_internal_payments: acceptsInternalPayments }),
+  });
+  const categoryLookup = new Map(categories.map((category) => [category.id, category]));
+  return mapListingToEvent(listing, categoryLookup);
 }
 
 export async function cancelTicket(ticketId: string, categories: AppCategory[]) {
@@ -581,7 +733,8 @@ export async function createEventListing(
     website: input.website || null,
     email: input.email || null,
     price_range: input.priceRange,
-    display_price: input.price,
+    display_price: formatDisplayPrice(input.price || input.priceRange),
+    accepts_internal_payments: input.acceptsInternalPayments ?? true,
     app_data: {
       artist: input.artist,
       title: input.title,
@@ -592,7 +745,7 @@ export async function createEventListing(
       month: input.month,
       weekday: input.weekday,
       time: input.time,
-      price: input.price,
+      price: formatDisplayPrice(input.price || input.priceRange),
       blurb: input.blurb,
       highlights: input.highlights,
       location: {
@@ -621,7 +774,7 @@ export async function createEventListing(
 
   try {
     await uploadListingMedia(created.id, input, (ratio) => {
-      callbacks.onProgress?.(0.16 + ratio * 0.74);
+      callbacks.onProgress?.(clampProgress(0.16 + clampProgress(ratio) * 0.74));
     });
   } catch (error) {
     await apiFetch(`/listings/${created.id}/`, { method: 'DELETE' }).catch(() => undefined);
@@ -676,7 +829,8 @@ export async function updateEventListing(
     website: input.website || null,
     email: input.email || null,
     price_range: input.priceRange,
-    display_price: input.price,
+    display_price: formatDisplayPrice(input.price || input.priceRange),
+    accepts_internal_payments: input.acceptsInternalPayments ?? existingEvent.acceptsInternalPayments,
     images_payload: preservedMedia,
     app_data: {
       artist: input.artist,
@@ -688,7 +842,7 @@ export async function updateEventListing(
       month: input.month,
       weekday: input.weekday,
       time: input.time,
-      price: input.price,
+      price: formatDisplayPrice(input.price || input.priceRange),
       blurb: input.blurb,
       highlights: input.highlights,
       location: {
@@ -722,7 +876,7 @@ export async function updateEventListing(
         ...input,
         heroImage: input.heroImage ?? null,
       } as CreateAppEventInput,
-      (ratio) => callbacks.onProgress?.(0.24 + ratio * 0.58),
+      (ratio) => callbacks.onProgress?.(clampProgress(0.24 + clampProgress(ratio) * 0.58)),
       {
         includeHero: Boolean(input.heroImage),
         includeTicket: Boolean(input.ticketImage),
@@ -937,7 +1091,7 @@ async function uploadFormDataJson<T>(
 
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable) {
-        onProgress?.(event.loaded / event.total);
+        onProgress?.(clampProgress(event.loaded / event.total));
       }
     };
 
@@ -963,6 +1117,14 @@ async function uploadFormDataJson<T>(
 
     xhr.send(formData);
   });
+}
+
+function clampProgress(value: number) {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+
+  return Math.max(0, Math.min(value, 1));
 }
 
 function readApiErrorMessageFromText(status: number, raw: string) {
@@ -1126,7 +1288,7 @@ function mapListingToEvent(listing: BackendListing, categoryLookup: Map<string, 
     month: readString(appData.month) ?? '--',
     weekday: readString(appData.weekday) ?? 'Any day',
     time: readString(appData.time) ?? 'TBA',
-    price: readString(appData.price) ?? listing.display_price ?? listing.price_range ?? '$$',
+    price: formatDisplayPrice(readString(appData.price) ?? listing.display_price ?? listing.price_range ?? '$$'),
     rating,
     ratingCount: listing.rating_count ?? 0,
     commentCount: listing.comment_count ?? 0,
@@ -1149,11 +1311,19 @@ function mapListingToEvent(listing: BackendListing, categoryLookup: Map<string, 
     contacts,
     socials,
     isSaved: Boolean(listing.user_has_saved),
+    saveCount: listing.saved_count ?? 0,
     hasTicket: Boolean((listing as BackendListing & { user_has_ticket?: boolean }).user_has_ticket),
+    acceptsInternalPayments: listing.accepts_internal_payments !== false,
     ownerName: listing.owner_name ?? null,
     ownerCanEdit: Boolean(listing.owner_can_edit),
     ownerEditExpiresAt: listing.owner_edit_expires_at ?? null,
+    ownerSoldCount: listing.owner_sold_count ?? 0,
+    ownerRevenueTotal: String(listing.owner_revenue_total ?? '0.00'),
     createdAt: listing.created_at,
+    isTrending: Boolean(listing.is_trending),
+    isFeatured: Boolean(listing.is_featured),
+    isVerified: Boolean(listing.is_verified),
+    vibePercentage: listing.vibe_percentage ?? 25,
   };
 }
 
@@ -1181,15 +1351,40 @@ function mapTicket(ticket: BackendTicket, categoryLookup: Map<string, AppCategor
     event,
     buyerName: ticket.buyer_name ?? null,
     buyerEmail: ticket.buyer_email ?? null,
+    actionType: ticket.action_type ?? 'ticket',
+    quantity: ticket.quantity ?? 1,
+    unitPrice: String(ticket.unit_price ?? '0.00'),
+    totalAmount: String(ticket.total_amount ?? '0.00'),
+    currency: ticket.currency ?? 'USD',
     referenceCode: ticket.reference_code,
     qrValue: ticket.qr_payload,
     status: ticket.status,
+    paymentStatus: ticket.payment_status ?? 'not_required',
+    paymentMethod: ticket.payment_method ?? null,
+    paynowReference: ticket.paynow_reference ?? null,
     canCancel: Boolean(ticket.can_cancel),
     canMarkUsed: Boolean(ticket.can_mark_used),
     canManage: Boolean(ticket.can_manage),
     bookedAt: ticket.booked_at,
     updatedAt: ticket.updated_at,
   };
+}
+
+function formatDisplayPrice(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return '$$';
+  }
+
+  if (/^\${1,4}$/.test(trimmed) || /^(free|tba|coming soon)$/i.test(trimmed)) {
+    return trimmed;
+  }
+
+  if (/^\d+(?:\.\d{1,2})?$/.test(trimmed.replace(',', ''))) {
+    return `$${trimmed}`;
+  }
+
+  return trimmed;
 }
 
 function mapNotification(notification: BackendNotification): AppNotification {

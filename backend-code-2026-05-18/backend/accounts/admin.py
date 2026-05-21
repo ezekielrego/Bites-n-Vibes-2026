@@ -1,6 +1,6 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
-from .models import User, PasswordResetToken, EmailLoginToken
+from .models import User, PasswordResetToken, EmailLoginToken, PushDevice
 
 
 @admin.register(User)
@@ -43,4 +43,12 @@ class EmailLoginTokenAdmin(admin.ModelAdmin):
     list_filter = ['used', 'created_at']
     search_fields = ['user__email', 'token', 'ip_address']
     readonly_fields = ['token', 'created_at', 'ip_address', 'user_agent']
+
+
+@admin.register(PushDevice)
+class PushDeviceAdmin(admin.ModelAdmin):
+    list_display = ['user', 'platform', 'provider', 'is_active', 'failure_count', 'last_registered_at']
+    list_filter = ['platform', 'provider', 'is_active', 'last_registered_at']
+    search_fields = ['user__email', 'token', 'device_name', 'last_error']
+    readonly_fields = ['created_at', 'updated_at', 'last_registered_at', 'last_error', 'failure_count']
 

@@ -9,6 +9,7 @@ import {
   View,
 } from 'react-native';
 import { Feather } from '@expo/vector-icons';
+import { LinearGradient } from 'expo-linear-gradient';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { TAB_ITEMS } from '../constants';
 import { theme, shadow } from '../theme';
@@ -19,9 +20,11 @@ type FeatherName = React.ComponentProps<typeof Feather>['name'];
 export function BottomNav({
   activeTab,
   onTabChange,
+  unreadCount = 0,
 }: {
   activeTab: TabId;
   onTabChange: (tab: TabId) => void;
+  unreadCount?: number;
 }) {
   const insets = useSafeAreaInsets();
   const indicatorX = useRef(new Animated.Value(0)).current;
@@ -130,7 +133,15 @@ export function BottomNav({
                 transform: [{ scaleX }, { scaleY }],
               },
             ]}
-          />
+          >
+            <LinearGradient
+              colors={['#E53935', theme.colors.accent, theme.colors.accent]}
+              locations={[0, 0.36, 1]}
+              start={{ x: 0, y: 0.5 }}
+              end={{ x: 1, y: 0.5 }}
+              style={StyleSheet.absoluteFillObject}
+            />
+          </Animated.View>
         </Animated.View>
 
         {TAB_ITEMS.map((tab) => (
@@ -139,6 +150,7 @@ export function BottomNav({
             active={tab.id === activeTab}
             icon={tab.icon as FeatherName}
             label={tab.label}
+            badgeCount={tab.id === 'inbox' ? unreadCount : 0}
             onLayout={(event) => handleItemLayout(tab.id, event)}
             onPress={() => onTabChange(tab.id)}
           />
@@ -152,12 +164,14 @@ function NavItem({
   active,
   icon,
   label,
+  badgeCount,
   onLayout,
   onPress,
 }: {
   active: boolean;
   icon: FeatherName;
   label: string;
+  badgeCount: number;
   onLayout: (event: LayoutChangeEvent) => void;
   onPress: () => void;
 }) {
@@ -203,7 +217,10 @@ function NavItem({
       style={[styles.pressable, active ? styles.pressableActive : styles.pressableIdle]}
     >
       <Animated.View style={[styles.item, { transform: [{ scale }] }]}>
-        <Feather color={active ? theme.colors.white : theme.colors.textSoft} name={icon} size={18} />
+        <View style={styles.iconWrap}>
+          <Feather color={active ? theme.colors.white : theme.colors.textSoft} name={icon} size={18} />
+          {badgeCount > 0 ? <NotificationBadge count={badgeCount} /> : null}
+        </View>
         <Animated.Text
           numberOfLines={1}
           style={[
@@ -218,6 +235,26 @@ function NavItem({
         </Animated.Text>
       </Animated.View>
     </Pressable>
+  );
+}
+
+function NotificationBadge({ count }: { count: number }) {
+  const displayCount = count > 99 ? '99+' : String(count);
+
+  return (
+    <View style={styles.badgeWrap}>
+      <LinearGradient
+        colors={['#E53935', theme.colors.accentStrong, theme.colors.accent]}
+        locations={[0, 0.5, 1]}
+        start={{ x: 0, y: 0.5 }}
+        end={{ x: 1, y: 0.5 }}
+        style={styles.badgeBorder}
+      >
+        <View style={styles.badgeInner}>
+          <Text style={styles.badgeText}>{displayCount}</Text>
+        </View>
+      </LinearGradient>
+    </View>
   );
 }
 
@@ -254,7 +291,7 @@ const styles = StyleSheet.create({
   indicator: {
     flex: 1,
     borderRadius: theme.radius.pill,
-    backgroundColor: theme.colors.accent,
+    overflow: 'hidden',
   },
   pressable: {
     zIndex: 1,
@@ -277,6 +314,37 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     gap: 8,
+  },
+  iconWrap: {
+    position: 'relative',
+  },
+  badgeWrap: {
+    position: 'absolute',
+    top: -9,
+    right: -13,
+    minWidth: 18,
+    height: 18,
+    borderRadius: 9,
+    overflow: 'hidden',
+  },
+  badgeBorder: {
+    flex: 1,
+    minWidth: 18,
+    padding: 1,
+  },
+  badgeInner: {
+    flex: 1,
+    minWidth: 16,
+    borderRadius: 999,
+    backgroundColor: 'rgba(12,15,23,0.96)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  badgeText: {
+    color: theme.colors.white,
+    fontSize: 9,
+    fontWeight: '900',
+    includeFontPadding: false,
   },
   label: {
     color: theme.colors.white,

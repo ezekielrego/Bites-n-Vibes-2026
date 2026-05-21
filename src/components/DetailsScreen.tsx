@@ -11,6 +11,7 @@ import {
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   View,
   useWindowDimensions,
 } from 'react-native';
@@ -21,7 +22,7 @@ import { LinearGradient } from 'expo-linear-gradient';
 import MapView, { Marker } from 'react-native-maps';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { theme, shadow } from '../theme';
-import { AppEvent, AppEventMedia, AppUser, ContactIconName, SocialPlatform } from '../types';
+import { AppEvent, AppEventMedia, AppTicket, AppUser, BookingCheckoutInput, BookingPaymentMethod, ContactIconName, SocialPlatform } from '../types';
 import { IconButton, PrimaryButton, Tag, useJellyPressAnimation } from './Primitives';
 import { CommentsSheet } from './CommentsSheet';
 
@@ -37,6 +38,13 @@ const SOCIAL_ICON_MAP: Record<SocialPlatform, { name: FontAwesome6Name; brand?: 
   web: { name: 'globe', color: theme.colors.textMuted },
 };
 
+const PAYMENT_METHODS: Array<{ id: BookingPaymentMethod; label: string }> = [
+  { id: 'ecocash', label: 'EcoCash' },
+  { id: 'onemoney', label: 'OneMoney' },
+  { id: 'innbucks', label: 'Innbucks' },
+  { id: 'omari', label: 'Omari' },
+];
+
 export function DetailsScreen({
   event,
   isSaved,
@@ -51,7 +59,7 @@ export function DetailsScreen({
   isSaved: boolean;
   profile: AppUser | null;
   onBack: () => void;
-  onBook: () => void;
+  onBook: (input?: BookingCheckoutInput) => Promise<AppTicket | null>;
   onCommentCountChange: (nextCount: number) => void;
   onRate: (value: number) => Promise<void>;
   onToggleSave: () => void;
@@ -67,6 +75,10 @@ export function DetailsScreen({
   const [mapExpanded, setMapExpanded] = useState(false);
   const [activeMediaIndex, setActiveMediaIndex] = useState(0);
   const [fullscreenVideo, setFullscreenVideo] = useState<AppEventMedia | null>(null);
+  const [checkoutOpen, setCheckoutOpen] = useState(false);
+  const [checkoutPending, setCheckoutPending] = useState(false);
+  const [paymentMethod, setPaymentMethod] = useState<BookingPaymentMethod>('ecocash');
+  const [paymentPhone, setPaymentPhone] = useState('');
   const tags = event.categories.map((category) => category.name);
   const heroMedia = useMemo(() => buildHeroMedia(event), [event]);
   const activeMedia = heroMedia[activeMediaIndex] ?? heroMedia[0] ?? null;
@@ -76,6 +88,8 @@ export function DetailsScreen({
     [event.city, event.venue],
   );
   const actionBarInset = insets.bottom + 96;
+  const bookingAction = useMemo(() => getBookingAction(event), [event]);
+  const ctaLabel = event.hasTicket ? `View ${bookingAction.noun}` : bookingAction.cta;
   const heroPagerRef = useRef<ScrollView>(null);
   const autoplayHoldUntil = useRef(0);
   const mapPreviewJelly = useJellyPressAnimation({
@@ -149,21 +163,6 @@ export function DetailsScreen({
     [heroMedia.length, width],
   );
 
-  const handleVideoStatusUpdate = useCallback(
-    (status: AVPlaybackStatus, mediaId: string) => {
-      if (!status.isLoaded || !status.didJustFinish) {
-        return;
-      }
-
-      if (activeMedia?.id !== mediaId || heroMedia.length < 2) {
-        return;
-      }
-
-      advanceMedia();
-    },
-    [activeMedia?.id, advanceMedia, heroMedia.length],
-  );
-
   const handleOpenDirections = async () => {
     const { latitude, longitude } = event.location;
     const destination = `${latitude},${longitude}`;
@@ -211,6 +210,32 @@ export function DetailsScreen({
     });
   };
 
+  const handlePrimaryAction = () => {
+    if (event.hasTicket || !eventNeedsPayment(event)) {
+      void onBook();
+      return;
+    }
+
+    setCheckoutOpen(true);
+  };
+
+  const handleConfirmCheckout = async () => {
+    if (!paymentPhone.trim()) {
+      return;
+    }
+
+    setCheckoutPending(true);
+    const ticket = await onBook({
+      paymentMethod,
+      phone: paymentPhone.trim(),
+      quantity: 1,
+    });
+    setCheckoutPending(false);
+    if (ticket?.status === 'confirmed') {
+      setCheckoutOpen(false);
+    }
+  };
+
   return (
     <View style={styles.container}>
       <ScrollView contentContainerStyle={{ paddingBottom: insets.bottom + 132 }} showsVerticalScrollIndicator={false}>
@@ -233,7 +258,6 @@ export function DetailsScreen({
                 isActive={activeMedia?.id === media.id && !fullscreenVideo}
                 media={media}
                 onOpenVideo={() => setFullscreenVideo(media)}
-                onVideoFinish={handleVideoStatusUpdate}
                 width={width}
               />
             ))}
@@ -250,7 +274,7 @@ export function DetailsScreen({
           {activeMedia?.kind === 'video' ? (
             <View pointerEvents="none" style={styles.heroVideoHint}>
               <Feather color={theme.colors.white} name="play-circle" size={14} />
-              <Text style={styles.heroVideoHintText}>Tap video to expand</Text>
+              <Text style={styles.heroVideoHintText}>Tap to play full video</Text>
             </View>
           ) : null}
 
@@ -390,7 +414,7 @@ export function DetailsScreen({
 
       <View style={[styles.bottomBar, { paddingBottom: insets.bottom + 12 }]}>
         <View style={styles.bottomBarInner}>
-          <PrimaryButton label={event.hasTicket ? 'View ticket' : 'Get ticket'} onPress={onBook} />
+          <PrimaryButton label={ctaLabel} onPress={handlePrimaryAction} />
           <RatingDock
             isOpen={ratingOpen}
             isSubmitting={ratingPending}
@@ -409,6 +433,23 @@ export function DetailsScreen({
         profile={profile}
         totalCount={commentCount}
         visible={commentsOpen}
+      />
+
+      <BookingCheckoutSheet
+        actionLabel={bookingAction.noun}
+        event={event}
+        method={paymentMethod}
+        phone={paymentPhone}
+        pending={checkoutPending}
+        visible={checkoutOpen}
+        onChangeMethod={setPaymentMethod}
+        onChangePhone={setPaymentPhone}
+        onClose={() => {
+          if (!checkoutPending) {
+            setCheckoutOpen(false);
+          }
+        }}
+        onConfirm={handleConfirmCheckout}
       />
 
       {mapExpanded ? (
@@ -472,18 +513,135 @@ export function DetailsScreen({
 
           {fullscreenVideo ? (
             <Video
-              posterSource={fullscreenVideo.preview ? { uri: fullscreenVideo.preview } : undefined}
+              isLooping={false}
               shouldPlay
               source={{ uri: fullscreenVideo.source }}
               style={styles.fullscreenVideoPlayer}
               resizeMode={ResizeMode.CONTAIN}
               useNativeControls
-              usePoster={Boolean(fullscreenVideo.preview)}
             />
           ) : null}
         </View>
       </Modal>
     </View>
+  );
+}
+
+function BookingCheckoutSheet({
+  actionLabel,
+  event,
+  method,
+  phone,
+  pending,
+  visible,
+  onChangeMethod,
+  onChangePhone,
+  onClose,
+  onConfirm,
+}: {
+  actionLabel: string;
+  event: AppEvent;
+  method: BookingPaymentMethod;
+  phone: string;
+  pending: boolean;
+  visible: boolean;
+  onChangeMethod: (method: BookingPaymentMethod) => void;
+  onChangePhone: (phone: string) => void;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  const insets = useSafeAreaInsets();
+  const canSubmit = phone.trim().length >= 7 && !pending;
+
+  return (
+    <Modal animationType="slide" transparent visible={visible} onRequestClose={onClose}>
+      <View style={styles.checkoutBackdrop}>
+        <Pressable style={StyleSheet.absoluteFillObject} onPress={onClose} />
+        <View style={[styles.checkoutSheet, { paddingBottom: insets.bottom + 18 }]}>
+          <View style={styles.checkoutHandle} />
+          <View style={styles.checkoutHeader}>
+            <View>
+              <Text style={styles.checkoutEyebrow}>In-app payment</Text>
+              <Text style={styles.checkoutTitle}>Complete {actionLabel}</Text>
+            </View>
+            <IconButton icon="x" onPress={onClose} accessibilityLabel="Close checkout" />
+          </View>
+
+          <View style={styles.checkoutSummary}>
+            <Text style={styles.checkoutListing} numberOfLines={1}>{event.title}</Text>
+            <Text style={styles.checkoutAmount}>{event.price}</Text>
+          </View>
+
+          <Text style={styles.checkoutLabel}>Pay with</Text>
+          <View style={styles.paymentMethodGrid}>
+            {PAYMENT_METHODS.map((item) => (
+              <PaymentMethodChip
+                key={item.id}
+                active={item.id === method}
+                label={item.label}
+                onPress={() => onChangeMethod(item.id)}
+              />
+            ))}
+          </View>
+
+          <Text style={styles.checkoutLabel}>Wallet phone number</Text>
+          <View style={styles.checkoutInputLine}>
+            <Feather color={theme.colors.textMuted} name="phone" size={16} />
+            <TextInput
+              keyboardType="phone-pad"
+              onChangeText={onChangePhone}
+              placeholder="e.g. 0771234567"
+              placeholderTextColor={theme.colors.textMuted}
+              style={styles.checkoutInput}
+              value={phone}
+            />
+          </View>
+
+          <Text style={styles.checkoutHelp}>
+            We will ask Paynow to send the prompt to your phone, then keep polling until your unique reference and QR are ready.
+          </Text>
+
+          <Pressable
+            accessibilityRole="button"
+            disabled={!canSubmit}
+            onPress={onConfirm}
+            style={[styles.checkoutSubmit, !canSubmit && styles.checkoutSubmitDisabled]}
+          >
+            <LinearGradient
+              colors={['#E7392F', theme.colors.accentStrong, theme.colors.accent]}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 1, y: 1 }}
+              style={styles.checkoutSubmitGradient}
+            >
+              <Text style={styles.checkoutSubmitText}>{pending ? 'Checking payment...' : `Pay ${event.price}`}</Text>
+            </LinearGradient>
+          </Pressable>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function PaymentMethodChip({
+  active,
+  label,
+  onPress,
+}: {
+  active: boolean;
+  label: string;
+  onPress: () => void;
+}) {
+  const jelly = useJellyPressAnimation({
+    pressedScaleX: 1.03,
+    pressedScaleY: 0.94,
+  });
+
+  return (
+    <Pressable onPress={onPress} onPressIn={jelly.onPressIn} onPressOut={jelly.onPressOut} style={styles.paymentMethodPressable}>
+      <Animated.View style={[styles.paymentMethodChip, active && styles.paymentMethodChipActive, jelly.animatedStyle]}>
+        <Text style={[styles.paymentMethodText, active && styles.paymentMethodTextActive]}>{label}</Text>
+      </Animated.View>
+    </Pressable>
   );
 }
 
@@ -534,35 +692,119 @@ function HeroMediaSlide({
   height,
   isActive,
   onOpenVideo,
-  onVideoFinish,
 }: {
   media: AppEventMedia;
   width: number;
   height: number;
   isActive: boolean;
   onOpenVideo: () => void;
-  onVideoFinish: (status: AVPlaybackStatus, mediaId: string) => void;
 }) {
   if (media.kind === 'video') {
-    return (
-      <Pressable onPress={onOpenVideo} style={{ width, height }}>
-        <Video
-          isLooping={false}
-          onPlaybackStatusUpdate={(status) => onVideoFinish(status, media.id)}
-          pointerEvents="none"
-          posterSource={media.preview ? { uri: media.preview } : undefined}
-          posterStyle={styles.heroMedia}
-          resizeMode={ResizeMode.COVER}
-          shouldPlay={isActive}
-          source={{ uri: media.source }}
-          style={styles.heroMedia}
-          usePoster={Boolean(media.preview)}
-        />
-      </Pressable>
-    );
+    return <HeroVideoPreviewSlide height={height} isActive={isActive} media={media} onOpenVideo={onOpenVideo} width={width} />;
   }
 
   return <Image contentFit="cover" source={media.source} style={{ width, height }} transition={220} />;
+}
+
+function HeroVideoPreviewSlide({
+  height,
+  isActive,
+  media,
+  onOpenVideo,
+  width,
+}: {
+  height: number;
+  isActive: boolean;
+  media: AppEventMedia;
+  onOpenVideo: () => void;
+  width: number;
+}) {
+  const videoRef = useRef<Video>(null);
+  const previewSegmentsRef = useRef<Array<{ start: number; end: number }>>([]);
+  const previewSegmentIndexRef = useRef(0);
+  const [videoReady, setVideoReady] = useState(false);
+
+  useEffect(() => {
+    if (!isActive) {
+      videoRef.current?.pauseAsync().catch(() => undefined);
+      return;
+    }
+
+    const firstSegment = previewSegmentsRef.current[0];
+    if (videoReady && firstSegment) {
+      previewSegmentIndexRef.current = 0;
+      videoRef.current?.playFromPositionAsync(firstSegment.start).catch(() => undefined);
+    }
+  }, [isActive, videoReady]);
+
+  useEffect(() => {
+    return () => {
+      videoRef.current?.stopAsync().catch(() => undefined);
+    };
+  }, []);
+
+  const handleVideoLoad = (status: AVPlaybackStatus) => {
+    if (!('isLoaded' in status) || !status.isLoaded) {
+      return;
+    }
+
+    previewSegmentsRef.current = buildHeroPreviewSegments(status.durationMillis ?? 0);
+    previewSegmentIndexRef.current = 0;
+    setVideoReady(true);
+
+    if (isActive) {
+      const firstSegment = previewSegmentsRef.current[0];
+      videoRef.current?.playFromPositionAsync(firstSegment?.start ?? 0).catch(() => undefined);
+    }
+  };
+
+  const handleVideoStatusUpdate = (status: AVPlaybackStatus) => {
+    if (!isActive || !('isLoaded' in status) || !status.isLoaded) {
+      return;
+    }
+
+    if (previewSegmentsRef.current.length === 0) {
+      previewSegmentsRef.current = buildHeroPreviewSegments(status.durationMillis ?? 0);
+    }
+
+    const activeSegment = previewSegmentsRef.current[previewSegmentIndexRef.current];
+    if (!activeSegment || status.positionMillis + 140 < activeSegment.end) {
+      return;
+    }
+
+    const nextSegment = previewSegmentsRef.current[previewSegmentIndexRef.current + 1];
+    if (!nextSegment) {
+      videoRef.current?.pauseAsync().catch(() => undefined);
+      return;
+    }
+
+    previewSegmentIndexRef.current += 1;
+    videoRef.current?.playFromPositionAsync(nextSegment.start).catch(() => undefined);
+  };
+
+  return (
+    <Pressable onPress={onOpenVideo} style={{ width, height }}>
+      {media.preview ? (
+        <Image contentFit="cover" source={media.preview} style={{ width, height }} transition={180} />
+      ) : (
+        <View style={[styles.heroVideoPlaceholder, { width, height }]} />
+      )}
+      <Video
+        isMuted
+        onLoad={handleVideoLoad}
+        onPlaybackStatusUpdate={handleVideoStatusUpdate}
+        pointerEvents="none"
+        ref={videoRef}
+        resizeMode={ResizeMode.COVER}
+        shouldPlay={false}
+        source={{ uri: media.source }}
+        style={[styles.heroMedia, styles.heroPreviewVideo, !videoReady && styles.heroPreviewVideoHidden]}
+      />
+      <View pointerEvents="none" style={styles.heroVideoPlayOverlay}>
+        <Feather color={theme.colors.white} name="play" size={22} />
+      </View>
+    </Pressable>
+  );
 }
 
 function HeroPaginationDots({
@@ -863,6 +1105,30 @@ function buildHeroMedia(event: AppEvent) {
   return [];
 }
 
+function buildHeroPreviewSegments(durationMillis: number) {
+  const clipLength = 5000;
+  const clipCount = 4;
+  const totalPreviewLength = clipLength * clipCount;
+
+  if (!Number.isFinite(durationMillis) || durationMillis <= totalPreviewLength + 120) {
+    return [{ start: 0, end: Math.max(1200, durationMillis - 120) }];
+  }
+
+  const maxStart = Math.max(durationMillis - clipLength - 120, 0);
+  const step = maxStart / Math.max(clipCount - 1, 1);
+  const segments: Array<{ start: number; end: number }> = [];
+
+  for (let index = 0; index < clipCount; index += 1) {
+    const start = Math.min(Math.round(step * index), maxStart);
+    segments.push({
+      start,
+      end: Math.min(start + clipLength, durationMillis - 120),
+    });
+  }
+
+  return segments.length > 0 ? segments : [{ start: 0, end: Math.max(1200, durationMillis - 120) }];
+}
+
 function shouldShowArtist(event: AppEvent) {
   const primaryCategory = event.categories[0]?.id ?? '';
   if (!event.artist || event.artist.trim().length === 0) {
@@ -870,6 +1136,27 @@ function shouldShowArtist(event: AppEvent) {
   }
 
   return ['bars-lounges', 'chill-spots'].includes(primaryCategory);
+}
+
+function getBookingAction(event: AppEvent) {
+  const categoryIds = event.categories.map((category) => category.id);
+  if (categoryIds.includes('restaurants')) {
+    return { cta: 'Reserve table', noun: 'reservation' };
+  }
+  if (categoryIds.includes('fast-food')) {
+    return { cta: 'Order now', noun: 'order' };
+  }
+  if (categoryIds.includes('resorts') || categoryIds.includes('bnbs') || categoryIds.includes('resorts-bnbs')) {
+    return { cta: 'Book stay', noun: 'booking' };
+  }
+  if (categoryIds.includes('bars-lounges') || categoryIds.includes('chill-spots')) {
+    return { cta: 'Reserve spot', noun: 'reservation' };
+  }
+  return { cta: 'Get ticket', noun: 'ticket' };
+}
+
+function eventNeedsPayment(event: AppEvent) {
+  return event.acceptsInternalPayments && /\d/.test(event.price) && !/free|tba|soon/i.test(event.price);
 }
 
 const styles = StyleSheet.create({
@@ -882,6 +1169,30 @@ const styles = StyleSheet.create({
   heroMedia: {
     width: '100%',
     height: '100%',
+  },
+  heroVideoPlaceholder: {
+    backgroundColor: '#05070C',
+  },
+  heroPreviewVideo: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  heroPreviewVideoHidden: {
+    opacity: 0,
+  },
+  heroVideoPlayOverlay: {
+    position: 'absolute',
+    left: '50%',
+    top: '50%',
+    width: 58,
+    height: 58,
+    marginLeft: -29,
+    marginTop: -29,
+    borderRadius: 29,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(8,10,14,0.58)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.20)',
   },
   heroControls: {
     position: 'absolute',
@@ -1000,7 +1311,7 @@ const styles = StyleSheet.create({
   },
   sheet: {
     marginTop: -22,
-    marginHorizontal: 16,
+    marginHorizontal: 4,
     padding: 20,
     borderRadius: theme.radius.xl,
     backgroundColor: 'rgba(12,15,23,0.94)',
@@ -1305,6 +1616,143 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     flexWrap: 'wrap',
     gap: 10,
+  },
+  checkoutBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(4,7,13,0.66)',
+    justifyContent: 'flex-end',
+  },
+  checkoutSheet: {
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    backgroundColor: 'rgba(12,15,23,0.98)',
+    borderTopWidth: 1,
+    borderColor: 'rgba(255,255,255,0.1)',
+    paddingHorizontal: 18,
+    paddingTop: 10,
+    gap: 14,
+    ...shadow,
+  },
+  checkoutHandle: {
+    alignSelf: 'center',
+    width: 42,
+    height: 4,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255,255,255,0.18)',
+    marginBottom: 4,
+  },
+  checkoutHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  checkoutEyebrow: {
+    color: theme.colors.accentStrong,
+    fontSize: 11,
+    fontWeight: '800',
+    textTransform: 'uppercase',
+    letterSpacing: 0.8,
+  },
+  checkoutTitle: {
+    color: theme.colors.text,
+    fontSize: 21,
+    fontWeight: '800',
+  },
+  checkoutSummary: {
+    minHeight: 48,
+    borderTopWidth: 1,
+    borderBottomWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  checkoutListing: {
+    flex: 1,
+    color: theme.colors.textMuted,
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  checkoutAmount: {
+    color: theme.colors.white,
+    fontSize: 18,
+    fontWeight: '800',
+  },
+  checkoutLabel: {
+    color: theme.colors.textSoft,
+    fontSize: 11,
+    fontWeight: '800',
+    textTransform: 'uppercase',
+    letterSpacing: 0.7,
+  },
+  paymentMethodGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  paymentMethodPressable: {
+    alignSelf: 'flex-start',
+  },
+  paymentMethodChip: {
+    minHeight: 38,
+    paddingHorizontal: 13,
+    borderRadius: 12,
+    backgroundColor: theme.colors.surfaceMuted,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  paymentMethodChipActive: {
+    backgroundColor: 'rgba(255,107,61,0.16)',
+    borderColor: 'rgba(231,57,47,0.54)',
+  },
+  paymentMethodText: {
+    color: theme.colors.textMuted,
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  paymentMethodTextActive: {
+    color: theme.colors.white,
+  },
+  checkoutInputLine: {
+    minHeight: 46,
+    borderBottomWidth: 1,
+    borderColor: 'rgba(255,255,255,0.14)',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  checkoutInput: {
+    flex: 1,
+    color: theme.colors.text,
+    fontSize: 15,
+    fontWeight: '700',
+    paddingVertical: 0,
+  },
+  checkoutHelp: {
+    color: theme.colors.textMuted,
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  checkoutSubmit: {
+    alignSelf: 'stretch',
+  },
+  checkoutSubmitDisabled: {
+    opacity: 0.48,
+  },
+  checkoutSubmitGradient: {
+    minHeight: 50,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  checkoutSubmitText: {
+    color: theme.colors.white,
+    fontSize: 14,
+    fontWeight: '900',
   },
   bottomBar: {
     position: 'absolute',

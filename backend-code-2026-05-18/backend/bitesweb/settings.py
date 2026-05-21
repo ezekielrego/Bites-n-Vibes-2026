@@ -42,7 +42,7 @@ INSTALLED_APPS = [
     'accounts',
     'listings',
     'comments',
-    'notifications',
+    'notifications.apps.NotificationsConfig',
 ]
 
 MIDDLEWARE = [
@@ -269,6 +269,22 @@ AUTH_ALLOWED_REDIRECT_PREFIXES = config(
     cast=Csv()
 )
 ALLOW_APP_DEMO_SESSION = config('ALLOW_APP_DEMO_SESSION', default=DEBUG, cast=bool)
+
+# Paynow Zimbabwe Express Checkout. Keep payment secrets out of source control.
+PAYNOW_INTEGRATION_ID = config('PAYNOW_INTEGRATION_ID', default='')
+PAYNOW_INTEGRATION_KEY = config('PAYNOW_INTEGRATION_KEY', default='')
+PAYNOW_RESULT_URL = config('PAYNOW_RESULT_URL', default=f'{FRONTEND_URL}/api/listings/paynow-result/')
+PAYNOW_RETURN_URL = config('PAYNOW_RETURN_URL', default=FRONTEND_URL)
+PAYNOW_EXPRESS_URL = config('PAYNOW_EXPRESS_URL', default='https://www.paynow.co.zw/interface/remotetransaction')
+PAYNOW_ENABLED = config('PAYNOW_ENABLED', default=False, cast=bool)
+PAYNOW_TEST_MODE = config('PAYNOW_TEST_MODE', default=DEBUG, cast=bool)
+
+# Firebase Cloud Messaging. Leave disabled until service account credentials are added.
+FIREBASE_PUSH_ENABLED = config('FIREBASE_PUSH_ENABLED', default=False, cast=bool)
+FIREBASE_CREDENTIALS_PATH = config('FIREBASE_CREDENTIALS_PATH', default='')
+FIREBASE_CREDENTIALS_JSON = config('FIREBASE_CREDENTIALS_JSON', default='')
+FIREBASE_PUSH_DRY_RUN = config('FIREBASE_PUSH_DRY_RUN', default=DEBUG, cast=bool)
+
 
 # CSRF Configuration
 CSRF_TRUSTED_ORIGINS = config(

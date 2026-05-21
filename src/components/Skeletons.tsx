@@ -37,13 +37,13 @@ function SkeletonBlock({
       Animated.sequence([
         Animated.timing(progress, {
           toValue: 1,
-          duration: 1200,
+          duration: 1500,
           easing: Easing.inOut(Easing.quad),
           useNativeDriver: true,
         }),
         Animated.timing(progress, {
           toValue: 0,
-          duration: 1200,
+          duration: 1500,
           easing: Easing.inOut(Easing.quad),
           useNativeDriver: true,
         }),
@@ -70,13 +70,13 @@ function SkeletonBlock({
             {
               scaleX: progress.interpolate({
                 inputRange: [0, 1],
-                outputRange: [1, 1.035],
+                outputRange: [1, 1.018],
               }),
             },
             {
               scaleY: progress.interpolate({
                 inputRange: [0, 1],
-                outputRange: [1, 0.965],
+                outputRange: [1, 0.982],
               }),
             },
           ],
@@ -105,13 +105,13 @@ export function HomeScreenSkeleton({ activeTab }: { activeTab: TabId }) {
 
       {activeTab === 'discover' ? (
         <>
-          <SkeletonBlock height={50} radius={999} />
+          <SkeletonBlock height={50} radius={11} />
 
           <View style={styles.pillRow}>
-            <SkeletonBlock height={38} radius={999} width={90} />
-            <SkeletonBlock height={38} radius={999} width={84} />
-            <SkeletonBlock height={38} radius={999} width={104} />
-            <SkeletonBlock height={38} radius={999} width={98} />
+            <SkeletonBlock height={38} radius={11} width={90} />
+            <SkeletonBlock height={38} radius={11} width={84} />
+            <SkeletonBlock height={38} radius={11} width={104} />
+            <SkeletonBlock height={38} radius={11} width={98} />
           </View>
 
           <View style={styles.spotlightCard}>
@@ -121,7 +121,7 @@ export function HomeScreenSkeleton({ activeTab }: { activeTab: TabId }) {
               <SkeletonBlock height={16} width="88%" />
               <SkeletonBlock height={16} width="58%" />
             </View>
-            <SkeletonBlock height={110} radius={20} width={92} />
+            <SkeletonBlock height={148} radius={0} width={120} />
           </View>
 
           <View style={styles.sectionHeader}>
@@ -129,8 +129,8 @@ export function HomeScreenSkeleton({ activeTab }: { activeTab: TabId }) {
             <SkeletonBlock height={14} width={54} />
           </View>
 
-          <SkeletonBlock height={208} radius={theme.radius.lg} style={styles.cardShadow} />
-          <SkeletonBlock height={208} radius={theme.radius.lg} style={styles.cardShadow} />
+          <SkeletonBlock height={318} radius={0} style={styles.feedCardSkeleton} />
+          <SkeletonBlock height={318} radius={0} style={styles.feedCardSkeleton} />
         </>
       ) : (
         <>
@@ -274,7 +274,7 @@ const styles = StyleSheet.create({
     borderColor: theme.colors.border,
   },
   page: {
-    paddingHorizontal: 20,
+    paddingHorizontal: 4,
     gap: 16,
   },
   headerRow: {
@@ -290,8 +290,9 @@ const styles = StyleSheet.create({
   },
   spotlightCard: {
     marginTop: 4,
-    marginBottom: 14,
-    borderRadius: theme.radius.lg,
+    marginBottom: 10,
+    marginHorizontal: -4,
+    borderRadius: 11,
     borderWidth: 1,
     borderColor: theme.colors.border,
     backgroundColor: theme.colors.surface,
@@ -312,21 +313,26 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
   },
-  cardShadow: {
-    ...shadow,
+  feedCardSkeleton: {
+    marginHorizontal: -4,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.08)',
   },
   placeholderCard: {
-    borderRadius: theme.radius.lg,
-    backgroundColor: theme.colors.surfaceMuted,
-    borderWidth: 1,
-    borderColor: theme.colors.border,
-    padding: 20,
+    borderTopWidth: 1,
+    borderBottomWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: 'transparent',
+    paddingVertical: 16,
+    paddingHorizontal: 4,
     gap: 12,
   },
   innerCard: {
-    borderRadius: theme.radius.md,
-    padding: 16,
-    backgroundColor: theme.colors.backgroundElevated,
+    borderTopWidth: 1,
+    borderBottomWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    paddingVertical: 12,
+    backgroundColor: 'transparent',
     gap: 8,
   },
   detailsHero: {
@@ -357,7 +363,7 @@ const styles = StyleSheet.create({
   },
   sheet: {
     marginTop: -22,
-    marginHorizontal: 16,
+    marginHorizontal: 4,
     padding: 20,
     borderRadius: theme.radius.xl,
     backgroundColor: 'rgba(12,15,23,0.94)',

@@ -2,7 +2,7 @@ import { AppIconName, TabId } from './types';
 
 export const TAB_ITEMS: Array<{ id: TabId; label: string; icon: AppIconName }> = [
   { id: 'discover', label: 'Discover', icon: 'grid' },
-  { id: 'saved', label: 'Saved', icon: 'heart' },
+  { id: 'stream', label: 'Stream', icon: 'play-circle' },
   { id: 'create', label: 'Create', icon: 'plus-circle' },
   { id: 'inbox', label: 'Inbox', icon: 'message-circle' },
   { id: 'profile', label: 'Me', icon: 'user' },

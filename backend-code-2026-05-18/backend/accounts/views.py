@@ -291,6 +291,7 @@ def register_push_device(request):
     """Register or refresh a push-capable device token for the current user."""
     token = (request.data.get('token') or '').strip()
     platform = (request.data.get('platform') or 'unknown').strip().lower()
+    provider = (request.data.get('provider') or 'firebase').strip().lower()
     device_name = (request.data.get('device_name') or '').strip()
 
     if not token:
@@ -301,14 +302,19 @@ def register_push_device(request):
 
     if platform not in {'android', 'ios', 'web'}:
         platform = 'unknown'
+    if provider not in {'firebase', 'expo'}:
+        provider = 'firebase'
 
     device, _ = PushDevice.objects.update_or_create(
         token=token,
         defaults={
             'user': request.user,
             'platform': platform,
+            'provider': provider,
             'device_name': device_name[:120],
             'is_active': True,
+            'failure_count': 0,
+            'last_error': '',
         },
     )
 

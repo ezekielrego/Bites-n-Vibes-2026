@@ -96,6 +96,8 @@ class ListingSerializer(serializers.ModelSerializer):
     user_has_ticket = serializers.SerializerMethodField()
     owner_can_edit = serializers.SerializerMethodField()
     owner_edit_expires_at = serializers.SerializerMethodField()
+    owner_sold_count = serializers.SerializerMethodField()
+    owner_revenue_total = serializers.SerializerMethodField()
     saved_count = serializers.ReadOnlyField()
     tag_names = serializers.ListField(child=serializers.CharField(), required=False, write_only=True)
     images_payload = serializers.ListField(child=serializers.DictField(), required=False, write_only=True)
@@ -131,17 +133,19 @@ class ListingSerializer(serializers.ModelSerializer):
             'id', 'name', 'listing_kind', 'category', 'category_name', 'category_slug', 'category_icon',
             'description', 'address', 'latitude', 'longitude',
             'phone', 'website', 'email', 'price_range', 'display_price', 'opening_hours', 'app_data',
-            'is_active', 'is_trending', 'is_featured', 'is_verified',
+            'is_active', 'is_trending', 'is_featured', 'is_verified', 'accepts_internal_payments',
             'tags', 'tags_display', 'images', 'primary_image', 'ticket_image', 'owner', 'owner_name',
             'average_rating', 'rating_count', 'comment_count',
             'vibe_percentage', 'vibe_count', 'user_is_vibing', 'user_has_saved', 'saved_count',
             'user_has_ticket', 'owner_can_edit', 'owner_edit_expires_at',
+            'owner_sold_count', 'owner_revenue_total',
             'tag_names', 'images_payload',
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at', 'average_rating', 'rating_count', 'comment_count',
                           'vibe_percentage', 'vibe_count', 'user_is_vibing', 'user_has_saved', 'saved_count',
                           'user_has_ticket', 'owner_can_edit', 'owner_edit_expires_at',
+                          'owner_sold_count', 'owner_revenue_total',
                           'images', 'primary_image', 'ticket_image', 'tags_display']
         extra_kwargs = {
             'category': {'write_only': True},
@@ -269,6 +273,19 @@ class ListingSerializer(serializers.ModelSerializer):
     def get_owner_edit_expires_at(self, obj):
         expires_at = getattr(obj, 'owner_edit_expires_at', None)
         return expires_at.isoformat() if expires_at else None
+
+    def get_owner_sold_count(self, obj):
+        request = self.context.get('request')
+        if not request or not request.user.is_authenticated or not (request.user.is_superuser or obj.owner_id == request.user.id):
+            return 0
+        return obj.tickets.filter(status__in=['confirmed', 'used']).count()
+
+    def get_owner_revenue_total(self, obj):
+        request = self.context.get('request')
+        if not request or not request.user.is_authenticated or not (request.user.is_superuser or obj.owner_id == request.user.id):
+            return '0.00'
+        total = sum(ticket.total_amount for ticket in obj.tickets.filter(status__in=['confirmed', 'used']))
+        return f'{Decimal(total).quantize(Decimal("0.01"))}'
     
     def validate(self, data):
         """Validate the entire data object."""
@@ -404,7 +421,7 @@ class ListingListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'listing_kind', 'category_name', 'category_slug', 'category_icon',
             'address', 'phone', 'price_range', 'display_price', 'app_data',
-            'primary_image', 'ticket_image', 'average_rating', 'rating_count', 'comment_count', 'is_trending', 'is_verified',
+            'primary_image', 'ticket_image', 'average_rating', 'rating_count', 'comment_count', 'is_trending', 'is_verified', 'accepts_internal_payments',
             'tags', 'vibe_percentage', 'user_has_saved', 'user_has_ticket', 'owner_can_edit', 'owner_edit_expires_at', 'saved_count',
             'owner', 'owner_name', 'created_at', 'latitude', 'longitude'
         ]
@@ -505,9 +522,18 @@ class TicketSerializer(serializers.ModelSerializer):
             'listing_name',
             'buyer_name',
             'buyer_email',
+            'action_type',
+            'quantity',
+            'unit_price',
+            'total_amount',
+            'currency',
             'reference_code',
             'qr_payload',
             'status',
+            'payment_status',
+            'payment_method',
+            'payer_phone',
+            'paynow_reference',
             'can_cancel',
             'can_mark_used',
             'can_manage',

@@ -23,6 +23,7 @@ import { ResizeMode, type AVPlaybackStatus, Video } from 'expo-av';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { APP_VERSION, TAB_ITEMS } from '../constants';
+import { fetchAppFeed } from '../api';
 import { theme, shadow } from '../theme';
 import {
   AppCategory,
@@ -43,7 +44,7 @@ import {
   SectionHeader,
   useJellyPressAnimation,
 } from './Primitives';
-import { CreateTabView, InboxTabView, ProfileTabView, SavedTabView } from './SecondaryTabViews';
+import { CreateTabView, InboxTabView, ProfileTabView, StreamTabView } from './SecondaryTabViews';
 
 type FeatherName = React.ComponentProps<typeof Feather>['name'];
 const APP_LOGO = require('../../logo.png');
@@ -141,6 +142,11 @@ export function HomeScreen({
   const { width } = useWindowDimensions();
   const [activeCategory, setActiveCategory] = useState<CategoryId>('all');
   const [searchQuery, setSearchQuery] = useState('');
+  const [feedEvents, setFeedEvents] = useState<AppEvent[]>(events);
+  const [feedNextPage, setFeedNextPage] = useState<number | null>(2);
+  const [feedLoading, setFeedLoading] = useState(false);
+  const [feedRefreshing, setFeedRefreshing] = useState(false);
+  const [feedTotalCount, setFeedTotalCount] = useState(events.length);
   const [isSearchFocused, setIsSearchFocused] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [floatingSearchVisible, setFloatingSearchVisible] = useState(false);
@@ -150,6 +156,9 @@ export function HomeScreen({
   const pendingSearchFocus = useRef(false);
   const searchFocusTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
   const floatingSearchVisibleRef = useRef(false);
+  const feedRequestKeyRef = useRef('');
+  const categoryRailRef = useRef<ScrollView>(null);
+  const categoryLayoutsRef = useRef<Partial<Record<CategoryId, { width: number; x: number }>>>({});
   const menuTranslate = useRef(new Animated.Value(-Math.min(width * 0.76, 320))).current;
   const menuOverlayOpacity = useRef(new Animated.Value(0)).current;
   const scrollY = useRef(new Animated.Value(0)).current;
@@ -209,6 +218,12 @@ export function HomeScreen({
   }, [activeCategory, categories]);
 
   useEffect(() => {
+    setFeedEvents(events);
+    setFeedTotalCount(events.length);
+    setFeedNextPage(2);
+  }, [events]);
+
+  useEffect(() => {
     if (!pendingSearchFocus.current || menuOpen || activeTab !== 'discover') {
       return;
     }
@@ -254,23 +269,119 @@ export function HomeScreen({
 
   const handleOpenCategory = (categoryId: CategoryId) => {
     setActiveCategory(categoryId);
+    setSearchQuery('');
+    previewEventIdRef.current = null;
+    setPreviewEventId(null);
+    scrollCategoryIntoView(categoryId);
     if (activeTab !== 'discover') {
       onTabChange('discover');
     }
   };
 
-  const query = deferredSearchQuery.trim().toLowerCase();
-  const filteredEvents = events.filter((event) => {
-    const matchesCategory =
-      activeCategory === 'all' || event.categories.some((category) => category.id === activeCategory);
-    const matchesQuery =
-      query.length === 0 ||
-      [event.artist, event.title, event.city, event.venue].some((value) =>
-        value.toLowerCase().includes(query),
-      );
+  const scrollCategoryIntoView = (categoryId: CategoryId) => {
+    const layout = categoryLayoutsRef.current[categoryId];
+    if (!layout) {
+      return;
+    }
 
-    return matchesCategory && matchesQuery;
-  });
+    const targetX = Math.max(0, layout.x - Math.max(16, (width - layout.width) / 2));
+    categoryRailRef.current?.scrollTo({ x: targetX, y: 0, animated: true });
+  };
+
+  useEffect(() => {
+    const timer = setTimeout(() => scrollCategoryIntoView(activeCategory), 80);
+    return () => clearTimeout(timer);
+  }, [activeCategory, width]);
+
+  useEffect(() => {
+    if (activeTab !== 'discover' || categories.length === 0) {
+      return;
+    }
+
+    const requestKey = `${activeCategory}|${deferredSearchQuery.trim()}`;
+    feedRequestKeyRef.current = requestKey;
+    setFeedRefreshing(true);
+
+    const timeout = setTimeout(() => {
+      fetchAppFeed({
+        categories,
+        categoryId: activeCategory,
+        page: 1,
+        pageSize: 10,
+        search: deferredSearchQuery,
+      })
+        .then((page) => {
+          if (feedRequestKeyRef.current !== requestKey) {
+            return;
+          }
+          setFeedEvents(page.events);
+          setFeedNextPage(page.nextPage);
+          setFeedTotalCount(page.totalCount);
+        })
+        .catch(() => {
+          if (feedRequestKeyRef.current !== requestKey) {
+            return;
+          }
+          const localQuery = deferredSearchQuery.trim().toLowerCase();
+          const localEvents = events.filter((event) => {
+            const matchesCategory =
+              activeCategory === 'all' || event.categories.some((category) => category.id === activeCategory);
+            const matchesQuery =
+              localQuery.length === 0 ||
+              [event.artist, event.title, event.city, event.venue].some((value) =>
+                value.toLowerCase().includes(localQuery),
+              );
+
+            return matchesCategory && matchesQuery;
+          });
+          setFeedEvents(localEvents);
+          setFeedNextPage(null);
+          setFeedTotalCount(localEvents.length);
+        })
+        .finally(() => {
+          if (feedRequestKeyRef.current === requestKey) {
+            setFeedRefreshing(false);
+          }
+        });
+    }, 260);
+
+    return () => clearTimeout(timeout);
+  }, [activeCategory, activeTab, categories, deferredSearchQuery, events]);
+
+  const loadNextFeedPage = () => {
+    if (feedLoading || feedRefreshing || !feedNextPage || activeTab !== 'discover') {
+      return;
+    }
+
+    const requestKey = `${activeCategory}|${deferredSearchQuery.trim()}`;
+    setFeedLoading(true);
+    fetchAppFeed({
+      categories,
+      categoryId: activeCategory,
+      page: feedNextPage,
+      pageSize: 10,
+      search: deferredSearchQuery,
+    })
+      .then((page) => {
+        if (feedRequestKeyRef.current !== requestKey) {
+          return;
+        }
+
+        setFeedEvents((current) => {
+          const seen = new Set(current.map((event) => event.id));
+          return [...current, ...page.events.filter((event) => !seen.has(event.id))];
+        });
+        setFeedNextPage(page.nextPage);
+        setFeedTotalCount(page.totalCount);
+      })
+      .catch(() => undefined)
+      .finally(() => setFeedLoading(false));
+  };
+
+  const filteredEvents = feedEvents;
+  const activeCategoryDetails = categories.find((category) => category.id === activeCategory);
+  const categoryFeedTitle =
+    activeCategory === 'all' ? 'All categories' : activeCategoryDetails?.name ?? 'Category';
 
   useEffect(() => {
     if (!previewEventId) {
@@ -284,7 +395,8 @@ export function HomeScreen({
     }
   }, [filteredEvents, previewEventId]);
 
-  const spotlightEvent = filteredEvents[0] ?? events[0];
+  const spotlightEvents = buildDynamicSpotlightEvents(filteredEvents.length > 0 ? filteredEvents : events, activeCategory);
+  const spotlightCardWidth = Math.max(width - 84, 292);
   const savedEvents = events.filter((event) => event.isSaved);
   const discoverContentPadding: StyleProp<ViewStyle> = [
     styles.content,
@@ -320,6 +432,7 @@ export function HomeScreen({
         categories={categories}
         contentPadding={contentPadding}
         createError={createError}
+        events={events}
         editingListing={editingListing}
         createPending={createPending}
         createProgress={createProgress}
@@ -358,11 +471,14 @@ export function HomeScreen({
       />
     ) : (
       <AnimatedFlatList
+        key={`discover-${activeCategory}`}
         data={filteredEvents}
         keyExtractor={(item) => item.id}
         contentContainerStyle={discoverContentPadding}
         initialNumToRender={4}
         maxToRenderPerBatch={4}
+        onEndReached={loadNextFeedPage}
+        onEndReachedThreshold={0.72}
         onViewableItemsChanged={onViewableItemsChanged}
         onScroll={Animated.event(
           [{ nativeEvent: { contentOffset: { y: scrollY } } }],
@@ -384,6 +500,7 @@ export function HomeScreen({
             <Text style={styles.emptyDescription}>Try a shorter search or switch back to another category.</Text>
           </View>
         }
+        ListFooterComponent={feedLoading ? <FeedFooterSkeleton /> : null}
         ListHeaderComponent={
           <>
             <SearchShell
@@ -395,50 +512,97 @@ export function HomeScreen({
               onFocus={() => setIsSearchFocused(true)}
             />
 
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.categoryRow}>
+            <ScrollView
+              ref={categoryRailRef}
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.categoryRow}
+            >
               {categories.map((category) => (
-                <CategoryPill
+                <View
                   key={category.id}
-                  active={category.id === activeCategory}
-                  category={category}
-                  onPress={() => setActiveCategory(category.id)}
-                />
+                  onLayout={(event) => {
+                    categoryLayoutsRef.current[category.id] = event.nativeEvent.layout;
+                  }}
+                >
+                  <CategoryPill
+                    active={category.id === activeCategory}
+                    category={category}
+                    onPress={() => handleOpenCategory(category.id)}
+                  />
+                </View>
               ))}
             </ScrollView>
 
-            {spotlightEvent ? (
-              <LinearGradient
-                colors={['rgba(255,107,61,0.24)', 'rgba(40,48,70,0.95)']}
-                start={{ x: 0, y: 0 }}
-                end={{ x: 1, y: 1 }}
-                style={styles.spotlightCard}
-              >
-                <View style={styles.spotlightBody}>
-                  <View style={styles.spotlightBadge}>
-                    <View style={styles.spotlightDot} />
-                    <Text style={styles.spotlightBadgeText}>Spotlight</Text>
-                  </View>
-                  <Text style={styles.spotlightTitle}>{spotlightEvent.artist}</Text>
-                  <Text style={styles.spotlightCopy} numberOfLines={2}>
-                    {spotlightEvent.blurb}
-                  </Text>
-                  <View style={styles.spotlightMeta}>
-                    <Text style={styles.spotlightPrice}>{spotlightEvent.price}</Text>
-                    <Text style={styles.spotlightMetaText}>
-                      {spotlightEvent.day} {spotlightEvent.month}
-                    </Text>
-                  </View>
+            {activeCategory !== 'all' ? (
+              <View style={styles.categoryFeedBanner}>
+                <View style={styles.categoryFeedIcon}>
+                  <Feather color={theme.colors.accentStrong} name={(activeCategoryDetails?.icon as FeatherName) ?? 'grid'} size={15} />
                 </View>
-                <Image
-                  source={spotlightEvent.ticketImage ?? spotlightEvent.image}
-                  contentFit="cover"
-                  style={styles.spotlightImage}
-                  transition={200}
-                />
-              </LinearGradient>
+                <View style={styles.categoryFeedCopy}>
+                  <Text style={styles.categoryFeedTitle}>{categoryFeedTitle}</Text>
+                  <Text style={styles.categoryFeedHint}>
+                    {feedTotalCount} listing{feedTotalCount === 1 ? '' : 's'} in this category
+                  </Text>
+                </View>
+              </View>
             ) : null}
 
-            <SectionHeader title="Upcoming events" actionLabel="See all" />
+            {spotlightEvents.length > 0 ? (
+              <ScrollView
+                horizontal
+                nestedScrollEnabled
+                showsHorizontalScrollIndicator={false}
+                snapToAlignment="start"
+                snapToInterval={spotlightCardWidth + 12}
+                decelerationRate="normal"
+                contentContainerStyle={styles.spotlightRail}
+              >
+                {spotlightEvents.map((spotlightEvent) => (
+                  <Pressable key={spotlightEvent.id} delayLongPress={120} onPress={() => onSelectEvent(spotlightEvent)}>
+                    <LinearGradient
+                      colors={['rgba(255,107,61,0.24)', 'rgba(40,48,70,0.95)']}
+                      start={{ x: 0, y: 0 }}
+                      end={{ x: 1, y: 1 }}
+                      style={[styles.spotlightCard, { width: spotlightCardWidth }]}
+                    >
+                      <View style={styles.spotlightImageWrap}>
+                        <Image
+                          source={spotlightEvent.ticketImage ?? spotlightEvent.image}
+                          contentFit="cover"
+                          style={styles.spotlightImage}
+                          transition={200}
+                        />
+                        <LinearGradient
+                          colors={['rgba(40,48,70,0.98)', 'rgba(40,48,70,0.56)', 'rgba(40,48,70,0.04)']}
+                          start={{ x: 0, y: 0.5 }}
+                          end={{ x: 1, y: 0.5 }}
+                          style={styles.spotlightImageFade}
+                        />
+                      </View>
+                      <View style={styles.spotlightBody}>
+                        <View style={styles.spotlightBadge}>
+                          <View style={styles.spotlightDot} />
+                          <Text style={styles.spotlightBadgeText}>Spotlight</Text>
+                        </View>
+                        <Text style={styles.spotlightTitle}>{spotlightEvent.artist}</Text>
+                        <Text style={styles.spotlightCopy} numberOfLines={2}>
+                          {spotlightEvent.blurb}
+                        </Text>
+                        <View style={styles.spotlightMeta}>
+                          <Text style={styles.spotlightPrice}>{spotlightEvent.price}</Text>
+                          <Text style={styles.spotlightMetaText}>
+                            {spotlightEvent.day} {spotlightEvent.month}
+                          </Text>
+                        </View>
+                      </View>
+                    </LinearGradient>
+                  </Pressable>
+                ))}
+              </ScrollView>
+            ) : null}
+
+            <SectionHeader title={activeCategory === 'all' ? 'Upcoming events' : `${categoryFeedTitle} feed`} actionLabel="See all" />
           </>
         }
         renderItem={({ item }) => (
@@ -630,6 +794,7 @@ function SecondaryTabContent({
   categories,
   contentPadding,
   createError,
+  events,
   editingListing,
   createPending,
   createProgress,
@@ -670,6 +835,7 @@ function SecondaryTabContent({
   categories: AppCategory[];
   contentPadding: StyleProp<ViewStyle>;
   createError: string | null;
+  events: AppEvent[];
   editingListing: AppEvent | null;
   createPending: boolean;
   createProgress: number;
@@ -706,13 +872,13 @@ function SecondaryTabContent({
   savedEvents: AppEvent[];
   unreadNotificationCount: number;
 }) {
+  if (activeTab === 'stream') {
+    return <StreamTabView events={events} onSelectEvent={onSelectEvent} onToggleSave={onToggleSave} />;
+  }
+
   return (
     <ScrollView contentContainerStyle={contentPadding} showsVerticalScrollIndicator={false}>
       <HomeHeader menuOpen={menuOpen} onOpenNearby={onOpenNearby} onToggleMenu={onToggleMenu} profile={profile} />
-
-      {activeTab === 'saved' ? (
-        <SavedTabView events={savedEvents} onSelectEvent={onSelectEvent} />
-      ) : null}
 
       {activeTab === 'create' ? (
         <CreateTabView
@@ -720,6 +886,7 @@ function SecondaryTabContent({
           editingEvent={editingListing}
           isSubmitting={createPending}
           onCancelEdit={onCancelEditListing}
+          profile={profile}
           submitProgress={createProgress}
           submitStage={createStage}
           submitError={createError}
@@ -730,9 +897,12 @@ function SecondaryTabContent({
       {activeTab === 'inbox' ? (
         <InboxTabView
           notifications={notifications}
+          receivedTickets={receivedTickets}
+          tickets={tickets}
           unreadCount={unreadNotificationCount}
           onMarkAllRead={onMarkAllRead}
           onOpenNotification={onOpenNotification}
+          onOpenTicket={onOpenTicket}
         />
       ) : null}
 
@@ -748,7 +918,7 @@ function SecondaryTabContent({
           onEditListing={onStartEditListing}
           onMarkTicketUsed={onMarkTicketUsed}
           onOpenCategory={onOpenCategory}
-          onOpenSavedTab={() => onTabChange('saved')}
+          onOpenSavedTab={() => onTabChange('stream')}
           onSignOut={onSignOut}
           onStartCreate={() => {
             onCancelEditListing();
@@ -1157,6 +1327,54 @@ function DrawerSearchShortcut({ onPress }: { onPress: () => void }) {
   );
 }
 
+function FeedFooterSkeleton() {
+  const breathe = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(breathe, {
+          toValue: 1,
+          duration: 1350,
+          easing: Easing.inOut(Easing.quad),
+          useNativeDriver: true,
+        }),
+        Animated.timing(breathe, {
+          toValue: 0,
+          duration: 1350,
+          easing: Easing.inOut(Easing.quad),
+          useNativeDriver: true,
+        }),
+      ]),
+    );
+
+    loop.start();
+    return () => loop.stop();
+  }, [breathe]);
+
+  const animatedStyle = {
+    opacity: breathe.interpolate({
+      inputRange: [0, 1],
+      outputRange: [0.36, 0.82],
+    }),
+    transform: [
+      {
+        scaleY: breathe.interpolate({
+          inputRange: [0, 1],
+          outputRange: [1, 0.985],
+        }),
+      },
+    ],
+  };
+
+  return (
+    <View style={styles.feedFooter}>
+      <Animated.View style={[styles.feedFooterCard, animatedStyle]} />
+      <Animated.View style={[styles.feedFooterCard, animatedStyle]} />
+    </View>
+  );
+}
+
 function EventCard({
   event,
   isPreviewActive,
@@ -1368,21 +1586,20 @@ function getCardPreviewVideo(event: AppEvent) {
 }
 
 function buildCardPreviewSegments(durationMillis: number) {
-  if (!Number.isFinite(durationMillis) || durationMillis <= 1800) {
+  const clipLength = 5000;
+  const clipCount = 4;
+  const totalPreviewLength = clipLength * clipCount;
+
+  if (!Number.isFinite(durationMillis) || durationMillis <= totalPreviewLength + 120) {
     return [{ start: 0, end: Math.max(1200, durationMillis - 120) }];
   }
 
-  const clipLength = Math.min(2400, Math.max(1500, Math.round(durationMillis * 0.14)));
   const maxStart = Math.max(durationMillis - clipLength - 120, 0);
-  const anchorRatios = [0.02, 0.34, 0.68];
+  const step = maxStart / Math.max(clipCount - 1, 1);
   const segments: Array<{ start: number; end: number }> = [];
 
-  for (const ratio of anchorRatios) {
-    const start = Math.min(Math.round(durationMillis * ratio), maxStart);
-    if (segments.length > 0 && start - segments[segments.length - 1].start < 520) {
-      continue;
-    }
-
+  for (let index = 0; index < clipCount; index += 1) {
+    const start = Math.min(Math.round(step * index), maxStart);
     segments.push({
       start,
       end: Math.min(start + clipLength, durationMillis - 120),
@@ -1392,21 +1609,68 @@ function buildCardPreviewSegments(durationMillis: number) {
   return segments.length > 0 ? segments : [{ start: 0, end: Math.max(1200, durationMillis - 120) }];
 }
 
+function buildDynamicSpotlightEvents(sourceEvents: AppEvent[], activeCategory: CategoryId) {
+  const pool = sourceEvents.filter((event) => event.image || event.media.length > 0);
+  const todaySeed = Math.floor(Date.now() / 86_400_000);
+
+  return pool
+    .map((event, index) => ({
+      event,
+      score: getSpotlightScore(event, index, activeCategory, todaySeed),
+    }))
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 4)
+    .map((entry) => entry.event);
+}
+
+function getSpotlightScore(event: AppEvent, index: number, activeCategory: CategoryId, seed: number) {
+  const categoryMatch = activeCategory !== 'all' && event.categories.some((category) => category.id === activeCategory);
+  const hasVideo = event.media.some((media) => media.kind === 'video');
+  const createdAgeHours = event.createdAt ? Math.max(0, (Date.now() - Date.parse(event.createdAt)) / 3_600_000) : 240;
+  const freshness = createdAgeHours <= 48 ? 26 : createdAgeHours <= 168 ? 15 : createdAgeHours <= 720 ? 7 : 0;
+  const rotation = seededSpotlightNoise(event.id, seed) * 18;
+
+  return (
+    (event.isFeatured ? 48 : 0) +
+    (event.isTrending ? 36 : 0) +
+    (event.isVerified ? 8 : 0) +
+    (categoryMatch ? 18 : 0) +
+    (hasVideo ? 10 : 0) +
+    freshness +
+    Math.min(event.rating * 4, 20) +
+    Math.min((event.ratingCount ?? 0) * 1.5, 12) +
+    Math.min(event.saveCount * 1.2, 24) +
+    Math.min((event.commentCount ?? 0) * 1.1, 14) +
+    Math.min((event.vibePercentage ?? 25) / 8, 12) +
+    rotation -
+    index * 0.65
+  );
+}
+
+function seededSpotlightNoise(value: string, seed: number) {
+  let hash = seed * 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return ((hash >>> 0) % 1000) / 1000;
+}
+
 const styles = StyleSheet.create({
   root: {
     flex: 1,
   },
   content: {
-    paddingHorizontal: 20,
+    paddingHorizontal: 4,
   },
   discoverContent: {
-    paddingHorizontal: 12,
+    paddingHorizontal: 4,
   },
   createContent: {
-    paddingHorizontal: 8,
+    paddingHorizontal: 4,
   },
   separator: {
-    height: 14,
+    height: 0,
   },
   headerRow: {
     marginBottom: 18,
@@ -1453,7 +1717,7 @@ const styles = StyleSheet.create({
   locationChip: {
     minHeight: 40,
     paddingHorizontal: 14,
-    borderRadius: theme.radius.pill,
+    borderRadius: 11,
     backgroundColor: theme.colors.surfaceMuted,
     borderWidth: 1,
     borderColor: theme.colors.border,
@@ -1484,7 +1748,7 @@ const styles = StyleSheet.create({
   },
   searchShell: {
     minHeight: 50,
-    borderRadius: theme.radius.pill,
+    borderRadius: 11,
     backgroundColor: theme.colors.surface,
     borderWidth: 1,
     borderColor: theme.colors.border,
@@ -1525,21 +1789,67 @@ const styles = StyleSheet.create({
   categoryRow: {
     paddingBottom: 10,
   },
+  categoryFeedBanner: {
+    minHeight: 60,
+    marginHorizontal: -4,
+    marginBottom: 10,
+    borderTopWidth: 1,
+    borderBottomWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    paddingHorizontal: 4,
+    paddingVertical: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 11,
+  },
+  categoryFeedIcon: {
+    width: 24,
+    height: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  categoryFeedCopy: {
+    flex: 1,
+    gap: 2,
+  },
+  categoryFeedTitle: {
+    color: theme.colors.text,
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  categoryFeedHint: {
+    color: theme.colors.textSoft,
+    fontSize: 11,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
   spotlightCard: {
     marginTop: 4,
     marginBottom: 14,
-    borderRadius: theme.radius.lg,
+    borderRadius: 11,
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.08)',
     overflow: 'hidden',
     padding: 16,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 14,
+    minHeight: 178,
+    justifyContent: 'center',
+  },
+  spotlightRail: {
+    gap: 12,
+    paddingRight: 42,
   },
   spotlightBody: {
-    flex: 1,
+    width: '54%',
     gap: 8,
+    zIndex: 2,
+  },
+  spotlightImageWrap: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    width: '56%',
   },
   spotlightBadge: {
     alignSelf: 'flex-start',
@@ -1592,18 +1902,24 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   spotlightImage: {
-    width: 92,
-    height: 110,
-    borderRadius: 20,
+    width: '100%',
+    height: '100%',
+  },
+  spotlightImageFade: {
+    ...StyleSheet.absoluteFillObject,
   },
   cardShell: {
-    ...shadow,
+    marginHorizontal: -4,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.08)',
+    paddingTop: 6,
+    paddingBottom: 8,
   },
   card: {
-    minHeight: 252,
-    borderRadius: theme.radius.lg,
+    minHeight: 318,
+    borderRadius: 0,
     overflow: 'hidden',
-    backgroundColor: theme.colors.surfaceStrong,
+    backgroundColor: 'transparent',
   },
   cardImage: {
     ...StyleSheet.absoluteFillObject,
@@ -1667,12 +1983,13 @@ const styles = StyleSheet.create({
     alignSelf: 'flex-start',
   },
   saveChipButton: {
-    width: 28,
+    width: 30,
     height: 28,
     borderRadius: 14,
     backgroundColor: 'rgba(12,15,23,0.74)',
     borderWidth: 1,
     borderColor: theme.colors.border,
+    flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -1682,9 +1999,9 @@ const styles = StyleSheet.create({
   },
   cardFooter: {
     position: 'absolute',
-    left: 16,
-    right: 16,
-    bottom: 16,
+    left: 18,
+    right: 18,
+    bottom: 20,
     flexDirection: 'row',
     alignItems: 'flex-end',
     justifyContent: 'space-between',
@@ -1763,6 +2080,17 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 19,
   },
+  feedFooter: {
+    marginHorizontal: -4,
+    paddingTop: 6,
+    gap: 8,
+  },
+  feedFooterCard: {
+    height: 146,
+    backgroundColor: 'rgba(255,255,255,0.07)',
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.08)',
+  },
   drawerOverlay: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: 'rgba(4, 7, 13, 0.52)',
@@ -1811,27 +2139,24 @@ const styles = StyleSheet.create({
   },
   drawerUtilityRow: {
     width: '100%',
-    flexDirection: 'row',
-    gap: 10,
+    flexDirection: 'column',
+    gap: 0,
   },
   drawerUtilityPressable: {
-    flex: 1,
+    alignSelf: 'stretch',
   },
   drawerUtilityAction: {
-    minHeight: 46,
-    borderRadius: theme.radius.pill,
-    backgroundColor: theme.colors.surfaceMuted,
-    borderWidth: 1,
-    borderColor: theme.colors.border,
-    paddingHorizontal: 12,
+    minHeight: 52,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.08)',
+    paddingHorizontal: 4,
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'center',
-    gap: 8,
+    gap: 12,
   },
   drawerUtilityIconWrap: {
     position: 'relative',
-    width: 24,
+    width: 22,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -1855,15 +2180,13 @@ const styles = StyleSheet.create({
     marginBottom: 16,
   },
   drawerSearchShortcut: {
-    minHeight: 50,
-    borderRadius: theme.radius.pill,
-    backgroundColor: theme.colors.surface,
-    borderWidth: 1,
-    borderColor: theme.colors.border,
-    paddingHorizontal: 16,
+    minHeight: 52,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.08)',
+    paddingHorizontal: 4,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 10,
+    gap: 12,
   },
   drawerSearchText: {
     flex: 1,
@@ -1872,45 +2195,43 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   drawerOptions: {
-    gap: 12,
+    gap: 0,
   },
   drawerBottomGroup: {
     marginTop: 34,
     paddingBottom: 36,
-    gap: 18,
+    gap: 0,
   },
   drawerSectionDivider: {
     height: 1,
     backgroundColor: theme.colors.border,
+    marginVertical: 12,
   },
   drawerOptionPressable: {
     alignSelf: 'stretch',
   },
   drawerOption: {
-    minHeight: 56,
-    borderRadius: theme.radius.md,
-    backgroundColor: theme.colors.surfaceMuted,
-    borderWidth: 1,
-    borderColor: theme.colors.border,
-    paddingHorizontal: 14,
+    minHeight: 54,
+    backgroundColor: 'transparent',
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.08)',
+    paddingHorizontal: 4,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
   },
   drawerOptionActive: {
-    backgroundColor: theme.colors.accentSoft,
-    borderColor: 'rgba(255,107,61,0.28)',
+    backgroundColor: 'transparent',
+    borderBottomColor: 'rgba(255,107,61,0.24)',
   },
   drawerIconWrap: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
-    backgroundColor: 'rgba(255,107,61,0.12)',
+    width: 22,
+    height: 22,
     alignItems: 'center',
     justifyContent: 'center',
   },
   drawerIconWrapActive: {
-    backgroundColor: 'rgba(255,255,255,0.12)',
+    backgroundColor: 'transparent',
   },
   drawerOptionText: {
     color: theme.colors.text,

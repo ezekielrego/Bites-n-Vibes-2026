@@ -14,9 +14,11 @@
       "backgroundColor": "#0A0D13"
     },
     "ios": {
-      "supportsTablet": false
+      "supportsTablet": false,
+      "bundleIdentifier": "zw.co.bitesnvibes.app"
     },
     "android": {
+      "package": "zw.co.bitesnvibes.app",
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
       "adaptiveIcon": {
@@ -28,7 +30,13 @@
       "favicon": "./logo.png"
     },
     "plugins": [
-      "@react-native-community/datetimepicker"
+      "@react-native-community/datetimepicker",
+      [
+        "expo-notifications",
+        {
+          "color": "#FF6B3D"
+        }
+      ]
     ]
   }
 }

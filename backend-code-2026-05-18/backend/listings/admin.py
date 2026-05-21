@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Category, Listing, ListingImage, ListingMediaPolicy, Rating, Tag, Vibe
+from .models import AppVersionPolicy, Category, Listing, ListingImage, ListingMediaPolicy, Rating, Tag, Ticket, Vibe
 
 
 class ListingImageInline(admin.TabularInline):
@@ -29,7 +29,7 @@ class TagAdmin(admin.ModelAdmin):
 @admin.register(Listing)
 class ListingAdmin(admin.ModelAdmin):
     """Admin configuration for Listing."""
-    list_display = ['name', 'category', 'price_range', 'is_active', 'is_trending', 
+    list_display = ['name', 'category', 'price_range', 'accepts_internal_payments', 'is_active', 'is_trending', 
                    'is_featured', 'average_rating', 'created_at']
     list_filter = ['category', 'is_active', 'is_trending', 'is_featured', 
                   'price_range', 'created_at']
@@ -52,7 +52,7 @@ class ListingAdmin(admin.ModelAdmin):
             'fields': ('price_range', 'opening_hours')
         }),
         ('Status', {
-            'fields': ('is_active', 'is_trending', 'is_featured', 'owner')
+            'fields': ('is_active', 'is_trending', 'is_featured', 'accepts_internal_payments', 'owner')
         }),
         ('Statistics', {
             'fields': ('average_rating', 'rating_count')
@@ -84,6 +84,30 @@ class ListingMediaPolicyAdmin(admin.ModelAdmin):
         return super().has_add_permission(request)
 
 
+@admin.register(AppVersionPolicy)
+class AppVersionPolicyAdmin(admin.ModelAdmin):
+    """Singleton-style admin for mobile app update prompts."""
+
+    list_display = ['name', 'latest_version', 'min_required_version', 'force_update', 'updated_at']
+    readonly_fields = ['updated_at']
+    fieldsets = (
+        ('Version rules', {
+            'fields': ('name', 'latest_version', 'min_required_version', 'force_update', 'message')
+        }),
+        ('Install links', {
+            'fields': ('android_update_url', 'ios_update_url')
+        }),
+        ('Timestamps', {
+            'fields': ('updated_at',)
+        }),
+    )
+
+    def has_add_permission(self, request):
+        if AppVersionPolicy.objects.exists():
+            return False
+        return super().has_add_permission(request)
+
+
 @admin.register(Rating)
 class RatingAdmin(admin.ModelAdmin):
     """Admin configuration for Rating."""
@@ -100,3 +124,13 @@ class VibeAdmin(admin.ModelAdmin):
     list_filter = ['is_vibing', 'created_at']
     search_fields = ['listing__name', 'user__email']
     readonly_fields = ['created_at', 'updated_at']
+
+
+@admin.register(Ticket)
+class TicketAdmin(admin.ModelAdmin):
+    """Owner/admin view of paid bookings, reservations, and scanned tickets."""
+
+    list_display = ['reference_code', 'listing', 'user', 'action_type', 'status', 'payment_status', 'total_amount', 'currency', 'booked_at']
+    list_filter = ['action_type', 'status', 'payment_status', 'payment_method', 'booked_at']
+    search_fields = ['reference_code', 'listing__name', 'user__email', 'user__name', 'paynow_reference']
+    readonly_fields = ['reference_code', 'qr_payload', 'paynow_reference', 'paynow_poll_url', 'payment_last_response', 'booked_at', 'updated_at', 'paid_at']

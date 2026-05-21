@@ -1,6 +1,9 @@
 import React, { Suspense, lazy, startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, BackHandler, Linking as NativeLinking, StyleSheet, Text, View } from 'react-native';
+import { Alert, BackHandler, Linking as NativeLinking, Modal, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import * as ExpoLinking from 'expo-linking';
+import { Image } from 'expo-image';
+import { Feather } from '@expo/vector-icons';
+import { LinearGradient } from 'expo-linear-gradient';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import * as WebBrowser from 'expo-web-browser';
@@ -13,10 +16,13 @@ import {
   createEventListing,
   deleteEventListing,
   fetchAppBootstrap,
+  fetchAppUpdatePolicy,
+  fetchEventListing,
   getGoogleAuthUrl,
   markAllNotificationsRead,
   markTicketUsed,
   markNotificationRead,
+  pollTicketPayment,
   removeHistoryItem,
   registerPushDevice,
   recordListingView,
@@ -33,18 +39,20 @@ import {
   updateUserProfile,
   verifyEmailMagicLink,
 } from './api';
-import { TAB_ITEMS } from './constants';
+import { APP_VERSION, TAB_ITEMS } from './constants';
 import { AuthScreen } from './components/AuthScreen';
 import { BottomNav } from './components/BottomNav';
 import { AppBackground, PrimaryButton, ScreenTransition } from './components/Primitives';
 import { DetailsScreenSkeleton, HomeScreenSkeleton, TicketScreenSkeleton } from './components/Skeletons';
-import { registerForPushNotificationsAsync } from './push';
+import { configureNotificationHandlingAsync, registerForPushNotificationsAsync } from './push';
 import {
   AppCategory,
   AppEvent,
   AppNotification,
   AppTicket,
+  AppUpdatePolicy,
   AppUser,
+  BookingCheckoutInput,
   ChangePasswordInput,
   CreateAppEventInput,
   Screen,
@@ -53,6 +61,8 @@ import {
 } from './types';
 
 WebBrowser.maybeCompleteAuthSession();
+void configureNotificationHandlingAsync();
+const APP_LOGO = require('../logo.png');
 
 const HomeScreen = lazy(async () => {
   const module = await import('./components/HomeScreen');
@@ -102,8 +112,25 @@ function AppContent() {
   const [createProgress, setCreateProgress] = useState(0);
   const [createStage, setCreateStage] = useState<string | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
+  const [updatePolicy, setUpdatePolicy] = useState<AppUpdatePolicy | null>(null);
+  const [updateDismissedVersion, setUpdateDismissedVersion] = useState<string | null>(null);
   const lastHandledAuthUrl = useRef<string | null>(null);
   const pushTokenRef = useRef<string | null>(null);
+  const updatePrompt = useMemo(() => {
+    if (!updatePolicy || !isAppUpdateAvailable(APP_VERSION, updatePolicy.latestVersion)) {
+      return null;
+    }
+
+    const required = updatePolicy.forceUpdate || isAppUpdateAvailable(APP_VERSION, updatePolicy.minRequiredVersion);
+    if (!required && updateDismissedVersion === updatePolicy.latestVersion) {
+      return null;
+    }
+
+    return {
+      ...updatePolicy,
+      required,
+    };
+  }, [updateDismissedVersion, updatePolicy]);
 
   const loadApp = useCallback(async () => {
     setIsBootstrapping(true);
@@ -139,6 +166,26 @@ function AppContent() {
     } finally {
       setIsBootstrapping(false);
     }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const checkForUpdates = async () => {
+      try {
+        const policy = await fetchAppUpdatePolicy(Platform.OS);
+        if (!cancelled) {
+          setUpdatePolicy(policy);
+        }
+      } catch {
+        // Update checks should never block opening the app.
+      }
+    };
+
+    void checkForUpdates();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const handleLogout = useCallback(async () => {
@@ -299,7 +346,7 @@ function AppContent() {
       }
 
       pushTokenRef.current = registration.token;
-      await registerPushDevice(registration.token, registration.platform).catch(() => undefined);
+      await registerPushDevice(registration.token, registration.platform, registration.provider).catch(() => undefined);
     };
 
     void syncPush();
@@ -481,11 +528,17 @@ function AppContent() {
       setDirection(1);
       setCurrentScreen('details');
     });
+    void fetchEventListing(event.id, categories)
+      .then((freshEvent) => {
+        upsertEvent(freshEvent);
+        promoteHistoryEvent(freshEvent);
+      })
+      .catch(() => undefined);
   };
 
-  const handleBookTicket = async () => {
+  const handleBookTicket = async (input?: BookingCheckoutInput) => {
     if (!selectedEvent) {
-      return;
+      return null;
     }
 
     const existingTicket =
@@ -497,11 +550,21 @@ function AppContent() {
         setDirection(1);
         setCurrentScreen('ticket');
       });
-      return;
+      return existingTicket;
     }
 
     try {
-      const ticket = await bookEventTicket(selectedEvent.id, categories);
+      let ticket = await bookEventTicket(selectedEvent.id, categories, input);
+      if (ticket.status === 'pending' || ticket.paymentStatus === 'pending') {
+        for (let attempt = 0; attempt < 6; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 3500));
+          ticket = await pollTicketPayment(ticket.id, categories);
+          if (ticket.status !== 'pending' && ticket.paymentStatus !== 'pending') {
+            break;
+          }
+        }
+      }
+
       setTickets((current) => {
         const existingIndex = current.findIndex((item) => item.id === ticket.id);
         if (existingIndex === -1) {
@@ -510,14 +573,22 @@ function AppContent() {
         return current.map((item) => (item.id === ticket.id ? ticket : item));
       });
       setSelectedTicket(ticket);
-      updateEventState(selectedEvent.id, { hasTicket: true });
+      updateEventState(selectedEvent.id, { hasTicket: ticket.status === 'confirmed' });
 
-      startTransition(() => {
-        setDirection(1);
-        setCurrentScreen('ticket');
-      });
+      if (ticket.status === 'confirmed') {
+        startTransition(() => {
+          setDirection(1);
+          setCurrentScreen('ticket');
+        });
+      } else if (ticket.status === 'pending') {
+        Alert.alert('Payment pending', 'Approve the payment on your phone. We will keep checking and update your booking.');
+      } else {
+        Alert.alert('Payment not completed', 'The payment was not completed. Please try again.');
+      }
+      return ticket;
     } catch (error) {
       Alert.alert('Ticket not ready', error instanceof Error ? error.message : 'Unable to prepare your ticket right now.');
+      return null;
     }
   };
 
@@ -538,34 +609,58 @@ function AppContent() {
   }, []);
 
   const handleCancelTicket = useCallback(async (ticket: AppTicket) => {
-    const response = await cancelTicket(ticket.id, categories);
-    const wasInMyTickets = tickets.some((item) => item.id === ticket.id);
-    const wasInReceivedTickets = receivedTickets.some((item) => item.id === ticket.id);
-    let nextUserTickets: AppTicket[] = [];
+    return new Promise<void>((resolve, reject) => {
+      Alert.alert(
+        'Cancel booking?',
+        `This will cancel ${ticket.referenceCode}. You can only continue if you are sure.`,
+        [
+          {
+            text: 'Keep it',
+            style: 'cancel',
+            onPress: () => resolve(),
+          },
+          {
+            text: 'Cancel booking',
+            style: 'destructive',
+            onPress: async () => {
+              try {
+                const response = await cancelTicket(ticket.id, categories);
+                const wasInMyTickets = tickets.some((item) => item.id === ticket.id);
+                const wasInReceivedTickets = receivedTickets.some((item) => item.id === ticket.id);
+                let nextUserTickets: AppTicket[] = [];
 
-    setTickets((current) => {
-      if (!wasInMyTickets) {
-        nextUserTickets = current;
-        return current;
-      }
-      nextUserTickets = upsertTicketItem(current, response.ticket);
-      return nextUserTickets;
+                setTickets((current) => {
+                  if (!wasInMyTickets) {
+                    nextUserTickets = current;
+                    return current;
+                  }
+                  nextUserTickets = upsertTicketItem(current, response.ticket);
+                  return nextUserTickets;
+                });
+                setReceivedTickets((current) => (wasInReceivedTickets ? upsertTicketItem(current, response.ticket) : current));
+                setSelectedTicket((current) => (current?.id === response.ticket.id ? response.ticket : current));
+
+                if (wasInMyTickets) {
+                  const hasConfirmed = hasConfirmedTicketForEvent(nextUserTickets, response.ticket.eventId);
+                  updateEventState(response.ticket.eventId, { hasTicket: hasConfirmed });
+
+                  if (selectedEvent?.id === response.ticket.eventId) {
+                    setSelectedEvent((current) =>
+                      current ? { ...current, hasTicket: hasConfirmed } : current,
+                    );
+                  }
+                }
+
+                Alert.alert('Ticket updated', response.message);
+                resolve();
+              } catch (error) {
+                reject(error);
+              }
+            },
+          },
+        ],
+      );
     });
-    setReceivedTickets((current) => (wasInReceivedTickets ? upsertTicketItem(current, response.ticket) : current));
-    setSelectedTicket((current) => (current?.id === response.ticket.id ? response.ticket : current));
-
-    if (wasInMyTickets) {
-      const hasConfirmed = hasConfirmedTicketForEvent(nextUserTickets, response.ticket.eventId);
-      updateEventState(response.ticket.eventId, { hasTicket: hasConfirmed });
-
-      if (selectedEvent?.id === response.ticket.eventId) {
-        setSelectedEvent((current) =>
-          current ? { ...current, hasTicket: hasConfirmed } : current,
-        );
-      }
-    }
-
-    Alert.alert('Ticket updated', response.message);
   }, [categories, receivedTickets, selectedEvent?.id, tickets, updateEventState]);
 
   const handleMarkTicketUsed = useCallback(async (ticket: AppTicket) => {
@@ -622,7 +717,7 @@ function AppContent() {
 
   const handleToggleSave = async (event: AppEvent) => {
     const result = await toggleSavedListing(event.id);
-    updateEventState(result.eventId, { isSaved: result.isSaved });
+    updateEventState(result.eventId, { isSaved: result.isSaved, saveCount: result.saveCount });
   };
 
   const handleRateEvent = async (value: number) => {
@@ -827,7 +922,7 @@ function AppContent() {
       throw new Error(registration.message ?? 'Push notifications are not available on this device right now.');
     }
 
-    await registerPushDevice(registration.token, registration.platform);
+    await registerPushDevice(registration.token, registration.platform, registration.provider);
     pushTokenRef.current = registration.token;
 
     const updated = await updateUserProfile({
@@ -1010,11 +1105,125 @@ function AppContent() {
         ) : null}
 
         {authState === 'signedIn' && !showStartupState && currentScreen === 'home' ? (
-          <BottomNav activeTab={activeTab} onTabChange={handleTabChange} />
+          <BottomNav activeTab={activeTab} onTabChange={handleTabChange} unreadCount={unreadNotificationCount} />
+        ) : null}
+
+        {updatePrompt ? (
+          <AppUpdateModal
+            currentVersion={APP_VERSION}
+            latestVersion={updatePrompt.latestVersion}
+            message={updatePrompt.message}
+            required={updatePrompt.required}
+            updateUrl={updatePrompt.updateUrl}
+            onDismiss={() => setUpdateDismissedVersion(updatePrompt.latestVersion)}
+          />
         ) : null}
       </View>
     </AppBackground>
   );
+}
+
+function AppUpdateModal({
+  currentVersion,
+  latestVersion,
+  message,
+  required,
+  updateUrl,
+  onDismiss,
+}: {
+  currentVersion: string;
+  latestVersion: string;
+  message: string;
+  required: boolean;
+  updateUrl: string;
+  onDismiss: () => void;
+}) {
+  const openUpdate = () => {
+    void NativeLinking.openURL(updateUrl).catch(() => undefined);
+  };
+
+  return (
+    <Modal animationType="fade" transparent visible>
+      <View style={styles.updateModalBackdrop}>
+        <View style={styles.updateModalCard}>
+          <View style={styles.updateAppHeader}>
+            <View style={styles.updateLogoShell}>
+              <Image source={APP_LOGO} contentFit="cover" style={styles.updateLogo} />
+            </View>
+            <View style={styles.updateAppCopy}>
+              <Text style={styles.updateAppName}>Bites & Vibes</Text>
+              <Text style={styles.updatePublisher}>BITESNVIBES</Text>
+              <Text style={styles.updatePurchaseText}>{required ? 'Important update' : 'Update available'}</Text>
+            </View>
+          </View>
+
+          <View style={styles.updateStatsRow}>
+            <View style={styles.updateStat}>
+              <Feather color="#FBBF24" name="star" size={19} />
+              <Text style={styles.updateStatLabel}>Review</Text>
+            </View>
+            <View style={styles.updateDivider} />
+            <View style={styles.updateStat}>
+              <Feather color="#DDE4F2" name="shield" size={20} />
+              <Text style={styles.updateStatLabel}>Rate</Text>
+            </View>
+            <View style={styles.updateDivider} />
+            <View style={styles.updateStat}>
+              <Feather color="#DDE4F2" name="download" size={24} />
+              <Text style={styles.updateStatLabel}>Latest v{latestVersion}</Text>
+            </View>
+          </View>
+
+          <Text style={styles.updateModalCopy}>{message}</Text>
+          <Text style={styles.updateModalMeta}>Installed v{currentVersion}</Text>
+
+          <Pressable accessibilityRole="button" onPress={openUpdate}>
+            <LinearGradient
+              colors={['#E53935', '#FF6B3D', '#FFB15C']}
+              locations={[0, 0.46, 1]}
+              start={{ x: 0, y: 0.5 }}
+              end={{ x: 1, y: 0.5 }}
+              style={styles.updateInstallButton}
+            >
+              <Text style={styles.updateInstallText}>{required ? 'Install required update' : 'Install'}</Text>
+            </LinearGradient>
+          </Pressable>
+          {!required ? (
+            <Pressable accessibilityRole="button" onPress={onDismiss} style={styles.updateModalLater}>
+              <Text style={styles.updateModalLaterText}>Later</Text>
+            </Pressable>
+          ) : null}
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function isAppUpdateAvailable(currentVersion: string, targetVersion: string) {
+  return compareVersions(currentVersion, targetVersion) < 0;
+}
+
+function compareVersions(left: string, right: string) {
+  const leftParts = normalizeVersionParts(left);
+  const rightParts = normalizeVersionParts(right);
+  const length = Math.max(leftParts.length, rightParts.length);
+
+  for (let index = 0; index < length; index += 1) {
+    const leftValue = leftParts[index] ?? 0;
+    const rightValue = rightParts[index] ?? 0;
+    if (leftValue !== rightValue) {
+      return leftValue > rightValue ? 1 : -1;
+    }
+  }
+
+  return 0;
+}
+
+function normalizeVersionParts(version: string) {
+  return version
+    .split(/[.-]/)
+    .map((part) => Number.parseInt(part, 10))
+    .filter((part) => Number.isFinite(part));
 }
 
 function firstStringParam(value: string | string[] | undefined) {
@@ -1109,5 +1318,120 @@ const styles = StyleSheet.create({
   },
   retryWrap: {
     width: '100%',
+  },
+  updateModalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(4,7,13,0.72)',
+    paddingHorizontal: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  updateModalCard: {
+    width: '100%',
+    maxWidth: 520,
+    borderRadius: 16,
+    padding: 18,
+    backgroundColor: 'rgba(15,16,18,0.98)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.1)',
+    gap: 18,
+  },
+  updateAppHeader: {
+    flexDirection: 'row',
+    gap: 16,
+    alignItems: 'flex-start',
+  },
+  updateLogoShell: {
+    width: 86,
+    height: 86,
+    borderRadius: 18,
+    overflow: 'hidden',
+    backgroundColor: '#0A0D13',
+    borderWidth: 1,
+    borderColor: 'rgba(255,107,61,0.24)',
+  },
+  updateLogo: {
+    width: '100%',
+    height: '100%',
+  },
+  updateAppCopy: {
+    flex: 1,
+    gap: 4,
+  },
+  updateAppName: {
+    color: '#F5F7FC',
+    fontSize: 29,
+    lineHeight: 35,
+    fontWeight: '900',
+    letterSpacing: 0.2,
+  },
+  updatePublisher: {
+    color: '#FFB15C',
+    fontSize: 13,
+    fontWeight: '900',
+    letterSpacing: 0.8,
+  },
+  updatePurchaseText: {
+    color: '#B9C2D1',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  updateStatsRow: {
+    minHeight: 74,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  updateStat: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+  },
+  updateStatInline: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+  },
+  updateStatLabel: {
+    color: '#B9C2D1',
+    fontSize: 12,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
+  updateDivider: {
+    width: 1,
+    height: 40,
+    backgroundColor: 'rgba(255,255,255,0.18)',
+  },
+  updateModalCopy: {
+    color: '#C8D0DE',
+    fontSize: 13,
+    lineHeight: 19,
+  },
+  updateModalMeta: {
+    color: '#8C96A8',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  updateInstallButton: {
+    minHeight: 58,
+    borderRadius: 15,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  updateInstallText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '900',
+  },
+  updateModalLater: {
+    minHeight: 42,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  updateModalLaterText: {
+    color: '#C8D0DE',
+    fontSize: 13,
+    fontWeight: '800',
   },
 });

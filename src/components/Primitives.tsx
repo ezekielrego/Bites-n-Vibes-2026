@@ -57,7 +57,6 @@ export function AppBackground({ children }: { children: React.ReactNode }) {
       style={styles.background}
     >
       <View pointerEvents="none" style={[styles.orb, styles.orbTop]} />
-      <View pointerEvents="none" style={[styles.orb, styles.orbBottom]} />
       {children}
     </LinearGradient>
   );
@@ -291,13 +290,6 @@ const styles = StyleSheet.create({
     height: 240,
     backgroundColor: 'rgba(255,107,61,0.16)',
   },
-  orbBottom: {
-    bottom: -80,
-    left: -50,
-    width: 220,
-    height: 220,
-    backgroundColor: 'rgba(72,125,255,0.13)',
-  },
   screen: {
     flex: 1,
   },
@@ -354,7 +346,7 @@ const styles = StyleSheet.create({
   categoryPill: {
     minHeight: 38,
     paddingHorizontal: 14,
-    borderRadius: theme.radius.pill,
+    borderRadius: 11,
     backgroundColor: theme.colors.surfaceMuted,
     borderWidth: 1,
     borderColor: theme.colors.border,

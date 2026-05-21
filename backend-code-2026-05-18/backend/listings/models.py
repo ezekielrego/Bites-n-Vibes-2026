@@ -85,6 +85,7 @@ class Listing(models.Model):
     is_trending = models.BooleanField(default=False)
     is_featured = models.BooleanField(default=False)
     is_verified = models.BooleanField(default=False, help_text="Verified listings show a verified badge")
+    accepts_internal_payments = models.BooleanField(default=True)
     
     # Metadata
     tags = models.ManyToManyField(Tag, related_name='listings', blank=True)
@@ -277,6 +278,35 @@ class ListingMediaPolicy(models.Model):
         return len(expired_videos)
 
 
+class AppVersionPolicy(models.Model):
+    """Admin-controlled app update policy used by installed mobile apps."""
+
+    singleton_guard = models.BooleanField(default=True, unique=True, editable=False)
+    name = models.CharField(max_length=80, default='Mobile app update policy')
+    latest_version = models.CharField(max_length=24, default='1.1.0')
+    min_required_version = models.CharField(max_length=24, default='1.0.0')
+    force_update = models.BooleanField(default=False)
+    android_update_url = models.URLField(default='https://bitesnvibes.co.zw')
+    ios_update_url = models.URLField(default='https://bitesnvibes.co.zw')
+    message = models.TextField(default='A newer Bites & Vibes app is available with important fixes and improvements.')
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'app_version_policy'
+        verbose_name_plural = 'App version policies'
+
+    def __str__(self):
+        return self.name
+
+    @classmethod
+    def get_solo(cls):
+        policy, _ = cls.objects.get_or_create(pk=1, defaults={'singleton_guard': True})
+        return policy
+
+    def update_url_for_platform(self, platform):
+        return self.ios_update_url if platform == 'ios' else self.android_update_url
+
+
 class Rating(models.Model):
     """User ratings for listings."""
     listing = models.ForeignKey(Listing, on_delete=models.CASCADE, related_name='ratings')
@@ -361,30 +391,127 @@ class ListingViewHistory(models.Model):
         return f"{self.user.email} viewed {self.listing.name}"
 
 
+class SearchQueryLog(models.Model):
+    """Production search signal used to improve future feed ranking."""
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='search_query_logs',
+        null=True,
+        blank=True,
+    )
+    query = models.CharField(max_length=180)
+    category = models.ForeignKey(Category, on_delete=models.SET_NULL, related_name='search_query_logs', null=True, blank=True)
+    result_count = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'search_query_logs'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user', 'created_at']),
+            models.Index(fields=['query', 'created_at']),
+            models.Index(fields=['category', 'created_at']),
+        ]
+
+    def __str__(self):
+        return self.query
+
+
+class ListingFeedImpression(models.Model):
+    """Tracks listings served in feed/search so repeated content can be softened."""
+    listing = models.ForeignKey(Listing, on_delete=models.CASCADE, related_name='feed_impressions')
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='feed_impressions',
+        null=True,
+        blank=True,
+    )
+    category = models.ForeignKey(Category, on_delete=models.SET_NULL, related_name='feed_impressions', null=True, blank=True)
+    search_query = models.CharField(max_length=180, blank=True)
+    source = models.CharField(max_length=40, default='app_feed')
+    position = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'listing_feed_impressions'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user', 'created_at']),
+            models.Index(fields=['listing', 'created_at']),
+            models.Index(fields=['category', 'created_at']),
+        ]
+
+    def __str__(self):
+        return f"{self.listing.name} served from {self.source}"
+
+
 class Ticket(models.Model):
     """A lightweight booked ticket for a user and listing."""
 
     STATUS_CHOICES = [
+        ('pending', 'Pending Payment'),
         ('confirmed', 'Confirmed'),
         ('used', 'Used'),
         ('cancelled', 'Cancelled'),
+        ('failed', 'Payment Failed'),
+        ('expired', 'Expired'),
+    ]
+
+    ACTION_CHOICES = [
+        ('ticket', 'Ticket'),
+        ('reservation', 'Reservation'),
+        ('booking', 'Booking'),
+        ('order', 'Order'),
+        ('enquiry', 'Enquiry'),
+    ]
+
+    PAYMENT_STATUS_CHOICES = [
+        ('not_required', 'Not Required'),
+        ('pending', 'Pending'),
+        ('paid', 'Paid'),
+        ('failed', 'Failed'),
+        ('cancelled', 'Cancelled'),
+        ('expired', 'Expired'),
+    ]
+
+    PAYMENT_METHOD_CHOICES = [
+        ('ecocash', 'EcoCash'),
+        ('onemoney', 'OneMoney'),
+        ('innbucks', 'InnBucks'),
+        ('omari', 'Omari'),
     ]
 
     listing = models.ForeignKey(Listing, on_delete=models.CASCADE, related_name='tickets')
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='tickets')
+    action_type = models.CharField(max_length=20, choices=ACTION_CHOICES, default='ticket')
+    quantity = models.PositiveIntegerField(default=1, validators=[MinValueValidator(1), MaxValueValidator(20)])
+    unit_price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    total_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    currency = models.CharField(max_length=3, default='USD')
     reference_code = models.CharField(max_length=32, unique=True, blank=True)
     qr_payload = models.TextField(blank=True)
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default='confirmed')
+    payment_status = models.CharField(max_length=16, choices=PAYMENT_STATUS_CHOICES, default='not_required')
+    payment_method = models.CharField(max_length=20, choices=PAYMENT_METHOD_CHOICES, blank=True)
+    payer_phone = models.CharField(max_length=24, blank=True)
+    paynow_reference = models.CharField(max_length=120, blank=True)
+    paynow_poll_url = models.URLField(max_length=1000, blank=True)
+    paynow_browser_url = models.URLField(max_length=1000, blank=True)
+    payment_last_response = models.JSONField(default=dict, blank=True)
+    paid_at = models.DateTimeField(null=True, blank=True)
     booked_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         db_table = 'tickets'
-        unique_together = ['listing', 'user']
         ordering = ['-booked_at']
         indexes = [
             models.Index(fields=['user', 'status', 'booked_at']),
             models.Index(fields=['listing', 'status']),
+            models.Index(fields=['reference_code']),
+            models.Index(fields=['paynow_reference']),
         ]
 
     def __str__(self):

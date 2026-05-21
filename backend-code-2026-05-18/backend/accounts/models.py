@@ -133,12 +133,19 @@ class PushDevice(models.Model):
         ('web', 'Web'),
         ('unknown', 'Unknown'),
     ]
+    PROVIDER_CHOICES = [
+        ('firebase', 'Firebase Cloud Messaging'),
+        ('expo', 'Expo Push Service'),
+    ]
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='push_devices')
-    token = models.CharField(max_length=255, unique=True)
+    token = models.CharField(max_length=512, unique=True)
     platform = models.CharField(max_length=20, choices=PLATFORM_CHOICES, default='unknown')
+    provider = models.CharField(max_length=20, choices=PROVIDER_CHOICES, default='firebase')
     device_name = models.CharField(max_length=120, blank=True)
     is_active = models.BooleanField(default=True)
+    failure_count = models.PositiveIntegerField(default=0)
+    last_error = models.CharField(max_length=255, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     last_registered_at = models.DateTimeField(auto_now=True)
@@ -149,6 +156,7 @@ class PushDevice(models.Model):
         indexes = [
             models.Index(fields=['user', 'is_active']),
             models.Index(fields=['platform', 'is_active']),
+            models.Index(fields=['provider', 'is_active']),
         ]
 
     def __str__(self):

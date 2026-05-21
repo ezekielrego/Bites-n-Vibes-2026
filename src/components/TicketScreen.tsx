@@ -131,7 +131,9 @@ export function TicketScreen({
                 <TicketField label="Date" value={event.dateLabel} />
                 <TicketField label="Time" value={event.time} rightAligned />
                 <TicketField label="Venue" value={event.venue} />
-                <TicketField label="Access" value="Floor pass" rightAligned />
+                <TicketField label="Access" value={formatTicketAction(ticket?.actionType)} rightAligned />
+                <TicketField label="Paid" value={ticket ? `${ticket.currency} ${ticket.totalAmount}` : event.price} />
+                <TicketField label="Payment" value={ticket?.paymentStatus ?? 'not_required'} rightAligned />
                 <TicketField label="Reference" value={ticketCode} />
                 <TicketField label="Status" value={ticket?.status ?? 'confirmed'} rightAligned />
               </View>
@@ -193,6 +195,19 @@ export function TicketScreen({
   );
 }
 
+function formatTicketAction(action?: AppTicket['actionType']) {
+  if (action === 'reservation') {
+    return 'Reservation';
+  }
+  if (action === 'booking') {
+    return 'Booking';
+  }
+  if (action === 'order') {
+    return 'Order';
+  }
+  return 'Pass';
+}
+
 function TicketField({
   label,
   value,
@@ -214,7 +229,7 @@ function TicketField({
 
 const styles = StyleSheet.create({
   content: {
-    paddingHorizontal: 20,
+    paddingHorizontal: 4,
   },
   header: {
     marginBottom: 22,

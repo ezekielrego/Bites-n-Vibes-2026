@@ -1,7 +1,7 @@
 import type { ImageSourcePropType } from 'react-native';
 
 export type Screen = 'home' | 'details' | 'ticket' | 'nearby';
-export type TabId = 'discover' | 'saved' | 'create' | 'inbox' | 'profile';
+export type TabId = 'discover' | 'stream' | 'create' | 'inbox' | 'profile';
 export type CategoryId = string;
 export type ContactIconName = 'phone-call' | 'mail' | 'globe';
 export type SocialPlatform = 'tiktok' | 'youtube' | 'facebook' | 'instagram' | 'x' | 'web';
@@ -29,6 +29,7 @@ export type AppIconName =
   | 'menu'
   | 'message-circle'
   | 'music'
+  | 'play-circle'
   | 'plus-circle'
   | 'search'
   | 'settings'
@@ -104,13 +105,21 @@ export interface AppEvent {
   contacts: EventContactLink[];
   socials: EventSocialLink[];
   isSaved: boolean;
+  saveCount: number;
   hasTicket: boolean;
+  acceptsInternalPayments: boolean;
   ownerName?: string | null;
   ownerCanEdit?: boolean;
   ownerEditExpiresAt?: string | null;
+  ownerSoldCount?: number;
+  ownerRevenueTotal?: string;
   createdAt?: string;
   ratingCount?: number;
   commentCount?: number;
+  isTrending?: boolean;
+  isFeatured?: boolean;
+  isVerified?: boolean;
+  vibePercentage?: number;
 }
 
 export interface AppTicket {
@@ -119,14 +128,30 @@ export interface AppTicket {
   event: AppEvent;
   buyerName?: string | null;
   buyerEmail?: string | null;
+  actionType: 'ticket' | 'reservation' | 'booking' | 'order' | 'enquiry';
+  quantity: number;
+  unitPrice: string;
+  totalAmount: string;
+  currency: string;
   referenceCode: string;
   qrValue: string;
-  status: 'confirmed' | 'used' | 'cancelled';
+  status: 'pending' | 'confirmed' | 'used' | 'cancelled' | 'failed' | 'expired';
+  paymentStatus: 'not_required' | 'pending' | 'paid' | 'failed' | 'cancelled' | 'expired';
+  paymentMethod?: string | null;
+  paynowReference?: string | null;
   canCancel: boolean;
   canMarkUsed: boolean;
   canManage: boolean;
   bookedAt: string;
   updatedAt: string;
+}
+
+export type BookingPaymentMethod = 'ecocash' | 'onemoney' | 'innbucks' | 'omari';
+
+export interface BookingCheckoutInput {
+  paymentMethod: BookingPaymentMethod;
+  phone: string;
+  quantity?: number;
 }
 
 export type CommentAttachmentType = 'image' | 'video' | 'link';
@@ -210,6 +235,20 @@ export interface AppBootstrap {
   profile: AppUser | null;
 }
 
+export interface AppUpdatePolicy {
+  latestVersion: string;
+  minRequiredVersion: string;
+  forceUpdate: boolean;
+  updateUrl: string;
+  message: string;
+}
+
+export interface AppEventPage {
+  events: AppEvent[];
+  nextPage: number | null;
+  totalCount: number;
+}
+
 export interface LocalUploadFile {
   uri: string;
   name: string;
@@ -267,6 +306,7 @@ export interface CreateAppEventInput {
   galleryMedia: LocalUploadImage[];
   existingMedia?: AppEventMedia[];
   socials: Partial<Record<SocialPlatform, string>>;
+  acceptsInternalPayments?: boolean;
 }
 
 export interface UpdateProfileInput {

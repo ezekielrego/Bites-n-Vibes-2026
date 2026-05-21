@@ -17,6 +17,7 @@
     "@urql/exchange-retry": "^1.3.2",
     "expo": "~54.0.33",
     "expo-av": "~16.0.8",
+    "expo-camera": "~17.0.10",
     "expo-constants": "^55.0.16",
     "expo-device": "^55.0.17",
     "expo-file-system": "^55.0.21",
