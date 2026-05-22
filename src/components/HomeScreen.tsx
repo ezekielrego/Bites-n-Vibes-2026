@@ -100,6 +100,8 @@ export function HomeScreen({
   onToggleEmailNotifications,
   onTogglePushNotifications,
   onUpdateProfile,
+  onDiscoverScroll,
+  onMenuOpen,
 }: {
   activeTab: TabId;
   categories: AppCategory[];
@@ -137,6 +139,8 @@ export function HomeScreen({
   onToggleEmailNotifications: (enabled: boolean) => Promise<AppUser>;
   onTogglePushNotifications: (enabled: boolean) => Promise<AppUser>;
   onUpdateProfile: (input: UpdateProfileInput) => Promise<AppUser>;
+  onDiscoverScroll?: (offsetY: number) => void;
+  onMenuOpen?: () => void;
 }) {
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
@@ -205,6 +209,12 @@ export function HomeScreen({
   useEffect(() => {
     setMenuOpen(false);
   }, [activeTab]);
+
+  useEffect(() => {
+    if (menuOpen) {
+      onMenuOpen?.();
+    }
+  }, [menuOpen, onMenuOpen]);
 
   useEffect(() => {
     if (categories.length === 0) {
@@ -418,6 +428,8 @@ export function HomeScreen({
   });
 
   const handleDiscoverScroll = (event: NativeSyntheticEvent<NativeScrollEvent>) => {
+    onDiscoverScroll?.(event.nativeEvent.contentOffset.y);
+
     const nextVisible = event.nativeEvent.contentOffset.y >= FLOATING_SEARCH_THRESHOLD;
     if (nextVisible !== floatingSearchVisibleRef.current) {
       floatingSearchVisibleRef.current = nextVisible;

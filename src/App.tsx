@@ -2,6 +2,7 @@ import React, { Suspense, lazy, startTransition, useCallback, useEffect, useMemo
 import { Alert, BackHandler, Linking as NativeLinking, Modal, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import * as ExpoLinking from 'expo-linking';
 import { Image } from 'expo-image';
+import * as SecureStore from 'expo-secure-store';
 import { Feather } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import { StatusBar } from 'expo-status-bar';
@@ -42,6 +43,7 @@ import {
 import { APP_VERSION, TAB_ITEMS } from './constants';
 import { AuthScreen } from './components/AuthScreen';
 import { BottomNav } from './components/BottomNav';
+import { OnboardingOverlay, OnboardingStage } from './components/OnboardingOverlay';
 import { AppBackground, PrimaryButton, ScreenTransition } from './components/Primitives';
 import { DetailsScreenSkeleton, HomeScreenSkeleton, TicketScreenSkeleton } from './components/Skeletons';
 import { configureNotificationHandlingAsync, registerForPushNotificationsAsync } from './push';
@@ -63,6 +65,8 @@ import {
 WebBrowser.maybeCompleteAuthSession();
 void configureNotificationHandlingAsync();
 const APP_LOGO = require('../logo.png');
+const ONBOARDING_COMPLETE_KEY = 'bites_onboarding_complete_v1';
+const SHOW_ONBOARDING_EVERY_LOGIN_FOR_TESTING = true;
 
 const HomeScreen = lazy(async () => {
   const module = await import('./components/HomeScreen');
@@ -114,6 +118,8 @@ function AppContent() {
   const [createError, setCreateError] = useState<string | null>(null);
   const [updatePolicy, setUpdatePolicy] = useState<AppUpdatePolicy | null>(null);
   const [updateDismissedVersion, setUpdateDismissedVersion] = useState<string | null>(null);
+  const [onboardingStage, setOnboardingStage] = useState<OnboardingStage>('checking');
+  const [onboardingTargets, setOnboardingTargets] = useState<Partial<Record<TabId, { x: number; y: number }>>>({});
   const lastHandledAuthUrl = useRef<string | null>(null);
   const pushTokenRef = useRef<string | null>(null);
   const updatePrompt = useMemo(() => {
@@ -171,6 +177,23 @@ function AppContent() {
   useEffect(() => {
     let cancelled = false;
 
+    const loadOnboardingState = async () => {
+      const completed = await readOnboardingCompleted();
+      if (!cancelled) {
+        setOnboardingStage(completed ? 'done' : 'welcome');
+      }
+    };
+
+    void loadOnboardingState();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
     const checkForUpdates = async () => {
       try {
         const policy = await fetchAppUpdatePolicy(Platform.OS);
@@ -213,6 +236,7 @@ function AppContent() {
     setAuthBusyProvider(null);
     setAuthMessage(null);
     setIsBootstrapping(false);
+    setOnboardingStage('welcome');
     setAuthState('signedOut');
   }, []);
 
@@ -713,6 +737,10 @@ function AppContent() {
       setTabDirection(nextIndex > currentIndex ? 1 : -1);
       setActiveTab(nextTab);
     });
+
+    if (nextTab === 'create') {
+      setOnboardingStage((current) => (current === 'create' ? 'menu' : current));
+    }
   };
 
   const handleToggleSave = async (event: AppEvent) => {
@@ -985,6 +1013,23 @@ function AppContent() {
     [authState, bootstrapError, events.length, isBootstrapping, myListings.length],
   );
 
+  const handleOnboardingNext = useCallback(() => {
+    setOnboardingStage('scroll');
+  }, []);
+
+  const handleOnboardingDiscoverScroll = useCallback((offsetY: number) => {
+    setOnboardingStage((current) => (current === 'scroll' && offsetY > 18 ? 'create' : current));
+  }, []);
+
+  const handleOnboardingMenuOpen = useCallback(() => {
+    setOnboardingStage((current) => (current === 'menu' ? 'success' : current));
+  }, []);
+
+  const handleOnboardingFinish = useCallback(() => {
+    setOnboardingStage('done');
+    void writeOnboardingCompleted();
+  }, []);
+
   return (
     <AppBackground>
       <StatusBar style="light" />
@@ -1048,6 +1093,8 @@ function AppContent() {
                 onTogglePushNotifications={handleTogglePushNotifications}
                 onToggleSave={handleToggleSave}
                 onUpdateProfile={handleUpdateProfile}
+                onDiscoverScroll={handleOnboardingDiscoverScroll}
+                onMenuOpen={handleOnboardingMenuOpen}
                 profile={profile}
                 tabDirection={tabDirection}
                 tickets={tickets}
@@ -1105,7 +1152,24 @@ function AppContent() {
         ) : null}
 
         {authState === 'signedIn' && !showStartupState && currentScreen === 'home' ? (
-          <BottomNav activeTab={activeTab} onTabChange={handleTabChange} unreadCount={unreadNotificationCount} />
+          <BottomNav
+            activeTab={activeTab}
+            onTabChange={handleTabChange}
+            onTabTargetLayout={(tab, target) =>
+              setOnboardingTargets((current) => {
+                const previous = current[tab];
+                if (previous && Math.abs(previous.x - target.x) < 0.5 && Math.abs(previous.y - target.y) < 0.5) {
+                  return current;
+                }
+
+                return {
+                  ...current,
+                  [tab]: target,
+                };
+              })
+            }
+            unreadCount={unreadNotificationCount}
+          />
         ) : null}
 
         {updatePrompt ? (
@@ -1116,6 +1180,15 @@ function AppContent() {
             required={updatePrompt.required}
             updateUrl={updatePrompt.updateUrl}
             onDismiss={() => setUpdateDismissedVersion(updatePrompt.latestVersion)}
+          />
+        ) : null}
+
+        {authState === 'signedIn' && !showStartupState ? (
+          <OnboardingOverlay
+            createTarget={onboardingTargets.create}
+            stage={onboardingStage}
+            onNext={handleOnboardingNext}
+            onFinish={handleOnboardingFinish}
           />
         ) : null}
       </View>
@@ -1283,6 +1356,27 @@ function upsertTicketItem(current: AppTicket[], nextTicket: AppTicket) {
 
 function hasConfirmedTicketForEvent(tickets: AppTicket[], eventId: string) {
   return tickets.some((ticket) => ticket.eventId === eventId && ticket.status === 'confirmed');
+}
+
+async function readOnboardingCompleted() {
+  if (SHOW_ONBOARDING_EVERY_LOGIN_FOR_TESTING) {
+    return false;
+  }
+
+  if (Platform.OS === 'web') {
+    return globalThis.localStorage?.getItem(ONBOARDING_COMPLETE_KEY) === 'true';
+  }
+
+  return (await SecureStore.getItemAsync(ONBOARDING_COMPLETE_KEY)) === 'true';
+}
+
+async function writeOnboardingCompleted() {
+  if (Platform.OS === 'web') {
+    globalThis.localStorage?.setItem(ONBOARDING_COMPLETE_KEY, 'true');
+    return;
+  }
+
+  await SecureStore.setItemAsync(ONBOARDING_COMPLETE_KEY, 'true');
 }
 
 export default function App() {

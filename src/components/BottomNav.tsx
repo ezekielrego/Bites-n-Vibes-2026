@@ -6,6 +6,7 @@ import {
   Pressable,
   StyleSheet,
   Text,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import { Feather } from '@expo/vector-icons';
@@ -20,18 +21,22 @@ type FeatherName = React.ComponentProps<typeof Feather>['name'];
 export function BottomNav({
   activeTab,
   onTabChange,
+  onTabTargetLayout,
   unreadCount = 0,
 }: {
   activeTab: TabId;
   onTabChange: (tab: TabId) => void;
+  onTabTargetLayout?: (tab: TabId, target: { x: number; y: number }) => void;
   unreadCount?: number;
 }) {
   const insets = useSafeAreaInsets();
+  const { height } = useWindowDimensions();
   const indicatorX = useRef(new Animated.Value(0)).current;
   const indicatorWidth = useRef(new Animated.Value(72)).current;
   const jelly = useRef(new Animated.Value(0)).current;
   const hasMounted = useRef(false);
-  const [layouts, setLayouts] = useState<Partial<Record<TabId, { width: number; x: number }>>>({});
+  const [layouts, setLayouts] = useState<Partial<Record<TabId, { height: number; width: number; x: number; y: number }>>>({});
+  const [shellLayout, setShellLayout] = useState<{ height: number; width: number; x: number } | null>(null);
 
   useEffect(() => {
     const activeLayout = layouts[activeTab];
@@ -86,19 +91,39 @@ export function BottomNav({
     ]).start();
   }, [activeTab, indicatorWidth, indicatorX, jelly, layouts]);
 
+  useEffect(() => {
+    if (!shellLayout || !onTabTargetLayout) {
+      return;
+    }
+
+    const shellTop = height - (insets.bottom + 10) - shellLayout.height;
+
+    TAB_ITEMS.forEach((tab) => {
+      const layout = layouts[tab.id];
+      if (!layout) {
+        return;
+      }
+
+      onTabTargetLayout(tab.id, {
+        x: shellLayout.x + layout.x + layout.width / 2,
+        y: shellTop + layout.y + layout.height / 2,
+      });
+    });
+  }, [height, insets.bottom, layouts, onTabTargetLayout, shellLayout]);
+
   const handleItemLayout = (tabId: TabId, event: LayoutChangeEvent) => {
-    const { width, x } = event.nativeEvent.layout;
+    const { height, width, x, y } = event.nativeEvent.layout;
 
     setLayouts((current) => {
       const previous = current[tabId];
 
-      if (previous && previous.width === width && previous.x === x) {
+      if (previous && previous.height === height && previous.width === width && previous.x === x && previous.y === y) {
         return current;
       }
 
       return {
         ...current,
-        [tabId]: { width, x },
+        [tabId]: { height, width, x, y },
       };
     });
   };
@@ -115,7 +140,17 @@ export function BottomNav({
 
   return (
     <View pointerEvents="box-none" style={[styles.outer, { paddingBottom: insets.bottom + 10 }]}>
-      <View style={styles.shell}>
+      <View
+        onLayout={(event) => {
+          const { height, width, x } = event.nativeEvent.layout;
+          setShellLayout((current) =>
+            current && current.height === height && current.width === width && current.x === x
+              ? current
+              : { height, width, x },
+          );
+        }}
+        style={styles.shell}
+      >
         <Animated.View
           pointerEvents="none"
           style={[
