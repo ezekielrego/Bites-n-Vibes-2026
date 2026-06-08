@@ -1,10 +1,15 @@
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
+from django.conf import settings
 from django.utils.text import slugify
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from .models import Category, Tag, Listing, ListingImage, Rating, Ticket, Vibe
 
 User = get_user_model()
+
+
+def build_public_media_url(path):
+    return f"{settings.PUBLIC_SITE_URL}{path}"
 
 
 class CategorySerializer(serializers.ModelSerializer):
@@ -194,7 +199,7 @@ class ListingSerializer(serializers.ModelSerializer):
                 if request:
                     return request.build_absolute_uri(primary_img)
                 # Fallback: build URL manually
-                return f"https://bitesnvibes.co.zw{primary_img}"
+                return build_public_media_url(primary_img)
         
         # For FileField objects, build absolute URI
         request = self.context.get('request')
@@ -216,7 +221,7 @@ class ListingSerializer(serializers.ModelSerializer):
                 request = self.context.get('request')
                 if request:
                     return request.build_absolute_uri(ticket_img)
-                return f"https://bitesnvibes.co.zw{ticket_img}"
+                return build_public_media_url(ticket_img)
 
         request = self.context.get('request')
         if request:
@@ -261,7 +266,7 @@ class ListingSerializer(serializers.ModelSerializer):
         """Check if current user already has a confirmed ticket for this listing."""
         request = self.context.get('request')
         if request and request.user.is_authenticated:
-            return obj.tickets.filter(user=request.user, status='confirmed').exists()
+            return obj.tickets.filter(user=request.user, status__in=['confirmed', 'accepted']).exists()
         return False
 
     def get_owner_can_edit(self, obj):
@@ -278,13 +283,13 @@ class ListingSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         if not request or not request.user.is_authenticated or not (request.user.is_superuser or obj.owner_id == request.user.id):
             return 0
-        return obj.tickets.filter(status__in=['confirmed', 'used']).count()
+        return obj.tickets.filter(status__in=['confirmed', 'accepted', 'used']).count()
 
     def get_owner_revenue_total(self, obj):
         request = self.context.get('request')
         if not request or not request.user.is_authenticated or not (request.user.is_superuser or obj.owner_id == request.user.id):
             return '0.00'
-        total = sum(ticket.total_amount for ticket in obj.tickets.filter(status__in=['confirmed', 'used']))
+        total = sum(ticket.total_amount for ticket in obj.tickets.filter(status__in=['confirmed', 'accepted', 'used']))
         return f'{Decimal(total).quantize(Decimal("0.01"))}'
     
     def validate(self, data):
@@ -441,7 +446,7 @@ class ListingListSerializer(serializers.ModelSerializer):
                 if request:
                     return request.build_absolute_uri(primary_img)
                 # Fallback: build URL manually
-                return f"https://bitesnvibes.co.zw{primary_img}"
+                return build_public_media_url(primary_img)
         
         # For FileField objects, build absolute URI
         request = self.context.get('request')
@@ -462,7 +467,7 @@ class ListingListSerializer(serializers.ModelSerializer):
                 request = self.context.get('request')
                 if request:
                     return request.build_absolute_uri(ticket_img)
-                return f"https://bitesnvibes.co.zw{ticket_img}"
+                return build_public_media_url(ticket_img)
 
         request = self.context.get('request')
         if request:
@@ -487,7 +492,7 @@ class ListingListSerializer(serializers.ModelSerializer):
     def get_user_has_ticket(self, obj):
         request = self.context.get('request')
         if request and request.user.is_authenticated:
-            return obj.tickets.filter(user=request.user, status='confirmed').exists()
+            return obj.tickets.filter(user=request.user, status__in=['confirmed', 'accepted']).exists()
         return False
 
     def get_owner_can_edit(self, obj):
@@ -510,6 +515,7 @@ class TicketSerializer(serializers.ModelSerializer):
     buyer_name = serializers.CharField(source='user.name', read_only=True, allow_null=True)
     buyer_email = serializers.CharField(source='user.email', read_only=True, allow_null=True)
     can_cancel = serializers.SerializerMethodField()
+    can_accept = serializers.SerializerMethodField()
     can_mark_used = serializers.SerializerMethodField()
     can_manage = serializers.SerializerMethodField()
 
@@ -533,8 +539,10 @@ class TicketSerializer(serializers.ModelSerializer):
             'payment_status',
             'payment_method',
             'payer_phone',
+            'request_note',
             'paynow_reference',
             'can_cancel',
+            'can_accept',
             'can_mark_used',
             'can_manage',
             'booked_at',
@@ -550,13 +558,19 @@ class TicketSerializer(serializers.ModelSerializer):
 
     def get_can_cancel(self, obj):
         user = self._request_user()
-        if not user or not user.is_authenticated or obj.status != 'confirmed':
+        if not user or not user.is_authenticated or obj.status not in {'requested', 'pending', 'confirmed', 'accepted'}:
             return False
         return user.is_superuser or user.id == obj.user_id or user.id == obj.listing.owner_id
 
+    def get_can_accept(self, obj):
+        user = self._request_user()
+        if not user or not user.is_authenticated or obj.status != 'requested':
+            return False
+        return user.is_superuser or user.id == obj.listing.owner_id
+
     def get_can_mark_used(self, obj):
         user = self._request_user()
-        if not user or not user.is_authenticated or obj.status != 'confirmed':
+        if not user or not user.is_authenticated or obj.status not in {'confirmed', 'accepted'}:
             return False
         return user.is_superuser or user.id == obj.listing.owner_id
 

@@ -163,7 +163,7 @@ class Listing(models.Model):
     @property
     def owner_edit_expires_at(self):
         """Time until which the owner can still edit the listing."""
-        return self.created_at + timedelta(hours=24)
+        return self.created_at + timedelta(hours=48)
 
     def owner_can_edit(self, user):
         """Whether the given user can still edit this listing."""
@@ -451,8 +451,10 @@ class Ticket(models.Model):
     """A lightweight booked ticket for a user and listing."""
 
     STATUS_CHOICES = [
+        ('requested', 'Requested'),
         ('pending', 'Pending Payment'),
         ('confirmed', 'Confirmed'),
+        ('accepted', 'Accepted / Reserved'),
         ('used', 'Used'),
         ('cancelled', 'Cancelled'),
         ('failed', 'Payment Failed'),
@@ -496,6 +498,7 @@ class Ticket(models.Model):
     payment_status = models.CharField(max_length=16, choices=PAYMENT_STATUS_CHOICES, default='not_required')
     payment_method = models.CharField(max_length=20, choices=PAYMENT_METHOD_CHOICES, blank=True)
     payer_phone = models.CharField(max_length=24, blank=True)
+    request_note = models.TextField(blank=True)
     paynow_reference = models.CharField(max_length=120, blank=True)
     paynow_poll_url = models.URLField(max_length=1000, blank=True)
     paynow_browser_url = models.URLField(max_length=1000, blank=True)

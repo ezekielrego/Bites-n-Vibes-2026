@@ -15,8 +15,9 @@ SECRET_KEY = config('SECRET_KEY', default='django-insecure-change-this-in-produc
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = config('DEBUG', default=True, cast=bool)
 
-allowed_hosts_value = config('ALLOWED_HOSTS', default='*' if DEBUG else 'localhost,127.0.0.1,10.0.2.2')
+allowed_hosts_value = config('ALLOWED_HOSTS', default='*' if DEBUG else 'bitesnvibes.co.zw,www.bitesnvibes.co.zw')
 ALLOWED_HOSTS = ['*'] if allowed_hosts_value == '*' else Csv()(allowed_hosts_value)
+PUBLIC_SITE_URL = config('PUBLIC_SITE_URL', default='https://bitesnvibes.co.zw' if not DEBUG else 'http://localhost:8000').rstrip('/')
 
 # Application definition
 INSTALLED_APPS = [
@@ -307,5 +308,11 @@ SESSION_COOKIE_SAMESITE = 'Lax'
 
 # Proxy SSL Configuration (since we're behind OpenLiteSpeed proxy)
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+SECURE_SSL_REDIRECT = config('SECURE_SSL_REDIRECT', default=not DEBUG, cast=bool)
+SECURE_HSTS_SECONDS = config('SECURE_HSTS_SECONDS', default=0 if DEBUG else 31536000, cast=int)
+SECURE_HSTS_INCLUDE_SUBDOMAINS = config('SECURE_HSTS_INCLUDE_SUBDOMAINS', default=not DEBUG, cast=bool)
+SECURE_HSTS_PRELOAD = config('SECURE_HSTS_PRELOAD', default=not DEBUG, cast=bool)
+SECURE_CONTENT_TYPE_NOSNIFF = True
+X_FRAME_OPTIONS = 'DENY'
 USE_TZ = True
 

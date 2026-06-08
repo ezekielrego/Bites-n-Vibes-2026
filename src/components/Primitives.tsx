@@ -128,12 +128,14 @@ export function IconButton({
   accessibilityLabel,
   light = false,
   darkGlass = false,
+  compact = false,
 }: {
   icon: AppIconName;
   onPress?: () => void;
   accessibilityLabel?: string;
   light?: boolean;
   darkGlass?: boolean;
+  compact?: boolean;
 }) {
   const jelly = useJellyPressAnimation();
 
@@ -149,12 +151,13 @@ export function IconButton({
       <Animated.View
         style={[
           styles.iconButton,
+          compact && styles.iconButtonCompact,
           light && styles.iconButtonLight,
           darkGlass && styles.iconButtonDarkGlass,
           jelly.animatedStyle,
         ]}
       >
-        <Feather color={theme.colors.text} name={icon as FeatherName} size={18} />
+        <Feather color={theme.colors.text} name={icon as FeatherName} size={compact ? 16 : 18} />
       </Animated.View>
     </Pressable>
   );
@@ -226,10 +229,12 @@ export function CategoryPill({
   category,
   active,
   onPress,
+  compact = false,
 }: {
   category: AppCategory;
   active: boolean;
   onPress?: () => void;
+  compact?: boolean;
 }) {
   const jelly = useJellyPressAnimation({
     pressedScaleX: 1.025,
@@ -244,9 +249,9 @@ export function CategoryPill({
       onPressOut={jelly.onPressOut}
       style={styles.pressableReset}
     >
-      <Animated.View style={[styles.categoryPill, active && styles.categoryPillActive, jelly.animatedStyle]}>
-        <Feather color={active ? theme.colors.white : theme.colors.accentStrong} name={category.icon as FeatherName} size={15} />
-        <Text style={[styles.categoryText, active && styles.categoryTextActive]}>{category.name}</Text>
+      <Animated.View style={[styles.categoryPill, compact && styles.categoryPillCompact, active && styles.categoryPillActive, jelly.animatedStyle]}>
+        <Feather color={active ? theme.colors.white : theme.colors.accentStrong} name={category.icon as FeatherName} size={compact ? 13 : 15} />
+        <Text style={[styles.categoryText, compact && styles.categoryTextCompact, active && styles.categoryTextActive]}>{category.name}</Text>
       </Animated.View>
     </Pressable>
   );
@@ -255,14 +260,20 @@ export function CategoryPill({
 export function SectionHeader({
   title,
   actionLabel,
+  onActionPress,
 }: {
   title: string;
   actionLabel?: string;
+  onActionPress?: () => void;
 }) {
   return (
     <View style={styles.sectionHeader}>
       <Text style={styles.sectionTitle}>{title}</Text>
-      {actionLabel ? <Text style={styles.sectionAction}>{actionLabel}</Text> : null}
+      {actionLabel ? (
+        <Pressable accessibilityRole={onActionPress ? 'button' : undefined} onPress={onActionPress} style={styles.sectionActionPressable}>
+          <Text style={styles.sectionAction}>{actionLabel}</Text>
+        </Pressable>
+      ) : null}
     </View>
   );
 }
@@ -288,7 +299,7 @@ const styles = StyleSheet.create({
     right: -60,
     width: 240,
     height: 240,
-    backgroundColor: 'rgba(255,107,61,0.16)',
+    backgroundColor: 'rgba(242,34,28,0.16)',
   },
   screen: {
     flex: 1,
@@ -302,6 +313,10 @@ const styles = StyleSheet.create({
     backgroundColor: theme.colors.surface,
     borderWidth: 1,
     borderColor: theme.colors.border,
+  },
+  iconButtonCompact: {
+    width: 36,
+    height: 36,
   },
   iconButtonLight: {
     backgroundColor: 'rgba(255,255,255,0.16)',
@@ -355,14 +370,25 @@ const styles = StyleSheet.create({
     gap: 8,
     marginRight: 10,
   },
+  categoryPillCompact: {
+    minHeight: 32,
+    paddingHorizontal: 11,
+    borderRadius: 10,
+    gap: 6,
+    marginRight: 8,
+  },
   categoryPillActive: {
     backgroundColor: theme.colors.accentSoft,
-    borderColor: 'rgba(255,107,61,0.24)',
+    borderColor: 'rgba(242,34,28,0.24)',
   },
   categoryText: {
     color: theme.colors.textMuted,
     fontSize: 13,
     fontWeight: '600',
+  },
+  categoryTextCompact: {
+    fontSize: 12,
+    fontWeight: '700',
   },
   categoryTextActive: {
     color: theme.colors.white,
@@ -384,6 +410,11 @@ const styles = StyleSheet.create({
     color: theme.colors.accentStrong,
     fontSize: 13,
     fontWeight: '700',
+  },
+  sectionActionPressable: {
+    minHeight: 30,
+    justifyContent: 'center',
+    paddingLeft: 12,
   },
   tag: {
     paddingHorizontal: 12,

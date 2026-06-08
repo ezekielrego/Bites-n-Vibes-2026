@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "Bites & Vibes",
+    "name": "bites n vibes",
     "slug": "bitesapp26",
     "scheme": "bitesnvibes",
     "version": "1.0.0",
@@ -15,10 +15,12 @@
     },
     "ios": {
       "supportsTablet": false,
+      "buildNumber": "1",
       "bundleIdentifier": "zw.co.bitesnvibes.app"
     },
     "android": {
       "package": "zw.co.bitesnvibes.app",
+      "versionCode": 1,
       "googleServicesFile": "./google-services.json",
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
@@ -35,11 +37,24 @@
       [
         "expo-notifications",
         {
-          "color": "#FF6B3D"
+          "color": "#F2221C"
         }
       ],
       "expo-secure-store",
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Allow Bites & Vibes to access your photos so ticket images can be saved.",
+          "savePhotosPermission": "Allow Bites & Vibes to save ticket images to your phone."
+        }
+      ],
       "expo-web-browser"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "e5fafdfc-4ed9-4a17-ad47-0b7763a1cba3"
+      }
+    },
+    "owner": "realego"
   }
 }

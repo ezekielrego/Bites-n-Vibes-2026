@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { ActivityIndicator, Animated, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Animated, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from 'react-native';
 import * as Location from 'expo-location';
 import { Feather } from '@expo/vector-icons';
 import { Image } from 'expo-image';
@@ -13,13 +13,17 @@ type FeatherName = React.ComponentProps<typeof Feather>['name'];
 export function NearbyScreen({
   events,
   onBack,
+  onRefresh,
   onOpenEvent,
   profile,
+  refreshing,
 }: {
   events: AppEvent[];
   onBack: () => void;
+  onRefresh: () => Promise<void>;
   onOpenEvent: (event: AppEvent) => void;
   profile?: AppUser | null;
+  refreshing: boolean;
 }) {
   const insets = useSafeAreaInsets();
   const [locationState, setLocationState] = useState<{
@@ -94,6 +98,10 @@ export function NearbyScreen({
     void loadNearbyLocation();
   }, []);
 
+  const handleRefresh = async () => {
+    await Promise.all([onRefresh(), loadNearbyLocation()]);
+  };
+
   const sortedNearbyEvents = useMemo(() => {
     return events
       .map((event) => ({
@@ -130,6 +138,15 @@ export function NearbyScreen({
     <View style={styles.root}>
       <ScrollView
         contentContainerStyle={[styles.content, { paddingTop: insets.top + 8, paddingBottom: insets.bottom + 32 }]}
+        refreshControl={
+          <RefreshControl
+            colors={[theme.colors.accentStrong]}
+            progressBackgroundColor={theme.colors.surfaceStrong}
+            refreshing={refreshing}
+            tintColor={theme.colors.accentStrong}
+            onRefresh={() => void handleRefresh()}
+          />
+        }
         showsVerticalScrollIndicator={false}
       >
         <View style={styles.headerRow}>
@@ -505,7 +522,7 @@ const styles = StyleSheet.create({
   cardGlow: {
     ...StyleSheet.absoluteFillObject,
     borderRadius: 18,
-    backgroundColor: 'rgba(255,107,61,0.08)',
+    backgroundColor: 'rgba(242,34,28,0.08)',
   },
   cardBorder: {
     borderRadius: 18,

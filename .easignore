@@ -1,0 +1,17 @@
+node_modules/
+.expo/
+build/
+dist/
+coverage/
+web-build/
+backend-code-2026-05-18/
+bitesnvibes-backend-hosting.zip
+*.log
+*.err.log
+.env
+.env.*
+__pycache__/
+*.py[cod]
+*.sqlite3
+Thumbs.db
+.DS_Store

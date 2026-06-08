@@ -9,6 +9,7 @@ import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import * as WebBrowser from 'expo-web-browser';
 import {
+  acceptTicket,
   bookEventTicket,
   cancelTicket,
   changeUserPassword,
@@ -66,7 +67,7 @@ WebBrowser.maybeCompleteAuthSession();
 void configureNotificationHandlingAsync();
 const APP_LOGO = require('../logo.png');
 const ONBOARDING_COMPLETE_KEY = 'bites_onboarding_complete_v1';
-const SHOW_ONBOARDING_EVERY_LOGIN_FOR_TESTING = true;
+const SHOW_ONBOARDING_EVERY_LOGIN_FOR_TESTING = false;
 
 const HomeScreen = lazy(async () => {
   const module = await import('./components/HomeScreen');
@@ -107,9 +108,11 @@ function AppContent() {
   const [selectedEvent, setSelectedEvent] = useState<AppEvent | null>(null);
   const [selectedTicket, setSelectedTicket] = useState<AppTicket | null>(null);
   const [activeTab, setActiveTab] = useState<TabId>('discover');
+  const [homeDrawerOpen, setHomeDrawerOpen] = useState(false);
   const [direction, setDirection] = useState<1 | -1>(1);
   const [tabDirection, setTabDirection] = useState<1 | -1>(1);
   const [isBootstrapping, setIsBootstrapping] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const [editingListing, setEditingListing] = useState<AppEvent | null>(null);
   const [createPending, setCreatePending] = useState(false);
@@ -119,7 +122,6 @@ function AppContent() {
   const [updatePolicy, setUpdatePolicy] = useState<AppUpdatePolicy | null>(null);
   const [updateDismissedVersion, setUpdateDismissedVersion] = useState<string | null>(null);
   const [onboardingStage, setOnboardingStage] = useState<OnboardingStage>('checking');
-  const [onboardingTargets, setOnboardingTargets] = useState<Partial<Record<TabId, { x: number; y: number }>>>({});
   const lastHandledAuthUrl = useRef<string | null>(null);
   const pushTokenRef = useRef<string | null>(null);
   const updatePrompt = useMemo(() => {
@@ -138,8 +140,10 @@ function AppContent() {
     };
   }, [updateDismissedVersion, updatePolicy]);
 
-  const loadApp = useCallback(async () => {
-    setIsBootstrapping(true);
+  const loadApp = useCallback(async (options?: { background?: boolean }) => {
+    if (!options?.background) {
+      setIsBootstrapping(true);
+    }
     setBootstrapError(null);
 
     try {
@@ -170,9 +174,24 @@ function AppContent() {
     } catch (error) {
       setBootstrapError('We could not load the latest content. Check your connection and try again.');
     } finally {
-      setIsBootstrapping(false);
+      if (!options?.background) {
+        setIsBootstrapping(false);
+      }
     }
   }, []);
+
+  const handleRefreshApp = useCallback(async () => {
+    if (isRefreshing) {
+      return;
+    }
+
+    setIsRefreshing(true);
+    try {
+      await loadApp({ background: true });
+    } finally {
+      setIsRefreshing(false);
+    }
+  }, [isRefreshing, loadApp]);
 
   useEffect(() => {
     let cancelled = false;
@@ -530,19 +549,22 @@ function AppContent() {
 
     setSelectedTicket((current) => {
       if (current) {
-        const matchingCurrent = tickets.find((ticket) => ticket.id === current.id);
+        const matchingCurrent =
+          tickets.find((ticket) => ticket.id === current.id) ??
+          receivedTickets.find((ticket) => ticket.id === current.id);
         if (matchingCurrent) {
           return matchingCurrent;
         }
       }
 
       return (
-        tickets.find((ticket) => ticket.eventId === selectedEvent.id && ticket.status === 'confirmed') ??
+        tickets.find((ticket) => ticket.eventId === selectedEvent.id && ['confirmed', 'accepted'].includes(ticket.status)) ??
         tickets.find((ticket) => ticket.eventId === selectedEvent.id) ??
+        receivedTickets.find((ticket) => ticket.eventId === selectedEvent.id) ??
         null
       );
     });
-  }, [selectedEvent, tickets]);
+  }, [receivedTickets, selectedEvent, tickets]);
 
   const handleSelectEvent = (event: AppEvent) => {
     promoteHistoryEvent(event);
@@ -566,7 +588,7 @@ function AppContent() {
     }
 
     const existingTicket =
-      tickets.find((ticket) => ticket.eventId === selectedEvent.id && ticket.status === 'confirmed') ?? null;
+      tickets.find((ticket) => ticket.eventId === selectedEvent.id && ['confirmed', 'accepted'].includes(ticket.status)) ?? null;
 
     if (existingTicket) {
       setSelectedTicket(existingTicket);
@@ -597,13 +619,16 @@ function AppContent() {
         return current.map((item) => (item.id === ticket.id ? ticket : item));
       });
       setSelectedTicket(ticket);
-      updateEventState(selectedEvent.id, { hasTicket: ticket.status === 'confirmed' });
+      updateEventState(selectedEvent.id, { hasTicket: ['confirmed', 'accepted'].includes(ticket.status) });
 
-      if (ticket.status === 'confirmed') {
+      if (['confirmed', 'accepted', 'requested'].includes(ticket.status)) {
         startTransition(() => {
           setDirection(1);
           setCurrentScreen('ticket');
         });
+        if (ticket.status === 'requested') {
+          Alert.alert('Request sent', 'The host will review your request and confirm it in the app.');
+        }
       } else if (ticket.status === 'pending') {
         Alert.alert('Payment pending', 'Approve the payment on your phone. We will keep checking and update your booking.');
       } else {
@@ -718,6 +743,24 @@ function AppContent() {
     Alert.alert('Ticket updated', response.message);
   }, [categories, receivedTickets, selectedEvent?.id, tickets, updateEventState]);
 
+  const handleAcceptTicket = useCallback(async (ticket: AppTicket) => {
+    const response = await acceptTicket(ticket.id, categories);
+    const wasInMyTickets = tickets.some((item) => item.id === ticket.id);
+    const wasInReceivedTickets = receivedTickets.some((item) => item.id === ticket.id);
+
+    setTickets((current) => (wasInMyTickets ? upsertTicketItem(current, response.ticket) : current));
+    setReceivedTickets((current) => (wasInReceivedTickets ? upsertTicketItem(current, response.ticket) : current));
+    setSelectedTicket((current) => (current?.id === response.ticket.id ? response.ticket : current));
+
+    if (wasInMyTickets) {
+      const nextUserTickets = tickets.map((item) => (item.id === response.ticket.id ? response.ticket : item));
+      const hasConfirmed = hasConfirmedTicketForEvent(nextUserTickets, response.ticket.eventId);
+      updateEventState(response.ticket.eventId, { hasTicket: hasConfirmed });
+    }
+
+    Alert.alert('Booking confirmed', response.message);
+  }, [categories, receivedTickets, tickets, updateEventState]);
+
   const handleBack = () => {
     startTransition(() => {
       setDirection(-1);
@@ -771,6 +814,19 @@ function AppContent() {
 
     if (!notification.listingId) {
       return;
+    }
+
+    if (notification.type === 'booking') {
+      const receivedTicket = receivedTickets.find((ticket) => ticket.eventId === notification.listingId);
+      if (receivedTicket) {
+        setSelectedEvent(receivedTicket.event);
+        setSelectedTicket(receivedTicket);
+        startTransition(() => {
+          setDirection(1);
+          setCurrentScreen('ticket');
+        });
+        return;
+      }
     }
 
     const target =
@@ -867,7 +923,7 @@ function AppContent() {
     if (event.ownerCanEdit === false) {
       Alert.alert(
         'Edit window closed',
-        'Listings can only be edited within the first 24 hours after posting.',
+        'Listings can only be edited within the first 48 hours after posting.',
       );
       return;
     }
@@ -1022,8 +1078,15 @@ function AppContent() {
   }, []);
 
   const handleOnboardingMenuOpen = useCallback(() => {
-    setOnboardingStage((current) => (current === 'menu' ? 'success' : current));
-  }, []);
+    setOnboardingStage((current) => {
+      if (current !== 'menu') {
+        return current;
+      }
+
+      handleTabChange('discover');
+      return 'success';
+    });
+  }, [handleTabChange]);
 
   const handleOnboardingFinish = useCallback(() => {
     setOnboardingStage('done');
@@ -1074,6 +1137,7 @@ function AppContent() {
                 notifications={notifications}
                 receivedTickets={receivedTickets}
                 onCancelEditListing={handleCancelEditListing}
+                onAcceptTicket={handleAcceptTicket}
                 onCancelTicket={handleCancelTicket}
                 onClearHistory={handleClearHistory}
                 onCreateEvent={handleSubmitListing}
@@ -1093,9 +1157,13 @@ function AppContent() {
                 onTogglePushNotifications={handleTogglePushNotifications}
                 onToggleSave={handleToggleSave}
                 onUpdateProfile={handleUpdateProfile}
+                onRefresh={handleRefreshApp}
                 onDiscoverScroll={handleOnboardingDiscoverScroll}
                 onMenuOpen={handleOnboardingMenuOpen}
+                onMenuVisibilityChange={setHomeDrawerOpen}
                 profile={profile}
+                refreshing={isRefreshing}
+                showMenuTapCue={onboardingStage === 'menu'}
                 tabDirection={tabDirection}
                 tickets={tickets}
                 unreadNotificationCount={unreadNotificationCount}
@@ -1118,7 +1186,9 @@ function AppContent() {
                   })
                 }
                 onRate={handleRateEvent}
+                onRefresh={handleRefreshApp}
                 profile={profile}
+                refreshing={isRefreshing}
                 onToggleSave={() => void handleToggleSave(selectedEvent)}
               />
             </Suspense>
@@ -1131,8 +1201,10 @@ function AppContent() {
               <NearbyScreen
                 events={events}
                 onBack={handleBack}
+                onRefresh={handleRefreshApp}
                 onOpenEvent={handleSelectEvent}
                 profile={profile}
+                refreshing={isRefreshing}
               />
             </Suspense>
           </ScreenTransition>
@@ -1144,30 +1216,21 @@ function AppContent() {
               <TicketScreen
                 event={selectedEvent}
                 ticket={selectedTicket}
+                onAcceptTicket={handleAcceptTicket}
                 onBack={handleBack}
                 onCancelTicket={handleCancelTicket}
+                onRefresh={handleRefreshApp}
+                refreshing={isRefreshing}
               />
             </Suspense>
           </ScreenTransition>
         ) : null}
 
-        {authState === 'signedIn' && !showStartupState && currentScreen === 'home' ? (
+        {authState === 'signedIn' && !showStartupState && currentScreen === 'home' && !homeDrawerOpen ? (
           <BottomNav
             activeTab={activeTab}
             onTabChange={handleTabChange}
-            onTabTargetLayout={(tab, target) =>
-              setOnboardingTargets((current) => {
-                const previous = current[tab];
-                if (previous && Math.abs(previous.x - target.x) < 0.5 && Math.abs(previous.y - target.y) < 0.5) {
-                  return current;
-                }
-
-                return {
-                  ...current,
-                  [tab]: target,
-                };
-              })
-            }
+            showCreateTapCue={onboardingStage === 'create'}
             unreadCount={unreadNotificationCount}
           />
         ) : null}
@@ -1185,7 +1248,6 @@ function AppContent() {
 
         {authState === 'signedIn' && !showStartupState ? (
           <OnboardingOverlay
-            createTarget={onboardingTargets.create}
             stage={onboardingStage}
             onNext={handleOnboardingNext}
             onFinish={handleOnboardingFinish}
@@ -1252,7 +1314,7 @@ function AppUpdateModal({
 
           <Pressable accessibilityRole="button" onPress={openUpdate}>
             <LinearGradient
-              colors={['#E53935', '#FF6B3D', '#FFB15C']}
+              colors={['#E53935', '#F2221C', '#FF9A96']}
               locations={[0, 0.46, 1]}
               start={{ x: 0, y: 0.5 }}
               end={{ x: 1, y: 0.5 }}
@@ -1355,7 +1417,7 @@ function upsertTicketItem(current: AppTicket[], nextTicket: AppTicket) {
 }
 
 function hasConfirmedTicketForEvent(tickets: AppTicket[], eventId: string) {
-  return tickets.some((ticket) => ticket.eventId === eventId && ticket.status === 'confirmed');
+  return tickets.some((ticket) => ticket.eventId === eventId && ['confirmed', 'accepted'].includes(ticket.status));
 }
 
 async function readOnboardingCompleted() {
@@ -1442,7 +1504,7 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
     backgroundColor: '#0A0D13',
     borderWidth: 1,
-    borderColor: 'rgba(255,107,61,0.24)',
+    borderColor: 'rgba(242,34,28,0.24)',
   },
   updateLogo: {
     width: '100%',
@@ -1460,7 +1522,7 @@ const styles = StyleSheet.create({
     letterSpacing: 0.2,
   },
   updatePublisher: {
-    color: '#FFB15C',
+    color: '#FF9A96',
     fontSize: 13,
     fontWeight: '900',
     letterSpacing: 0.8,

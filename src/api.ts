@@ -11,6 +11,7 @@ import {
   AppEventCategory,
   AppIconName,
   AppNotification,
+  AppSearchSuggestion,
   AppTicket,
   AppUpdatePolicy,
   AppUser,
@@ -191,6 +192,14 @@ type BackendAppVersionResponse = {
   message: string;
 };
 
+type BackendSearchSuggestion = {
+  id?: string | number;
+  label: string;
+  query?: string;
+  type?: AppSearchSuggestion['type'];
+  hint?: string | null;
+};
+
 type BackendTicket = {
   id: number;
   listing?: BackendListing;
@@ -209,8 +218,10 @@ type BackendTicket = {
   payment_status?: AppTicket['paymentStatus'];
   payment_method?: string | null;
   payer_phone?: string | null;
+  request_note?: string | null;
   paynow_reference?: string | null;
   can_cancel?: boolean;
+  can_accept?: boolean;
   can_mark_used?: boolean;
   can_manage?: boolean;
   booked_at: string;
@@ -469,6 +480,101 @@ export async function fetchAppFeed({
   };
 }
 
+export async function fetchAppSearchSuggestions({
+  categoryId = 'all',
+  query = '',
+  limit = 8,
+}: {
+  categoryId?: string;
+  query?: string;
+  limit?: number;
+} = {}): Promise<AppSearchSuggestion[]> {
+  const params = new URLSearchParams({
+    limit: String(limit),
+  });
+  const trimmedQuery = query.trim();
+
+  if (trimmedQuery) {
+    params.set('q', trimmedQuery);
+  }
+
+  if (categoryId && categoryId !== 'all') {
+    params.set('category', categoryId);
+  }
+
+  const payload = await apiFetchJson<{ results?: BackendSearchSuggestion[] }>(
+    `/listings/app-search-suggestions/?${params.toString()}`,
+  );
+
+  return (payload.results ?? [])
+    .map((suggestion, index) => ({
+      id: String(suggestion.id ?? `${suggestion.type ?? 'suggestion'}-${index}`),
+      label: suggestion.label,
+      query: suggestion.query ?? suggestion.label,
+      type: suggestion.type ?? 'popular',
+      hint: suggestion.hint ?? undefined,
+    }))
+    .filter((suggestion) => suggestion.label.trim().length > 0 && suggestion.query.trim().length > 0);
+}
+
+export async function recordSearchQuery({
+  categoryId = 'all',
+  query,
+  resultCount = 0,
+}: {
+  categoryId?: string;
+  query: string;
+  resultCount?: number;
+}) {
+  const trimmedQuery = query.trim();
+  if (!trimmedQuery) {
+    return;
+  }
+
+  await apiFetchJson<{ ok: boolean }>('/listings/app-search-log/', {
+    method: 'POST',
+    body: JSON.stringify({
+      category: categoryId,
+      query: trimmedQuery,
+      result_count: resultCount,
+    }),
+  });
+}
+
+export async function fetchAppSpotlight({
+  categories,
+  categoryId = 'all',
+  latitude,
+  longitude,
+  limit = 4,
+}: {
+  categories: AppCategory[];
+  categoryId?: string;
+  latitude?: number | null;
+  longitude?: number | null;
+  limit?: number;
+}): Promise<AppEvent[]> {
+  const params = new URLSearchParams({
+    limit: String(limit),
+  });
+
+  if (categoryId && categoryId !== 'all') {
+    params.set('category', categoryId);
+  }
+
+  if (typeof latitude === 'number' && Number.isFinite(latitude)) {
+    params.set('lat', latitude.toFixed(6));
+  }
+
+  if (typeof longitude === 'number' && Number.isFinite(longitude)) {
+    params.set('lng', longitude.toFixed(6));
+  }
+
+  const payload = await apiFetchJson<{ results?: BackendListing[] }>(`/listings/app-spotlight/?${params.toString()}`);
+  const categoryLookup = new Map(categories.map((category) => [category.id, category]));
+  return (payload.results ?? []).map((listing) => mapListingToEvent(listing, categoryLookup));
+}
+
 export async function recordListingView(eventId: string) {
   await apiFetchJson(`/listings/${eventId}/record-view/`, {
     method: 'POST',
@@ -618,6 +724,7 @@ export async function bookEventTicket(eventId: string, categories: AppCategory[]
       payment_method: input?.paymentMethod,
       phone: input?.phone,
       quantity: input?.quantity ?? 1,
+      request_note: input?.requestNote,
     }),
   });
   const categoryLookup = new Map(categories.map((category) => [category.id, category]));
@@ -677,6 +784,19 @@ export async function cancelTicket(ticketId: string, categories: AppCategory[]) 
     ticket: mapTicket(response.ticket, categoryLookup),
   };
 }
+
+export async function confirmTicket(ticketId: string, categories: AppCategory[]) {
+  const response = await apiFetchJson<{ message?: string; ticket: BackendTicket }>(`/listings/tickets/${ticketId}/confirm/`, {
+    method: 'POST',
+  });
+  const categoryLookup = new Map(categories.map((category) => [category.id, category]));
+  return {
+    message: response.message ?? 'Booking confirmed.',
+    ticket: mapTicket(response.ticket, categoryLookup),
+  };
+}
+
+export const acceptTicket = confirmTicket;
 
 export async function markTicketUsed(ticketId: string, categories: AppCategory[]) {
   const response = await apiFetchJson<{ message?: string; ticket: BackendTicket }>(`/listings/tickets/${ticketId}/mark-used/`, {
@@ -1340,7 +1460,7 @@ function mapTicket(ticket: BackendTicket, categoryLookup: Map<string, AppCategor
   const event = mapListingToEvent(
     {
       ...fallbackListing,
-      user_has_ticket: true,
+      user_has_ticket: ['confirmed', 'accepted'].includes(ticket.status),
     },
     categoryLookup,
   );
@@ -1362,7 +1482,9 @@ function mapTicket(ticket: BackendTicket, categoryLookup: Map<string, AppCategor
     paymentStatus: ticket.payment_status ?? 'not_required',
     paymentMethod: ticket.payment_method ?? null,
     paynowReference: ticket.paynow_reference ?? null,
+    requestNote: ticket.request_note ?? '',
     canCancel: Boolean(ticket.can_cancel),
+    canAccept: Boolean(ticket.can_accept),
     canMarkUsed: Boolean(ticket.can_mark_used),
     canManage: Boolean(ticket.can_manage),
     bookedAt: ticket.booked_at,

@@ -1052,7 +1052,24 @@ function buildCommentRows(comments: AppComment[], replyLoadingMap: Record<string
 }
 
 function formatCommentCount(count: number) {
-  return `${count} comment${count === 1 ? '' : 's'}`;
+  return `${formatCompactCount(count)} comment${count === 1 ? '' : 's'}`;
+}
+
+function formatCompactCount(count: number) {
+  const safeCount = Math.max(0, Math.floor(Number.isFinite(count) ? count : 0));
+  if (safeCount < 1000) {
+    return String(safeCount);
+  }
+
+  const units = [
+    { value: 1_000_000_000, suffix: 'B' },
+    { value: 1_000_000, suffix: 'M' },
+    { value: 1_000, suffix: 'k' },
+  ];
+  const unit = units.find((item) => safeCount >= item.value) ?? units[2];
+  const value = safeCount / unit.value;
+  const formatted = value >= 10 ? Math.floor(value).toString() : value.toFixed(1).replace(/\.0$/, '');
+  return `${formatted}${unit.suffix}`;
 }
 
 function formatRelativeTime(timestamp: string) {
@@ -1212,7 +1229,7 @@ const styles = StyleSheet.create({
   replyTargetBanner: {
     borderRadius: theme.radius.md,
     borderWidth: 1,
-    borderColor: 'rgba(255,107,61,0.2)',
+    borderColor: 'rgba(242,34,28,0.2)',
     backgroundColor: theme.colors.accentSoft,
     paddingHorizontal: 12,
     paddingVertical: 10,
@@ -1417,8 +1434,8 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   commentCardPinned: {
-    borderColor: 'rgba(255,107,61,0.26)',
-    backgroundColor: 'rgba(255,107,61,0.02)',
+    borderColor: 'rgba(242,34,28,0.26)',
+    backgroundColor: 'rgba(242,34,28,0.02)',
   },
   commentHeader: {
     flexDirection: 'row',
@@ -1542,7 +1559,7 @@ const styles = StyleSheet.create({
     borderRadius: theme.radius.pill,
     backgroundColor: theme.colors.surfaceStrong,
     borderWidth: 1,
-    borderColor: 'rgba(255,107,61,0.18)',
+    borderColor: 'rgba(242,34,28,0.18)',
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,

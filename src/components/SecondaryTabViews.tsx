@@ -3,11 +3,13 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
+  Easing,
   FlatList,
   Linking,
   Modal,
   Platform,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
@@ -21,7 +23,7 @@ import DateTimePicker, { type DateTimePickerEvent } from '@react-native-communit
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { Feather } from '@expo/vector-icons';
 import { Image } from 'expo-image';
-import { ResizeMode, Video } from 'expo-av';
+import { ResizeMode, type AVPlaybackStatus, Video } from 'expo-av';
 import * as ImagePicker from 'expo-image-picker';
 import * as Location from 'expo-location';
 import * as VideoThumbnails from 'expo-video-thumbnails';
@@ -44,7 +46,6 @@ import {
 import { Tag, useJellyPressAnimation } from './Primitives';
 
 type FeatherName = React.ComponentProps<typeof Feather>['name'];
-type CreateStep = 0 | 1 | 2;
 type PriceRange = CreateAppEventInput['priceRange'];
 type SelectOption = {
   value: string;
@@ -153,12 +154,16 @@ type StreamVideoItem = {
 
 export function StreamTabView({
   events,
+  onRefresh,
   onSelectEvent,
   onToggleSave,
+  refreshing,
 }: {
   events: AppEvent[];
+  onRefresh: () => Promise<void>;
   onSelectEvent: (event: AppEvent) => void;
   onToggleSave: (event: AppEvent) => void;
+  refreshing: boolean;
 }) {
   const insets = useSafeAreaInsets();
   const { height } = useWindowDimensions();
@@ -221,6 +226,15 @@ export function StreamTabView({
         windowSize={3}
         removeClippedSubviews
         onViewableItemsChanged={onViewableItemsChanged}
+        refreshControl={
+          <RefreshControl
+            colors={[theme.colors.accentStrong]}
+            progressBackgroundColor={theme.colors.surfaceStrong}
+            refreshing={refreshing}
+            tintColor={theme.colors.accentStrong}
+            onRefresh={() => void onRefresh()}
+          />
+        }
         viewabilityConfig={viewabilityConfig}
         showsVerticalScrollIndicator={false}
         renderItem={({ item }) => (
@@ -272,20 +286,22 @@ export function StreamTabView({
 export function InboxTabView({
   notifications,
   receivedTickets,
+  searchQuery,
   tickets,
-  unreadCount,
-  onMarkAllRead,
+  onAcceptTicket,
   onOpenNotification,
   onOpenTicket,
 }: {
   notifications: AppNotification[];
   receivedTickets: AppTicket[];
+  searchQuery: string;
   tickets: AppTicket[];
-  unreadCount: number;
-  onMarkAllRead: () => void;
+  onAcceptTicket: (ticket: AppTicket) => Promise<void>;
   onOpenNotification: (notification: AppNotification) => void;
   onOpenTicket: (ticket: AppTicket) => void;
 }) {
+  const [confirmingTicketId, setConfirmingTicketId] = useState<string | null>(null);
+  const normalizedInboxQuery = searchQuery.trim().toLowerCase();
   const ticketActivity = useMemo(
     () =>
       [
@@ -296,101 +312,148 @@ export function InboxTabView({
           subtitle: ticket.event.title,
           kind: 'Received',
         })),
-      ]
-        .sort((left, right) => Date.parse(right.ticket.updatedAt || right.ticket.bookedAt) - Date.parse(left.ticket.updatedAt || left.ticket.bookedAt))
-        .slice(0, 8),
+      ].sort((left, right) => Date.parse(right.ticket.updatedAt || right.ticket.bookedAt) - Date.parse(left.ticket.updatedAt || left.ticket.bookedAt)),
     [receivedTickets, tickets],
   );
+  const visibleTicketActivity = useMemo(() => {
+    const filtered = normalizedInboxQuery
+      ? ticketActivity.filter((item) => matchesTicketActivitySearch(item, normalizedInboxQuery))
+      : ticketActivity;
+
+    return filtered.slice(0, normalizedInboxQuery ? 24 : 8);
+  }, [normalizedInboxQuery, ticketActivity]);
+  const visibleNotifications = useMemo(
+    () =>
+      normalizedInboxQuery
+        ? notifications.filter((notification) => matchesNotificationSearch(notification, normalizedInboxQuery))
+        : notifications,
+    [normalizedInboxQuery, notifications],
+  );
+  const hasInboxResults = visibleTicketActivity.length > 0 || visibleNotifications.length > 0;
+  const handleQuickConfirm = async (ticket: AppTicket) => {
+    setConfirmingTicketId(ticket.id);
+    try {
+      await onAcceptTicket(ticket);
+    } catch (error) {
+      Alert.alert('Confirm failed', error instanceof Error ? error.message : 'The booking could not be confirmed right now.');
+    } finally {
+      setConfirmingTicketId(null);
+    }
+  };
 
   return (
     <View style={styles.sectionStack}>
-      <View style={[styles.sectionHeading, styles.sectionHeadingTight]}>
-        <View style={styles.inboxHeadingCopy}>
-          <Text style={styles.sectionTitle}>Inbox</Text>
-          <Text style={styles.sectionCopy}>Tickets, booking moves, and event nudges land here.</Text>
-        </View>
-
-        <InboxReadAllButton
-          disabled={unreadCount === 0}
-          label={unreadCount > 0 ? `Read all ${unreadCount}` : 'Caught up'}
-          onPress={onMarkAllRead}
-        />
-      </View>
-
-      {ticketActivity.length > 0 ? (
+      {visibleTicketActivity.length > 0 ? (
         <View style={styles.profileSection}>
           <View style={styles.compactSectionHeader}>
             <View style={styles.compactSectionCopy}>
               <Text style={styles.compactSectionTitle}>Ticket activity</Text>
-              <Text style={styles.compactSectionHint}>Bookings and received tickets</Text>
+              <Text style={styles.compactSectionHint}>
+                {normalizedInboxQuery ? `${visibleTicketActivity.length} ticket match${visibleTicketActivity.length === 1 ? '' : 'es'}` : 'Bookings and received tickets'}
+              </Text>
             </View>
           </View>
 
           <View style={styles.ticketManagementList}>
-            {ticketActivity.map(({ ticket, title, subtitle, kind }) => (
-              <TicketManagementRow
+            {visibleTicketActivity.map(({ ticket, title, subtitle, kind }) => (
+              <InboxTicketActivityCard
                 key={`inbox-ticket-${kind}-${ticket.id}`}
+                imageSource={ticket.event.ticketImage ?? ticket.event.image}
+                isConfirming={confirmingTicketId === ticket.id}
                 title={title}
                 subtitle={subtitle}
                 meta={`${kind} ticket | Ref ${ticket.referenceCode} | ${formatTicketDate(ticket.bookedAt)}`}
+                onConfirm={kind === 'Received' && ticket.canAccept ? () => void handleQuickConfirm(ticket) : undefined}
                 status={ticket.status}
-                primaryActionLabel="Open"
-                onPrimaryAction={() => onOpenTicket(ticket)}
+                onPress={() => onOpenTicket(ticket)}
               />
             ))}
           </View>
         </View>
       ) : null}
 
-      {notifications.length === 0 ? (
+      {!hasInboxResults ? (
         <EmptyState
-          icon="message-circle"
-          title="Your inbox is quiet"
-          copy="Once tickets or listing updates arrive, they will show up here."
+          icon={normalizedInboxQuery ? 'search' : 'message-circle'}
+          title={normalizedInboxQuery ? 'No inbox matches' : 'Your inbox is quiet'}
+          copy={normalizedInboxQuery ? 'Try a ticket reference, event name, venue, or notification keyword.' : 'Once tickets or listing updates arrive, they will show up here.'}
         />
-      ) : (
+      ) : visibleNotifications.length > 0 ? (
         <View style={styles.notificationList}>
-          {notifications.map((notification) => (
-            <NotificationCard
-              key={notification.id}
-              notification={notification}
-              onPress={() => onOpenNotification(notification)}
-            />
-          ))}
+          {visibleNotifications.map((notification) => {
+            const confirmTicket =
+              notification.type === 'booking'
+                ? receivedTickets.find((ticket) => ticket.eventId === notification.listingId && ticket.canAccept)
+                : undefined;
+
+            return (
+              <NotificationCard
+                key={notification.id}
+                isConfirming={confirmTicket ? confirmingTicketId === confirmTicket.id : false}
+                notification={notification}
+                onConfirm={confirmTicket ? () => void handleQuickConfirm(confirmTicket) : undefined}
+                onPress={() => onOpenNotification(notification)}
+              />
+            );
+          })}
         </View>
-      )}
+      ) : null}
     </View>
   );
 }
 
-function InboxReadAllButton({
-  disabled,
-  label,
-  onPress,
-}: {
-  disabled: boolean;
-  label: string;
-  onPress: () => void;
-}) {
-  const jelly = useJellyPressAnimation({
-    pressedScaleX: 1.018,
-    pressedScaleY: 0.94,
-  });
+function matchesTicketActivitySearch(
+  item: {
+    ticket: AppTicket;
+    title: string;
+    subtitle: string;
+    kind: string;
+  },
+  query: string,
+) {
+  return [
+    item.kind,
+    item.title,
+    item.subtitle,
+    item.ticket.referenceCode,
+    item.ticket.status,
+    item.ticket.buyerName,
+    item.ticket.event.artist,
+    item.ticket.event.city,
+    item.ticket.event.venue,
+  ]
+    .filter(Boolean)
+    .some((value) => String(value).toLowerCase().includes(query));
+}
 
-  return (
-    <Pressable
-      disabled={disabled}
-      onPress={onPress}
-      onPressIn={jelly.onPressIn}
-      onPressOut={jelly.onPressOut}
-      style={styles.inboxReadAllPressable}
-    >
-      <Animated.View style={[styles.inboxReadAllButton, disabled && styles.inboxReadAllButtonDisabled, jelly.animatedStyle]}>
-        <Feather color={disabled ? theme.colors.textSoft : theme.colors.accentStrong} name="check" size={13} />
-        <Text style={[styles.inboxReadAllText, disabled && styles.inboxReadAllTextDisabled]}>{label}</Text>
-      </Animated.View>
-    </Pressable>
-  );
+function matchesNotificationSearch(notification: AppNotification, query: string) {
+  return [
+    notification.title,
+    notification.message,
+    notification.type,
+    notification.listingName,
+    notification.createdAt,
+  ]
+    .filter(Boolean)
+    .some((value) => String(value).toLowerCase().includes(query));
+}
+
+function matchesTicketSearch(ticket: AppTicket, query: string) {
+  return [
+    ticket.referenceCode,
+    ticket.status,
+    ticket.paymentStatus,
+    ticket.actionType,
+    ticket.buyerName,
+    ticket.buyerEmail,
+    ticket.event.title,
+    ticket.event.venue,
+    ticket.event.city,
+    ticket.event.price,
+    ticket.bookedAt,
+  ]
+    .filter(Boolean)
+    .some((value) => String(value).toLowerCase().includes(query));
 }
 
 export function CreateTabView({
@@ -418,12 +481,11 @@ export function CreateTabView({
     () => categories.filter((category) => category.id !== 'all'),
     [categories],
   );
-  const [step, setStep] = useState<CreateStep>(0);
   const [draft, setDraft] = useState<CreateDraft>(() => buildInitialDraft(selectableCategories));
   const [localError, setLocalError] = useState<string | null>(null);
   const [pickerMode, setPickerMode] = useState<'date' | 'time' | null>(null);
   const [detectingLocation, setDetectingLocation] = useState(false);
-  const [activeQuickSheet, setActiveQuickSheet] = useState<'details' | 'schedule' | 'location' | 'tags' | null>(null);
+  const [activeQuickSheet, setActiveQuickSheet] = useState<'details' | 'schedule' | 'location' | 'socials' | 'tags' | 'others' | null>(null);
   const insets = useSafeAreaInsets();
   const selectedTags = useMemo(() => splitCommaList(draft.tagsText), [draft.tagsText]);
   const selectedSchedule = useMemo(() => readScheduledDate(draft.scheduledAt), [draft.scheduledAt]);
@@ -493,13 +555,11 @@ export function CreateTabView({
   useEffect(() => {
     if (editingEvent) {
       setDraft(buildDraftFromEvent(editingEvent, selectableCategories));
-      setStep(0);
       setLocalError(null);
       return;
     }
 
     setDraft(buildInitialDraft(selectableCategories));
-    setStep(0);
     setLocalError(null);
   }, [editingEvent, selectableCategories]);
 
@@ -699,42 +759,25 @@ export function CreateTabView({
   const handleStoryChange = (value: string) => {
     setDraft((current) => ({
       ...current,
-      about: value,
-      blurb: current.blurb.trim() ? current.blurb : value.split('\n').map((item) => item.trim()).find(Boolean) ?? '',
+      blurb: value,
+      about: current.about.trim() ? current.about : value,
     }));
   };
 
-  const handleNext = () => {
-    const validation = validateRequiredStep(draft, Boolean(editingEvent));
-    if (validation) {
-      setLocalError(validation);
-      return;
+  const handleStartFresh = () => {
+    if (editingEvent) {
+      onCancelEdit();
     }
-
+    setDraft(buildInitialDraft(selectableCategories));
+    setActiveQuickSheet(null);
+    setPickerMode(null);
     setLocalError(null);
-    setStep((current) => Math.min(2, current + 1) as CreateStep);
-  };
-
-  const handleBack = () => {
-    setLocalError(null);
-    setStep((current) => Math.max(0, current - 1) as CreateStep);
-  };
-
-  const handleSkip = async () => {
-    if (step === 2) {
-      await handlePublish();
-      return;
-    }
-
-    setLocalError(null);
-    setStep((current) => Math.min(2, current + 1) as CreateStep);
   };
 
   const handlePublish = async () => {
     const validation = validateRequiredStep(draft, Boolean(editingEvent));
     if (validation) {
       setLocalError(validation);
-      setStep(0);
       return;
     }
 
@@ -743,7 +786,7 @@ export function CreateTabView({
     try {
       await onSubmit(buildCreateInput(draft, editingEvent?.media ?? []));
       setDraft(buildInitialDraft(selectableCategories));
-      setStep(0);
+      setActiveQuickSheet(null);
     } catch (error) {
       return;
     }
@@ -751,23 +794,8 @@ export function CreateTabView({
 
   return (
     <View style={styles.sectionStack}>
-      <View style={styles.createComposerTopBar}>
-        <Pressable
-          disabled={!editingEvent}
-          onPress={onCancelEdit}
-          style={styles.createComposerTopIcon}
-        >
-          <Feather color={editingEvent ? theme.colors.text : theme.colors.textSoft} name={'x' as FeatherName} size={24} />
-        </Pressable>
-        <Text style={styles.createComposerTopTitle}>{editingEvent ? 'Edit post' : 'New post'}</Text>
-        <View style={styles.createComposerTopIcon}>
-          <Feather color={theme.colors.textSoft} name={'more-horizontal' as FeatherName} size={22} />
-        </View>
-      </View>
-
       <View style={styles.formCard}>
-        {step === 0 ? (
-          <View style={styles.createComposerStep}>
+        <View style={styles.createComposerStep}>
             <View style={styles.createComposerProfileRow}>
               <View style={styles.createComposerAvatar}>
                 <Image source={creatorAvatarSource} contentFit="cover" style={styles.createComposerAvatarImage} transition={120} />
@@ -778,6 +806,10 @@ export function CreateTabView({
                   {editingEvent ? 'Updating your listing' : 'Creating a new listing'}
                 </Text>
               </View>
+              <Pressable accessibilityRole="button" onPress={handleStartFresh} style={styles.createComposerPlainAction}>
+                <Feather color={theme.colors.accentStrong} name="plus-circle" size={15} />
+                <Text style={styles.createComposerPlainActionText}>New</Text>
+              </Pressable>
             </View>
 
             <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.createComposerChipRow}>
@@ -808,10 +840,28 @@ export function CreateTabView({
                 onPress={() => setActiveQuickSheet('schedule')}
               />
               <CreateComposerChip
+                active={Boolean(draft.phone.trim() || draft.tiktok.trim() || draft.instagram.trim() || draft.youtube.trim() || draft.facebook.trim() || draft.x.trim())}
+                icon="share-2"
+                label="Socials"
+                onPress={() => setActiveQuickSheet('socials')}
+              />
+              <CreateComposerChip
                 active={selectedTags.length > 0}
                 icon="tag"
                 label={tagChipLabel}
                 onPress={() => setActiveQuickSheet('tags')}
+              />
+              <CreateComposerChip
+                active={Boolean(draft.price.trim())}
+                icon="dollar-sign"
+                label={draft.price.trim() || selectedPriceRangeOption?.label || 'Price'}
+                onPress={() => setActiveQuickSheet('details')}
+              />
+              <CreateComposerChip
+                active={Boolean(draft.about.trim() || draft.highlightsText.trim() || draft.email.trim() || draft.website.trim() || draft.locationNote.trim())}
+                icon="more-horizontal"
+                label="Others"
+                onPress={() => setActiveQuickSheet('others')}
               />
             </ScrollView>
 
@@ -830,12 +880,24 @@ export function CreateTabView({
               ) : null}
               <TextInput
                 multiline
-                placeholder="What's on your mind?"
+                placeholder="Short text for the home feed card"
                 placeholderTextColor={theme.colors.textSoft}
                 style={styles.createComposerStoryInput}
                 textAlignVertical="top"
-                value={draft.about || draft.blurb}
+                value={draft.blurb}
                 onChangeText={handleStoryChange}
+              />
+            </View>
+
+            <View style={styles.createComposerInlinePrice}>
+              <Feather color={theme.colors.textMuted} name="dollar-sign" size={14} />
+              <TextInput
+                keyboardType="default"
+                onChangeText={(value) => setField('price', value)}
+                placeholder="Set price, e.g. $18 or Free"
+                placeholderTextColor={theme.colors.textSoft}
+                style={styles.createComposerInlinePriceInput}
+                value={draft.price}
               />
             </View>
 
@@ -877,216 +939,7 @@ export function CreateTabView({
                 onRemove={handleRemoveGalleryMedia}
               />
             ) : null}
-          </View>
-        ) : null}
-
-        {step === 1 ? (
-          <View style={styles.formStepStack}>
-            <StepIntro
-              title="Timing and story"
-              copy="This screen is optional. Pick the schedule quickly, then add the story if you want."
-            />
-
-            <View style={styles.fieldGroup}>
-              <FieldLabel label="Date and time" optional />
-              <View style={styles.utilityCard}>
-                <View style={styles.utilityCardHeader}>
-                  <View style={styles.utilityTextWrap}>
-                    <Text style={styles.utilityTitle}>{scheduleSummary}</Text>
-                    <Text style={styles.utilityCopy}>
-                      {selectedSchedule ? 'Update the schedule whenever you need to.' : 'Choose when this listing should happen.'}
-                    </Text>
-                  </View>
-                  <Feather color={theme.colors.accentStrong} name="calendar" size={16} />
-                </View>
-
-                <View style={styles.utilityButtonRow}>
-                  <CompactActionButton
-                    icon="calendar"
-                    label={selectedSchedule ? 'Change date' : 'Pick date'}
-                    onPress={() => handleOpenPicker('date')}
-                    tone="muted"
-                  />
-                  <CompactActionButton
-                    icon="clock"
-                    label={selectedSchedule ? 'Change time' : 'Pick time'}
-                    onPress={() => handleOpenPicker('time')}
-                    tone="muted"
-                  />
-                </View>
-
-                {pickerMode ? (
-                  <View style={styles.pickerWrap}>
-                    <DateTimePicker
-                      display={Platform.OS === 'ios' ? 'spinner' : 'default'}
-                      mode={pickerMode}
-                      minimumDate={pickerMode === 'date' ? new Date() : undefined}
-                      onChange={handlePickerChange}
-                      value={selectedSchedule ?? new Date()}
-                    />
-                    {Platform.OS !== 'android' ? (
-                      <View style={styles.pickerActions}>
-                        <CompactActionButton icon="check" label="Done" onPress={() => setPickerMode(null)} tone="accent" />
-                      </View>
-                    ) : null}
-                  </View>
-                ) : null}
-              </View>
-            </View>
-
-            <CompactField
-              label="Short blurb"
-              placeholder="A rooftop night with warm plates and vinyl textures."
-              value={draft.blurb}
-              onChangeText={(value) => setField('blurb', value)}
-              optional
-              multiline
-            />
-            <CompactField
-              label="About"
-              placeholder="Write a fuller story for the listing if you want."
-              value={draft.about}
-              onChangeText={(value) => setField('about', value)}
-              optional
-              multiline
-            />
-            <CompactField
-              label="Highlights"
-              placeholder={'Ocean view\nLive band\nSignature cocktails'}
-              value={draft.highlightsText}
-              onChangeText={(value) => setField('highlightsText', value)}
-              optional
-              multiline
-            />
-          </View>
-        ) : null}
-
-        {step === 2 ? (
-          <View style={styles.formStepStack}>
-            <StepIntro
-              title="Location and contact"
-              copy="This last screen is also skippable. Detect the place in one tap, then add contact details if you want."
-            />
-
-            <View style={styles.fieldGroup}>
-              <FieldLabel label="Location" optional />
-              <View style={styles.utilityCard}>
-                <View style={styles.utilityCardHeader}>
-                  <View style={styles.utilityTextWrap}>
-                    <Text style={styles.utilityTitle}>{draft.locationLabel.trim() || 'Use current location'}</Text>
-                    <Text style={styles.utilityCopy}>{locationSummary}</Text>
-                  </View>
-                  {detectingLocation ? (
-                    <ActivityIndicator color={theme.colors.accentStrong} />
-                  ) : (
-                    <Feather color={theme.colors.accentStrong} name="map-pin" size={16} />
-                  )}
-                </View>
-                <View style={styles.utilityButtonRow}>
-                  <CompactActionButton
-                    disabled={detectingLocation}
-                    icon="map-pin"
-                    label={detectingLocation ? 'Finding...' : 'Use current location'}
-                    onPress={() => void handleDetectLocation()}
-                    tone="muted"
-                  />
-                </View>
-              </View>
-            </View>
-
-            <CompactField
-              label="Address"
-              placeholder="45 Samora Machel Ave"
-              value={draft.address}
-              onChangeText={(value) => setField('address', value)}
-              optional
-            />
-            <CompactField
-              label="Location label"
-              placeholder="Main entrance"
-              value={draft.locationLabel}
-              onChangeText={(value) => setField('locationLabel', value)}
-              optional
-            />
-            <CompactField
-              label="Location note"
-              placeholder="Parking through the side gate."
-              value={draft.locationNote}
-              onChangeText={(value) => setField('locationNote', value)}
-              optional
-              multiline
-            />
-
-            <CompactField
-              label="Phone"
-              placeholder="+263 77 123 4567"
-              value={draft.phone}
-              onChangeText={(value) => setField('phone', value)}
-              optional
-              keyboardType="phone-pad"
-            />
-            <CompactField
-              label="Email"
-              placeholder="host@example.com"
-              value={draft.email}
-              onChangeText={(value) => setField('email', value)}
-              optional
-              keyboardType="email-address"
-            />
-            <CompactField
-              label="Website"
-              placeholder="https://example.com"
-              value={draft.website}
-              onChangeText={(value) => setField('website', value)}
-              optional
-              autoCapitalize="none"
-            />
-
-            <FieldLabel label="Social links" optional />
-            <View style={styles.socialGrid}>
-              <CompactField
-                label="TikTok"
-                placeholder="tiktok.com/@..."
-                value={draft.tiktok}
-                onChangeText={(value) => setField('tiktok', value)}
-                optional
-                autoCapitalize="none"
-              />
-              <CompactField
-                label="Instagram"
-                placeholder="instagram.com/..."
-                value={draft.instagram}
-                onChangeText={(value) => setField('instagram', value)}
-                optional
-                autoCapitalize="none"
-              />
-              <CompactField
-                label="YouTube"
-                placeholder="youtube.com/..."
-                value={draft.youtube}
-                onChangeText={(value) => setField('youtube', value)}
-                optional
-                autoCapitalize="none"
-              />
-              <CompactField
-                label="Facebook"
-                placeholder="facebook.com/..."
-                value={draft.facebook}
-                onChangeText={(value) => setField('facebook', value)}
-                optional
-                autoCapitalize="none"
-              />
-              <CompactField
-                label="X"
-                placeholder="x.com/..."
-                value={draft.x}
-                onChangeText={(value) => setField('x', value)}
-                optional
-                autoCapitalize="none"
-              />
-            </View>
-          </View>
-        ) : null}
+        </View>
 
         <SettingsModalShell
           title="Details"
@@ -1286,6 +1139,114 @@ export function CreateTabView({
           </View>
         </SettingsModalShell>
 
+        <SettingsModalShell
+          title="Socials"
+          visible={activeQuickSheet === 'socials'}
+          onClose={() => setActiveQuickSheet(null)}
+          topInset={insets.top}
+        >
+          <View style={styles.formStepStack}>
+            <CompactField
+              label="Phone"
+              placeholder="+263 77 123 4567"
+              value={draft.phone}
+              onChangeText={(value) => setField('phone', value)}
+              optional
+              keyboardType="phone-pad"
+            />
+            <CompactField
+              label="TikTok"
+              placeholder="tiktok.com/@..."
+              value={draft.tiktok}
+              onChangeText={(value) => setField('tiktok', value)}
+              optional
+              autoCapitalize="none"
+            />
+            <CompactField
+              label="Instagram"
+              placeholder="instagram.com/..."
+              value={draft.instagram}
+              onChangeText={(value) => setField('instagram', value)}
+              optional
+              autoCapitalize="none"
+            />
+            <CompactField
+              label="YouTube"
+              placeholder="youtube.com/..."
+              value={draft.youtube}
+              onChangeText={(value) => setField('youtube', value)}
+              optional
+              autoCapitalize="none"
+            />
+            <CompactField
+              label="Facebook"
+              placeholder="facebook.com/..."
+              value={draft.facebook}
+              onChangeText={(value) => setField('facebook', value)}
+              optional
+              autoCapitalize="none"
+            />
+            <CompactField
+              label="X"
+              placeholder="x.com/..."
+              value={draft.x}
+              onChangeText={(value) => setField('x', value)}
+              optional
+              autoCapitalize="none"
+            />
+          </View>
+        </SettingsModalShell>
+
+        <SettingsModalShell
+          title="Others"
+          visible={activeQuickSheet === 'others'}
+          onClose={() => setActiveQuickSheet(null)}
+          topInset={insets.top}
+        >
+          <View style={styles.formStepStack}>
+            <CompactField
+              label="About"
+              placeholder="Write a fuller story for the listing if you want."
+              value={draft.about}
+              onChangeText={(value) => setField('about', value)}
+              optional
+              multiline
+            />
+            <CompactField
+              label="Highlights"
+              placeholder={'Ocean view\nLive band\nSignature cocktails'}
+              value={draft.highlightsText}
+              onChangeText={(value) => setField('highlightsText', value)}
+              optional
+              multiline
+            />
+            <CompactField
+              label="Location note"
+              placeholder="Parking through the side gate."
+              value={draft.locationNote}
+              onChangeText={(value) => setField('locationNote', value)}
+              optional
+              multiline
+            />
+            <CompactField
+              label="Email"
+              placeholder="host@example.com"
+              value={draft.email}
+              onChangeText={(value) => setField('email', value)}
+              optional
+              keyboardType="email-address"
+            />
+            <CompactField
+              label="Website"
+              placeholder="https://example.com"
+              value={draft.website}
+              onChangeText={(value) => setField('website', value)}
+              optional
+              autoCapitalize="none"
+            />
+          </View>
+        </SettingsModalShell>
+
         {isSubmitting ? <CreateUploadProgress progress={submitProgress} stage={submitStage} /> : null}
 
         {localError || submitError ? (
@@ -1296,36 +1257,20 @@ export function CreateTabView({
         ) : null}
 
         <View style={styles.formActions}>
-          {step > 0 ? (
-            <CompactActionButton icon="chevron-left" label="Back" onPress={handleBack} tone="muted" />
-          ) : (
-            <View style={styles.actionSpacer} />
-          )}
-
+          <View style={styles.actionSpacer} />
           <View style={styles.formActionRight}>
-            {step > 0 ? (
-              <CompactActionButton
-                icon="x"
-                label={step === 2 ? 'Skip & publish' : 'Skip'}
-                onPress={() => void handleSkip()}
-                tone="muted"
-              />
-            ) : null}
-
             <CompactActionButton
-              icon={step === 2 ? 'plus-circle' : 'chevron-right'}
+              icon="plus-circle"
               label={
                 isSubmitting
                   ? submitStage
                     ? `${submitStage} ${Math.max(1, Math.min(100, Math.round(submitProgress * 100)))}%`
                     : 'Publishing...'
-                  : step === 2
-                    ? editingEvent
-                      ? 'Save changes'
-                      : 'Publish'
-                    : 'Next'
+                  : editingEvent
+                    ? 'Save changes'
+                    : 'Publish'
               }
-              onPress={() => void (step === 2 ? handlePublish() : handleNext())}
+              onPress={() => void handlePublish()}
               tone="accent"
               disabled={isSubmitting}
             />
@@ -1347,7 +1292,7 @@ export function ProfileTabView({
   onEditListing,
   onMarkTicketUsed,
   onOpenCategory,
-  onOpenSavedTab,
+  onHeaderModeChange,
   onOpenTicket,
   onRemoveHistoryItem,
   onSignOut,
@@ -1359,6 +1304,7 @@ export function ProfileTabView({
   receivedTickets,
   savedEvents,
   tickets,
+  ticketSearchQuery,
   unreadCount,
   onSelectEvent,
 }: {
@@ -1372,7 +1318,7 @@ export function ProfileTabView({
   onEditListing: (event: AppEvent) => void;
   onMarkTicketUsed: (ticket: AppTicket) => Promise<void>;
   onOpenCategory: (categoryId: string) => void;
-  onOpenSavedTab: () => void;
+  onHeaderModeChange: (mode: 'default' | 'tickets') => void;
   onOpenTicket: (ticket: AppTicket) => void;
   onRemoveHistoryItem: (event: AppEvent) => Promise<void>;
   onSignOut: () => void;
@@ -1384,12 +1330,13 @@ export function ProfileTabView({
   receivedTickets: AppTicket[];
   savedEvents: AppEvent[];
   tickets: AppTicket[];
+  ticketSearchQuery: string;
   unreadCount: number;
   onSelectEvent: (event: AppEvent) => void;
 }) {
   const insets = useSafeAreaInsets();
   const [activePanel, setActivePanel] = useState<'profile' | 'password' | 'notifications' | 'about' | null>(null);
-  const [profilePage, setProfilePage] = useState<'main' | 'hosted' | 'tickets'>('main');
+  const [profilePage, setProfilePage] = useState<'main' | 'hosted' | 'tickets' | 'saved'>('main');
   const [busyKey, setBusyKey] = useState<'profile' | 'password' | 'push' | 'email' | 'hosted-delete' | 'hosted-payment' | 'verify' | null>(null);
   const [ticketBusyKey, setTicketBusyKey] = useState<string | null>(null);
   const [historyBusyKey, setHistoryBusyKey] = useState<string | null>(null);
@@ -1418,7 +1365,6 @@ export function ProfileTabView({
   const recentViews = showAllHistory ? historyEvents : historyEvents.slice(0, 6);
   const activeTicketCount = tickets.filter((ticket) => ticket.status === 'confirmed').length;
   const ticketHistoryCount = tickets.filter((ticket) => ticket.status !== 'confirmed').length;
-  const categoryShortcuts = categories.filter((category) => category.id !== 'all');
   const hostedListings = useMemo(
     () => myListings.map((event) => ({
       ...event,
@@ -1439,7 +1385,20 @@ export function ProfileTabView({
     );
   }, [hostedSearchQuery, hostedListings]);
   const visibleHostedListings = showAllHostedListings ? filteredHostedListings : filteredHostedListings.slice(0, 8);
-  const visibleTicketPageItems = showAllTicketPage ? tickets : tickets.slice(0, 8);
+  const filteredTicketPageItems = useMemo(() => {
+    const query = ticketSearchQuery.trim().toLowerCase();
+    if (!query) {
+      return tickets;
+    }
+
+    return tickets.filter((ticket) => matchesTicketSearch(ticket, query));
+  }, [ticketSearchQuery, tickets]);
+  const visibleTicketPageItems = showAllTicketPage ? filteredTicketPageItems : filteredTicketPageItems.slice(0, 8);
+  const filteredActiveTicketCount = filteredTicketPageItems.filter((ticket) => ['confirmed', 'accepted'].includes(ticket.status)).length;
+
+  useEffect(() => {
+    onHeaderModeChange(profilePage === 'tickets' ? 'tickets' : 'default');
+  }, [onHeaderModeChange, profilePage]);
 
   useEffect(() => {
     setName(profile?.name ?? '');
@@ -1634,6 +1593,10 @@ export function ProfileTabView({
     setProfilePage('tickets');
   };
 
+  const handleOpenSavedPage = () => {
+    setProfilePage('saved');
+  };
+
   const handleToggleHostedSelection = (eventId: string) => {
     setSelectedHostedIds((current) =>
       current.includes(eventId) ? current.filter((id) => id !== eventId) : [...current, eventId],
@@ -1802,10 +1765,10 @@ export function ProfileTabView({
   if (profilePage === 'tickets') {
     return (
       <TicketsPage
-        activeCount={activeTicketCount}
+        activeCount={filteredActiveTicketCount}
         showAll={showAllTicketPage}
         tickets={visibleTicketPageItems}
-        totalCount={tickets.length}
+        totalCount={filteredTicketPageItems.length}
         onBack={() => {
           setProfilePage('main');
           setShowAllTicketPage(false);
@@ -1818,10 +1781,20 @@ export function ProfileTabView({
     );
   }
 
+  if (profilePage === 'saved') {
+    return (
+      <SavedPlacesPage
+        events={savedEvents}
+        myListings={myListings}
+        onBack={() => setProfilePage('main')}
+        onEdit={onEditListing}
+        onOpen={onSelectEvent}
+      />
+    );
+  }
+
   return (
     <View style={styles.sectionStack}>
-      <Text style={styles.sectionTitle}>Me</Text>
-
       <View style={styles.profileCard}>
         <View style={styles.profileTopRow}>
           <View style={styles.profileAvatar}>
@@ -1832,27 +1805,29 @@ export function ProfileTabView({
             )}
           </View>
 
-          <View style={styles.profileText}>
-            <Text style={styles.profileName}>{profile?.name ?? 'Your profile'}</Text>
-            <Text style={styles.profileMeta}>{profile?.email ?? 'Signed in'}</Text>
+          <View style={styles.profileIdentityRow}>
+            <View style={styles.profileText}>
+              <Text numberOfLines={1} ellipsizeMode="tail" style={styles.profileName}>
+                {profile?.name ?? 'Your profile'}
+              </Text>
+              <Text numberOfLines={1} ellipsizeMode="middle" style={styles.profileMeta}>
+                {profile?.email ?? 'Signed in'}
+              </Text>
+            </View>
+
+            <View style={styles.profileInlineActions}>
+              <ProfileIconAction icon="user" label="Edit profile" onPress={() => setActivePanel('profile')} />
+              <ProfileIconAction icon="log-out" label="Sign out" onPress={onSignOut} />
+            </View>
           </View>
         </View>
 
         <View style={styles.profileStatsRow}>
           <MiniStatCard label="Saved" value={String(savedEvents.length)} />
-          <MiniStatCard label="Hosting" value={String(myListings.length)} />
+          <MiniStatCard label="Tickets" value={String(tickets.length)} />
           <MiniStatCard label="Received" value={String(receivedTickets.length)} />
         </View>
 
-        <View style={styles.profileActionRow}>
-          <CompactActionButton
-            icon="user"
-            label="Edit profile"
-            onPress={() => setActivePanel('profile')}
-            tone="muted"
-          />
-          <CompactActionButton icon="log-out" label="Sign out" onPress={onSignOut} tone="muted" />
-        </View>
       </View>
 
       {notice ? (
@@ -1973,22 +1948,6 @@ export function ProfileTabView({
       <View style={styles.profileSection}>
         <View style={styles.compactSectionHeader}>
           <View style={styles.compactSectionCopy}>
-            <Text style={styles.compactSectionTitle}>Hosting</Text>
-            <Text style={styles.compactSectionHint}>Separate page</Text>
-          </View>
-          <CompactActionButton icon="grid" label="Open" onPress={handleOpenHostedPage} tone="muted" />
-        </View>
-
-        <View style={styles.hostingSummaryCard}>
-          <MiniStatCard label="Listings" value={`${myListings.length}`} />
-          <MiniStatCard label="Received" value={`${receivedTickets.length}`} />
-          <MiniStatCard label="Create" value="Open" />
-        </View>
-      </View>
-
-      <View style={styles.profileSection}>
-        <View style={styles.compactSectionHeader}>
-          <View style={styles.compactSectionCopy}>
             <Text style={styles.compactSectionTitle}>Recently viewed</Text>
             <Text style={styles.compactSectionHint}>History</Text>
           </View>
@@ -2002,11 +1961,9 @@ export function ProfileTabView({
               />
             ) : null}
             {historyEvents.length > 0 ? (
-              <CompactActionButton
-                icon="x"
+              <PlainTextAction
                 label={historyBusyKey === 'clear' ? 'Clearing...' : 'Clear'}
                 onPress={() => void handleClearViewedHistory()}
-                tone="muted"
                 disabled={historyBusyKey !== null}
               />
             ) : null}
@@ -2044,27 +2001,6 @@ export function ProfileTabView({
       <View style={styles.profileSection}>
         <View style={styles.compactSectionHeader}>
           <View style={styles.compactSectionCopy}>
-            <Text style={styles.compactSectionTitle}>Categories</Text>
-            <Text style={styles.compactSectionHint}>Jump to discover</Text>
-          </View>
-        </View>
-
-        <View style={styles.categoryShortcutWrap}>
-          {categoryShortcuts.map((category) => (
-            <CompactChip
-              key={`category-shortcut-${category.id}`}
-              active={false}
-              icon={(category.icon as FeatherName) ?? 'grid'}
-              label={category.name}
-              onPress={() => onOpenCategory(category.id)}
-            />
-          ))}
-        </View>
-      </View>
-
-      <View style={styles.profileSection}>
-        <View style={styles.compactSectionHeader}>
-          <View style={styles.compactSectionCopy}>
             <Text style={styles.compactSectionTitle}>Settings</Text>
             <Text style={styles.compactSectionHint}>Tighter controls</Text>
           </View>
@@ -2077,10 +2013,10 @@ export function ProfileTabView({
             value={profile?.pushNotificationsEnabled ? 'On' : 'Off'}
             onPress={() => setActivePanel('notifications')}
           />
-          <SettingsRow icon="message-circle" label="Inbox" value={unreadCount > 0 ? `${unreadCount} new` : 'Up to date'} />
-          <SettingsActionRow icon="heart" label="Saved places" value={`${savedEvents.length}`} onPress={onOpenSavedTab} />
-          <SettingsActionRow icon="grid" label="Hosted listings" value={`${myListings.length}`} onPress={handleOpenHostedPage} />
-          <SettingsActionRow icon="download" label="My tickets" value={`${tickets.length}`} onPress={handleOpenTicketsPage} />
+          <SettingsRow icon="inbox" label="Inbox" value={unreadCount > 0 ? `${formatCompactCount(unreadCount)} new` : 'Up to date'} />
+          <SettingsActionRow icon="grid" label="My posts" value={formatCompactCount(myListings.length)} onPress={handleOpenHostedPage} />
+          <SettingsActionRow icon="heart" label="Saved places" value={formatCompactCount(savedEvents.length)} onPress={handleOpenSavedPage} />
+          <SettingsActionRow icon="download" label="My tickets" value={formatCompactCount(tickets.length)} onPress={handleOpenTicketsPage} />
           <SettingsActionRow
             icon="mail"
             label="Email updates"
@@ -2142,7 +2078,7 @@ export function ProfileTabView({
                 transition={120}
               />
             </View>
-            <Text style={styles.profileEditorHint}>Keep your public details fresh for bookings and hosted listings.</Text>
+            <Text style={styles.profileEditorHint}>Keep your public details fresh for bookings and account activity.</Text>
           </View>
 
           <CompactField label="Name" placeholder="Your name" value={name} onChangeText={setName} />
@@ -2335,10 +2271,10 @@ function HostedListingsPage({
   return (
     <View style={styles.sectionStack}>
       <View style={styles.hostedPageHeader}>
-        <CompactActionButton icon="chevron-left" label="Back" onPress={onBack} tone="muted" />
+        <PlainIconAction icon="chevron-left" label="Back" onPress={onBack} />
         <View style={styles.hostedPageTitleWrap}>
-          <Text style={styles.hostedPageTitle}>Hosted listings</Text>
-          <Text style={styles.hostedPageHint}>{rawCount} total listings</Text>
+          <Text style={styles.hostedPageTitle}>My posts</Text>
+          <Text style={styles.hostedPageHint}>{rawCount} total posts</Text>
         </View>
         <CompactActionButton icon="plus-circle" label="Create" onPress={onCreate} tone="accent" />
       </View>
@@ -2346,7 +2282,7 @@ function HostedListingsPage({
       <View style={styles.hostedSearchShell}>
         <Feather color={theme.colors.textMuted} name="search" size={16} />
         <TextInput
-          placeholder="Search hosted listings"
+          placeholder="Search my posts"
           placeholderTextColor={theme.colors.textSoft}
           style={styles.hostedSearchInput}
           value={query}
@@ -2396,7 +2332,7 @@ function HostedListingsPage({
       {rawCount === 0 ? (
         <EmptyState
           icon="grid"
-          title="No hosted listings yet"
+          title="No posts yet"
           copy="Create your first listing, then come back here to manage it."
           compact
         />
@@ -2404,7 +2340,7 @@ function HostedListingsPage({
         <EmptyState
           icon="search"
           title="Nothing matched that search"
-          copy="Try a shorter search or clear it to see all your hosted listings again."
+          copy="Try a shorter search or clear it to see all your posts again."
           compact
         />
       ) : (
@@ -2537,6 +2473,88 @@ function TicketVerifierModal({
   );
 }
 
+function SavedPlacesPage({
+  events,
+  myListings,
+  onBack,
+  onEdit,
+  onOpen,
+}: {
+  events: AppEvent[];
+  myListings: AppEvent[];
+  onBack: () => void;
+  onEdit: (event: AppEvent) => void;
+  onOpen: (event: AppEvent) => void;
+}) {
+  const ownedListingsById = useMemo(
+    () => new Map(myListings.map((event) => [event.id, event])),
+    [myListings],
+  );
+
+  return (
+    <View style={styles.sectionStack}>
+      <View style={styles.hostedPageHeader}>
+        <PlainIconAction icon="chevron-left" label="Back" onPress={onBack} />
+        <View style={styles.hostedPageTitleWrap}>
+          <Text style={styles.hostedPageTitle}>Saved places</Text>
+          <Text style={styles.hostedPageHint}>{events.length} saved</Text>
+        </View>
+      </View>
+
+      {events.length === 0 ? (
+        <EmptyState
+          icon="heart"
+          title="No saved spots yet"
+          copy="Save restaurants, lounges, and events you want to revisit later."
+          compact
+        />
+      ) : (
+        <View style={styles.savedList}>
+          {events.map((event) => {
+            const ownedEvent = ownedListingsById.get(event.id);
+            return (
+              <SavedPlaceRow
+                key={`saved-page-${event.id}`}
+                event={ownedEvent ?? event}
+                owned={Boolean(ownedEvent)}
+                onEdit={() => ownedEvent && onEdit(ownedEvent)}
+                onOpen={() => onOpen(ownedEvent ?? event)}
+              />
+            );
+          })}
+        </View>
+      )}
+    </View>
+  );
+}
+
+function SavedPlaceRow({
+  event,
+  owned,
+  onEdit,
+  onOpen,
+}: {
+  event: AppEvent;
+  owned: boolean;
+  onEdit: () => void;
+  onOpen: () => void;
+}) {
+  return (
+    <View style={styles.savedPlaceRow}>
+      <View style={styles.savedPlacePressableWrap}>
+        <SavedEventCard event={event} onPress={onOpen} />
+      </View>
+      {owned ? (
+        <PlainTextAction
+          disabled={event.ownerCanEdit === false}
+          label={event.ownerCanEdit === false ? 'Locked' : 'Edit'}
+          onPress={onEdit}
+        />
+      ) : null}
+    </View>
+  );
+}
+
 function TicketsPage({
   activeCount,
   showAll,
@@ -2561,7 +2579,7 @@ function TicketsPage({
   return (
     <View style={styles.sectionStack}>
       <View style={styles.hostedPageHeader}>
-        <CompactActionButton icon="chevron-left" label="Back" onPress={onBack} tone="muted" />
+        <PlainIconAction icon="chevron-left" label="Back" onPress={onBack} />
         <View style={styles.hostedPageTitleWrap}>
           <Text style={styles.hostedPageTitle}>My tickets</Text>
           <Text style={styles.hostedPageHint}>{totalCount} total tickets</Text>
@@ -2573,11 +2591,9 @@ function TicketsPage({
           {tickets.length} shown{totalCount > tickets.length ? ` of ${totalCount}` : ''} | {activeCount} active
         </Text>
         {totalCount > 8 ? (
-          <CompactActionButton
-            icon={showAll ? 'chevron-up' : 'chevron-down'}
+          <PlainTextAction
             label={showAll ? 'Less' : 'View all'}
             onPress={onToggleShowAll}
-            tone="muted"
           />
         ) : null}
       </View>
@@ -2592,24 +2608,79 @@ function TicketsPage({
       ) : (
         <View style={styles.ticketManagementList}>
           {tickets.map((ticket) => (
-            <TicketManagementRow
+            <TicketListCard
               key={`tickets-page-${ticket.id}`}
-              title={ticket.event.title}
-              subtitle={ticket.event.venue}
+              actionLabel={ticket.canCancel ? (ticketBusyKey === `${ticket.id}:cancel` ? 'Cancelling...' : 'Cancel') : undefined}
+              actionDisabled={ticketBusyKey !== null}
+              imageSource={ticket.event.image}
               meta={`Ref ${ticket.referenceCode} | ${formatTicketDate(ticket.bookedAt)}`}
+              onAction={ticket.canCancel ? () => onCancelTicket(ticket) : undefined}
+              onPress={() => onOpenTicket(ticket)}
               status={ticket.status}
-              primaryActionLabel="Open"
-              onPrimaryAction={() => onOpenTicket(ticket)}
-              secondaryActionLabel={
-                ticket.canCancel ? (ticketBusyKey === `${ticket.id}:cancel` ? 'Cancelling...' : 'Cancel') : undefined
-              }
-              onSecondaryAction={ticket.canCancel ? () => onCancelTicket(ticket) : undefined}
-              secondaryActionDisabled={ticketBusyKey !== null}
+              subtitle={ticket.event.venue}
+              title={ticket.event.title}
             />
           ))}
         </View>
       )}
     </View>
+  );
+}
+
+function TicketListCard({
+  actionDisabled = false,
+  actionLabel,
+  imageSource,
+  meta,
+  onAction,
+  onPress,
+  status,
+  subtitle,
+  title,
+}: {
+  actionDisabled?: boolean;
+  actionLabel?: string;
+  imageSource: ImageSourcePropType | string;
+  meta: string;
+  onAction?: () => void;
+  onPress: () => void;
+  status: AppTicket['status'];
+  subtitle: string;
+  title: string;
+}) {
+  const jelly = useJellyPressAnimation({
+    pressedScaleX: 1.01,
+    pressedScaleY: 0.972,
+  });
+
+  return (
+    <Pressable accessibilityRole="button" onPress={onPress} onPressIn={jelly.onPressIn} onPressOut={jelly.onPressOut}>
+      <Animated.View style={[styles.inboxTicketCard, jelly.animatedStyle]}>
+        <Image source={imageSource} contentFit="cover" style={styles.inboxTicketImage} transition={160} />
+        <View style={styles.inboxTicketBody}>
+          <View style={styles.inboxTicketTop}>
+            <View style={styles.inboxTicketCopy}>
+              <Text numberOfLines={1} style={styles.ticketManagementTitle}>
+                {title}
+              </Text>
+              <Text numberOfLines={1} style={styles.ticketManagementSubtitle}>
+                {subtitle}
+              </Text>
+            </View>
+            <StatusPill status={status} />
+          </View>
+          <View style={styles.ticketListMetaRow}>
+            <Text numberOfLines={1} style={styles.ticketManagementMeta}>
+              {meta}
+            </Text>
+            {actionLabel && onAction ? (
+              <PlainTextAction disabled={actionDisabled} label={actionLabel} onPress={onAction} />
+            ) : null}
+          </View>
+        </View>
+        <Feather color={theme.colors.textSoft} name="chevron-right" size={17} />
+      </Animated.View>
+    </Pressable>
   );
 }
 
@@ -2808,6 +2879,72 @@ function NotificationPreferenceCard({
   );
 }
 
+function InboxTicketActivityCard({
+  imageSource,
+  isConfirming,
+  title,
+  subtitle,
+  meta,
+  status,
+  onConfirm,
+  onPress,
+}: {
+  imageSource: ImageSourcePropType | string;
+  isConfirming?: boolean;
+  title: string;
+  subtitle: string;
+  meta: string;
+  status: AppTicket['status'];
+  onConfirm?: () => void;
+  onPress: () => void;
+}) {
+  const jelly = useJellyPressAnimation({
+    pressedScaleX: 1.01,
+    pressedScaleY: 0.972,
+  });
+
+  return (
+    <Pressable accessibilityRole="button" onPress={onPress} onPressIn={jelly.onPressIn} onPressOut={jelly.onPressOut}>
+      <Animated.View style={[styles.inboxTicketCard, jelly.animatedStyle]}>
+        <Image source={imageSource} contentFit="cover" style={styles.inboxTicketImage} transition={160} />
+        <View style={styles.inboxTicketBody}>
+          <View style={styles.inboxTicketTop}>
+            <View style={styles.inboxTicketCopy}>
+              <Text numberOfLines={1} style={styles.ticketManagementTitle}>
+                {title}
+              </Text>
+              <Text numberOfLines={1} style={styles.ticketManagementSubtitle}>
+                {subtitle}
+              </Text>
+            </View>
+            <StatusPill status={status} />
+          </View>
+          <Text numberOfLines={1} style={styles.ticketManagementMeta}>
+            {meta}
+          </Text>
+          {onConfirm ? (
+            <Pressable
+              accessibilityRole="button"
+              disabled={Boolean(isConfirming)}
+              onPress={(event) => {
+                event.stopPropagation();
+                onConfirm();
+              }}
+              style={[styles.inboxQuickConfirm, isConfirming && styles.inboxQuickConfirmDisabled]}
+            >
+              <Feather color={theme.colors.white} name="check" size={12} />
+              <Text numberOfLines={1} style={styles.inboxQuickConfirmText}>
+                {isConfirming ? 'Confirming...' : 'Confirm ticket'}
+              </Text>
+            </Pressable>
+          ) : null}
+        </View>
+        <Feather color={theme.colors.textSoft} name="chevron-right" size={17} />
+      </Animated.View>
+    </Pressable>
+  );
+}
+
 function SavedEventCard({
   event,
   onPress,
@@ -2861,10 +2998,14 @@ function SavedEventCard({
 }
 
 function NotificationCard({
+  isConfirming,
   notification,
+  onConfirm,
   onPress,
 }: {
+  isConfirming?: boolean;
   notification: AppNotification;
+  onConfirm?: () => void;
   onPress: () => void;
 }) {
   const jelly = useJellyPressAnimation({
@@ -2875,8 +3016,12 @@ function NotificationCard({
   return (
     <Pressable onPress={onPress} onPressIn={jelly.onPressIn} onPressOut={jelly.onPressOut}>
       <Animated.View style={[styles.notificationCard, !notification.isRead && styles.notificationCardUnread, jelly.animatedStyle]}>
-        <View style={styles.notificationIcon}>
-          <Feather color={theme.colors.accentStrong} name={notificationIconForType(notification.type)} size={15} />
+        <View style={styles.notificationThumb}>
+          <Image source={APP_LOGO} contentFit="cover" style={styles.notificationThumbImage} transition={120} />
+          <View style={styles.notificationThumbShade} />
+          <View style={styles.notificationIconBadge}>
+            <Feather color={theme.colors.white} name={notificationIconForType(notification.type)} size={12} />
+          </View>
         </View>
 
         <View style={styles.notificationBody}>
@@ -2891,6 +3036,22 @@ function NotificationCard({
             {notification.message}
           </Text>
           <Text style={styles.notificationMeta}>{formatRelativeDate(notification.createdAt)}</Text>
+          {onConfirm ? (
+            <Pressable
+              accessibilityRole="button"
+              disabled={Boolean(isConfirming)}
+              onPress={(event) => {
+                event.stopPropagation();
+                onConfirm();
+              }}
+              style={[styles.inboxQuickConfirm, isConfirming && styles.inboxQuickConfirmDisabled]}
+            >
+              <Feather color={theme.colors.white} name="check" size={12} />
+              <Text numberOfLines={1} style={styles.inboxQuickConfirmText}>
+                {isConfirming ? 'Confirming...' : 'Confirm ticket'}
+              </Text>
+            </Pressable>
+          ) : null}
         </View>
       </Animated.View>
     </Pressable>
@@ -3002,10 +3163,19 @@ function StreamVideoCard({
 }) {
   const videoRef = useRef<Video>(null);
   const [muted, setMuted] = useState(true);
+  const [videoReady, setVideoReady] = useState(false);
+  const [videoBuffering, setVideoBuffering] = useState(true);
+  const [videoFailed, setVideoFailed] = useState(false);
   const jelly = useJellyPressAnimation({
     pressedScaleX: 1.02,
     pressedScaleY: 0.95,
   });
+
+  useEffect(() => {
+    setVideoReady(false);
+    setVideoBuffering(true);
+    setVideoFailed(false);
+  }, [item.source]);
 
   useEffect(() => {
     if (active) {
@@ -3016,12 +3186,30 @@ function StreamVideoCard({
     videoRef.current?.pauseAsync().catch(() => undefined);
   }, [active]);
 
+  const handlePlaybackStatusUpdate = (status: AVPlaybackStatus) => {
+    if (!status.isLoaded) {
+      return;
+    }
+
+    setVideoBuffering(status.isBuffering);
+  };
+
   return (
     <View style={[styles.streamCard, { height }]}>
       {item.poster ? <Image source={item.poster} contentFit="cover" style={styles.streamPoster} transition={120} /> : null}
       <Video
         isLooping
         isMuted={muted}
+        onError={() => {
+          setVideoFailed(true);
+          setVideoBuffering(false);
+        }}
+        onLoad={() => setVideoBuffering(false)}
+        onPlaybackStatusUpdate={handlePlaybackStatusUpdate}
+        onReadyForDisplay={() => {
+          setVideoReady(true);
+          setVideoBuffering(false);
+        }}
         progressUpdateIntervalMillis={500}
         ref={videoRef}
         resizeMode={ResizeMode.COVER}
@@ -3029,6 +3217,9 @@ function StreamVideoCard({
         source={{ uri: item.source }}
         style={styles.streamVideo}
       />
+      {!videoReady || videoBuffering || videoFailed ? (
+        <StreamVideoLoadingOverlay failed={videoFailed} />
+      ) : null}
       <View pointerEvents="none" style={styles.streamShade} />
       <Pressable
         accessibilityRole="button"
@@ -3076,40 +3267,80 @@ function StreamVideoCard({
   );
 }
 
-function StepStrip({ currentStep }: { currentStep: CreateStep }) {
-  const steps = [
-    { id: 0, label: 'Basics' },
-    { id: 1, label: 'Story' },
-    { id: 2, label: 'Extras' },
-  ] as const;
+function StreamVideoLoadingOverlay({ failed }: { failed: boolean }) {
+  const pulse = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    if (failed) {
+      pulse.stopAnimation();
+      return;
+    }
+
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulse, {
+          toValue: 1,
+          duration: 760,
+          easing: Easing.inOut(Easing.quad),
+          useNativeDriver: true,
+        }),
+        Animated.timing(pulse, {
+          toValue: 0,
+          duration: 760,
+          easing: Easing.inOut(Easing.quad),
+          useNativeDriver: true,
+        }),
+      ]),
+    );
+
+    loop.start();
+    return () => loop.stop();
+  }, [failed, pulse]);
+
+  const scale = pulse.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0.82, 1.08],
+  });
+  const opacity = pulse.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0.42, 1],
+  });
 
   return (
-    <View style={styles.stepStrip}>
-      {steps.map((step) => (
-        <View key={step.id} style={[styles.stepChip, currentStep === step.id && styles.stepChipActive]}>
-          <Text style={[styles.stepChipIndex, currentStep === step.id && styles.stepChipIndexActive]}>
-            {step.id + 1}
-          </Text>
-          <Text style={[styles.stepChipText, currentStep === step.id && styles.stepChipTextActive]}>
-            {step.label}
-          </Text>
-        </View>
-      ))}
-    </View>
-  );
-}
-
-function StepIntro({
-  title,
-  copy,
-}: {
-  title: string;
-  copy: string;
-}) {
-  return (
-    <View style={styles.stepIntro}>
-      <Text style={styles.stepIntroTitle}>{title}</Text>
-      <Text style={styles.stepIntroCopy}>{copy}</Text>
+    <View pointerEvents="none" style={styles.streamLoadingOverlay}>
+      <View style={styles.streamLoadingBadge}>
+        {failed ? (
+          <>
+            <Feather color={theme.colors.white} name="alert-circle" size={18} />
+            <Text style={styles.streamLoadingText}>Preview unavailable</Text>
+          </>
+        ) : (
+          <>
+            <View style={styles.streamLoadingBars}>
+              {[0, 1, 2].map((index) => (
+                <Animated.View
+                  key={index}
+                  style={[
+                    styles.streamLoadingBar,
+                    {
+                      opacity,
+                      transform: [
+                        {
+                          scaleY: index === 1 ? scale : pulse.interpolate({
+                            inputRange: [0, 1],
+                            outputRange: index === 0 ? [1.08, 0.76] : [0.76, 1.08],
+                          }),
+                        },
+                      ],
+                    },
+                  ]}
+                />
+              ))}
+            </View>
+            <Text style={styles.streamLoadingText}>Loading preview</Text>
+          </>
+        )}
+      </View>
     </View>
   );
 }
@@ -3810,6 +4041,61 @@ function MiniStatCard({
   );
 }
 
+function ProfileIconAction({
+  icon,
+  label,
+  onPress,
+}: {
+  icon: FeatherName;
+  label: string;
+  onPress: () => void;
+}) {
+  const jelly = useJellyPressAnimation({
+    pressedScaleX: 1.08,
+    pressedScaleY: 0.9,
+  });
+
+  return (
+    <Pressable accessibilityRole="button" accessibilityLabel={label} onPress={onPress} onPressIn={jelly.onPressIn} onPressOut={jelly.onPressOut}>
+      <Animated.View style={[styles.profileIconAction, jelly.animatedStyle]}>
+        <Feather color={theme.colors.textMuted} name={icon} size={15} />
+      </Animated.View>
+    </Pressable>
+  );
+}
+
+function PlainTextAction({
+  label,
+  disabled = false,
+  onPress,
+}: {
+  label: string;
+  disabled?: boolean;
+  onPress: () => void;
+}) {
+  return (
+    <Pressable accessibilityRole="button" disabled={disabled} onPress={onPress} style={styles.plainTextAction}>
+      <Text style={[styles.plainTextActionLabel, disabled && styles.plainTextActionLabelDisabled]}>{label}</Text>
+    </Pressable>
+  );
+}
+
+function PlainIconAction({
+  icon,
+  label,
+  onPress,
+}: {
+  icon: FeatherName;
+  label: string;
+  onPress: () => void;
+}) {
+  return (
+    <Pressable accessibilityRole="button" accessibilityLabel={label} onPress={onPress} style={styles.plainIconAction}>
+      <Feather color={theme.colors.textMuted} name={icon} size={21} />
+    </Pressable>
+  );
+}
+
 function EmptyState({
   icon,
   title,
@@ -3869,7 +4155,7 @@ function buildInitialDraft(categories: AppCategory[]): CreateDraft {
     facebook: '',
     instagram: '',
     x: '',
-    acceptsInternalPayments: true,
+    acceptsInternalPayments: false,
   };
 }
 
@@ -4207,15 +4493,20 @@ function formatTicketDate(value: string) {
 }
 
 function formatCompactCount(value: number) {
-  if (value >= 1000000) {
-    return `${(value / 1000000).toFixed(value >= 10000000 ? 0 : 1)}M`;
+  const safeValue = Math.max(0, Math.floor(Number.isFinite(value) ? value : 0));
+  if (safeValue < 1000) {
+    return String(safeValue);
   }
 
-  if (value >= 1000) {
-    return `${(value / 1000).toFixed(value >= 10000 ? 0 : 1)}K`;
-  }
-
-  return String(value);
+  const units = [
+    { value: 1_000_000_000, suffix: 'B' },
+    { value: 1_000_000, suffix: 'M' },
+    { value: 1_000, suffix: 'k' },
+  ];
+  const unit = units.find((item) => safeValue >= item.value) ?? units[2];
+  const count = safeValue / unit.value;
+  const formatted = count >= 10 ? Math.floor(count).toString() : count.toFixed(1).replace(/\.0$/, '');
+  return `${formatted}${unit.suffix}`;
 }
 
 function formatEditWindowHint(event: AppEvent) {
@@ -4251,35 +4542,6 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     gap: 12,
   },
-  inboxHeadingCopy: {
-    flex: 1,
-    gap: 4,
-  },
-  inboxReadAllPressable: {
-    flexShrink: 0,
-    marginTop: 5,
-  },
-  inboxReadAllButton: {
-    minHeight: 30,
-    borderBottomWidth: 1,
-    borderBottomColor: 'rgba(255,107,61,0.34)',
-    paddingHorizontal: 2,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 5,
-  },
-  inboxReadAllButtonDisabled: {
-    borderBottomColor: 'rgba(255,255,255,0.08)',
-  },
-  inboxReadAllText: {
-    color: theme.colors.accentStrong,
-    fontSize: 11,
-    fontWeight: '800',
-    letterSpacing: 0.2,
-  },
-  inboxReadAllTextDisabled: {
-    color: theme.colors.textSoft,
-  },
   sectionTitle: {
     color: theme.colors.text,
     fontSize: 26,
@@ -4298,6 +4560,12 @@ const styles = StyleSheet.create({
   },
   savedList: {
     gap: 12,
+  },
+  savedPlaceRow: {
+    gap: 8,
+  },
+  savedPlacePressableWrap: {
+    flex: 1,
   },
   savedCard: {
     flexDirection: 'row',
@@ -4402,6 +4670,41 @@ const styles = StyleSheet.create({
     ...StyleSheet.absoluteFillObject,
     backgroundColor: 'rgba(0,0,0,0.14)',
   },
+  streamLoadingOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(5,7,11,0.26)',
+  },
+  streamLoadingBadge: {
+    minHeight: 46,
+    borderRadius: 23,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.1)',
+    backgroundColor: 'rgba(8,10,14,0.54)',
+    paddingHorizontal: 15,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  streamLoadingBars: {
+    height: 22,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+  },
+  streamLoadingBar: {
+    width: 4,
+    height: 18,
+    borderRadius: 2,
+    backgroundColor: theme.colors.accentStrong,
+  },
+  streamLoadingText: {
+    color: theme.colors.white,
+    fontSize: 12,
+    fontWeight: '800',
+  },
   streamTapTarget: {
     ...StyleSheet.absoluteFillObject,
     zIndex: 1,
@@ -4435,7 +4738,7 @@ const styles = StyleSheet.create({
   },
   streamRoundActionActive: {
     backgroundColor: theme.colors.accentSoft,
-    borderColor: 'rgba(255,107,61,0.3)',
+    borderColor: 'rgba(242,34,28,0.3)',
   },
   streamActions: {
     position: 'absolute',
@@ -4550,12 +4853,35 @@ const styles = StyleSheet.create({
     paddingVertical: 13,
   },
   notificationCardUnread: {
-    borderBottomColor: 'rgba(255,107,61,0.24)',
+    borderBottomColor: 'rgba(242,34,28,0.24)',
   },
-  notificationIcon: {
-    width: 24,
-    height: 24,
-    backgroundColor: 'transparent',
+  notificationThumb: {
+    width: 48,
+    height: 48,
+    borderRadius: 12,
+    overflow: 'hidden',
+    backgroundColor: theme.colors.surfaceStrong,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+  },
+  notificationThumbImage: {
+    width: '100%',
+    height: '100%',
+  },
+  notificationThumbShade: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(8,10,14,0.18)',
+  },
+  notificationIconBadge: {
+    position: 'absolute',
+    right: 4,
+    bottom: 4,
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: theme.colors.accentStrong,
+    borderWidth: 1,
+    borderColor: 'rgba(10,13,19,0.82)',
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -4609,7 +4935,7 @@ const styles = StyleSheet.create({
   },
   stepChipActive: {
     backgroundColor: theme.colors.accentSoft,
-    borderColor: 'rgba(255,107,61,0.24)',
+    borderColor: 'rgba(242,34,28,0.24)',
   },
   stepChipIndex: {
     color: theme.colors.textSoft,
@@ -4691,6 +5017,18 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '600',
   },
+  createComposerPlainAction: {
+    minHeight: 32,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 2,
+  },
+  createComposerPlainActionText: {
+    color: theme.colors.accentStrong,
+    fontSize: 12,
+    fontWeight: '800',
+  },
   createComposerChipRow: {
     gap: 10,
     paddingRight: 6,
@@ -4708,7 +5046,7 @@ const styles = StyleSheet.create({
   },
   createComposerChipActive: {
     backgroundColor: theme.colors.accentSoft,
-    borderColor: 'rgba(255,107,61,0.22)',
+    borderColor: 'rgba(242,34,28,0.22)',
   },
   createComposerChipText: {
     color: theme.colors.text,
@@ -4739,6 +5077,21 @@ const styles = StyleSheet.create({
     fontSize: 17,
     lineHeight: 25,
     fontWeight: '500',
+    paddingVertical: 0,
+  },
+  createComposerInlinePrice: {
+    minHeight: 42,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.1)',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  createComposerInlinePriceInput: {
+    flex: 1,
+    color: theme.colors.text,
+    fontSize: 14,
+    fontWeight: '700',
     paddingVertical: 0,
   },
   createComposerMediaTray: {
@@ -4921,7 +5274,7 @@ const styles = StyleSheet.create({
     borderBottomColor: 'rgba(255,255,255,0.04)',
   },
   dropdownOptionRowActive: {
-    backgroundColor: 'rgba(255,107,61,0.09)',
+    backgroundColor: 'rgba(242,34,28,0.09)',
   },
   dropdownOptionLeft: {
     flex: 1,
@@ -4933,7 +5286,7 @@ const styles = StyleSheet.create({
     width: 28,
     height: 28,
     borderRadius: 10,
-    backgroundColor: 'rgba(255,107,61,0.12)',
+    backgroundColor: 'rgba(242,34,28,0.12)',
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -4967,7 +5320,7 @@ const styles = StyleSheet.create({
   },
   compactChipActive: {
     backgroundColor: theme.colors.accentSoft,
-    borderColor: 'rgba(255,107,61,0.24)',
+    borderColor: 'rgba(242,34,28,0.24)',
   },
   compactChipText: {
     color: theme.colors.textMuted,
@@ -5143,8 +5496,8 @@ const styles = StyleSheet.create({
   progressCard: {
     borderRadius: 15,
     borderWidth: 1,
-    borderColor: 'rgba(255,107,61,0.24)',
-    backgroundColor: 'rgba(255,107,61,0.08)',
+    borderColor: 'rgba(242,34,28,0.24)',
+    backgroundColor: 'rgba(242,34,28,0.08)',
     paddingHorizontal: 13,
     paddingVertical: 12,
     gap: 9,
@@ -5208,7 +5561,7 @@ const styles = StyleSheet.create({
   },
   priceOptionActive: {
     backgroundColor: theme.colors.accentSoft,
-    borderColor: 'rgba(255,107,61,0.24)',
+    borderColor: 'rgba(242,34,28,0.24)',
   },
   priceOptionText: {
     color: theme.colors.textMuted,
@@ -5225,8 +5578,8 @@ const styles = StyleSheet.create({
   inlineError: {
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: 'rgba(255,107,61,0.2)',
-    backgroundColor: 'rgba(255,107,61,0.09)',
+    borderColor: 'rgba(242,34,28,0.2)',
+    backgroundColor: 'rgba(242,34,28,0.09)',
     paddingHorizontal: 12,
     paddingVertical: 11,
     flexDirection: 'row',
@@ -5340,7 +5693,15 @@ const styles = StyleSheet.create({
   },
   profileText: {
     flex: 1,
+    minWidth: 0,
     gap: 3,
+  },
+  profileIdentityRow: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
   },
   profileName: {
     color: theme.colors.text,
@@ -5351,6 +5712,22 @@ const styles = StyleSheet.create({
     color: theme.colors.textMuted,
     fontSize: 12,
   },
+  profileInlineActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+    flexShrink: 0,
+  },
+  profileIconAction: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: theme.colors.surfaceMuted,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   profileStatsRow: {
     flexDirection: 'row',
     gap: 0,
@@ -5358,12 +5735,25 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderColor: 'rgba(255,255,255,0.08)',
   },
-  profileActionRow: {
-    paddingTop: 2,
-    flexDirection: 'row',
+  plainTextAction: {
+    minHeight: 28,
     alignItems: 'center',
-    flexWrap: 'wrap',
-    gap: 8,
+    justifyContent: 'center',
+    paddingHorizontal: 2,
+  },
+  plainTextActionLabel: {
+    color: theme.colors.accentStrong,
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  plainTextActionLabelDisabled: {
+    color: theme.colors.textSoft,
+  },
+  plainIconAction: {
+    width: 38,
+    height: 38,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   profilePanel: {
     borderRadius: 12,
@@ -5543,6 +5933,53 @@ const styles = StyleSheet.create({
     borderTopWidth: 1,
     borderTopColor: 'rgba(255,255,255,0.08)',
   },
+  inboxTicketCard: {
+    minHeight: 82,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.08)',
+    paddingHorizontal: 4,
+    paddingVertical: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 11,
+  },
+  inboxTicketImage: {
+    width: 58,
+    height: 58,
+    borderRadius: 12,
+    backgroundColor: theme.colors.surfaceStrong,
+  },
+  inboxTicketBody: {
+    flex: 1,
+    gap: 7,
+  },
+  inboxTicketTop: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 8,
+  },
+  inboxTicketCopy: {
+    flex: 1,
+    gap: 4,
+  },
+  inboxQuickConfirm: {
+    alignSelf: 'flex-start',
+    minHeight: 28,
+    borderRadius: 10,
+    backgroundColor: theme.colors.accentStrong,
+    paddingHorizontal: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  inboxQuickConfirmDisabled: {
+    opacity: 0.56,
+  },
+  inboxQuickConfirmText: {
+    color: theme.colors.white,
+    fontSize: 11,
+    fontWeight: '900',
+  },
   ticketManagementRow: {
     borderRadius: 0,
     borderBottomWidth: 1,
@@ -5572,9 +6009,16 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   ticketManagementMeta: {
+    flex: 1,
     color: theme.colors.textSoft,
     fontSize: 11,
     lineHeight: 15,
+  },
+  ticketListMetaRow: {
+    minWidth: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
   },
   ticketManagementActions: {
     flexDirection: 'row',
@@ -5596,8 +6040,8 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(255,184,77,0.26)',
   },
   ticketStatusPillCancelled: {
-    backgroundColor: 'rgba(255,107,61,0.14)',
-    borderColor: 'rgba(255,107,61,0.26)',
+    backgroundColor: 'rgba(242,34,28,0.14)',
+    borderColor: 'rgba(242,34,28,0.26)',
   },
   ticketStatusText: {
     color: '#8BE28B',
@@ -5679,7 +6123,7 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   hostedListingRowSelected: {
-    borderBottomColor: 'rgba(255,107,61,0.34)',
+    borderBottomColor: 'rgba(242,34,28,0.34)',
     backgroundColor: 'transparent',
   },
   hostedListingRowPressable: {
@@ -5702,7 +6146,7 @@ const styles = StyleSheet.create({
   },
   hostedListingSelectCircleActive: {
     backgroundColor: theme.colors.accentSoft,
-    borderColor: 'rgba(255,107,61,0.34)',
+    borderColor: 'rgba(242,34,28,0.34)',
   },
   hostedListingImage: {
     width: 58,
@@ -6096,7 +6540,7 @@ const styles = StyleSheet.create({
     width: 34,
     height: 34,
     borderRadius: 12,
-    backgroundColor: 'rgba(255,107,61,0.12)',
+    backgroundColor: 'rgba(242,34,28,0.12)',
     alignItems: 'center',
     justifyContent: 'center',
   },

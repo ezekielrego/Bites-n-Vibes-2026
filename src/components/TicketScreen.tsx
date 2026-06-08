@@ -1,10 +1,9 @@
-import React, { useMemo, useState } from 'react';
-import { Alert, Modal, Platform, ScrollView, Share, StyleSheet, Text, View } from 'react-native';
+import React, { useMemo, useRef, useState } from 'react';
+import { Alert, Modal, Platform, RefreshControl, ScrollView, Share, StyleSheet, Text, View } from 'react-native';
 import { Image } from 'expo-image';
-import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
-import * as Sharing from 'expo-sharing';
 import QRCode from 'react-native-qrcode-svg';
+import { captureRef } from 'react-native-view-shot';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { BARCODE_PATTERN } from '../constants';
 import { theme, shadow } from '../theme';
@@ -14,18 +13,26 @@ import { IconButton, PrimaryButton, SecondaryButton } from './Primitives';
 export function TicketScreen({
   event,
   ticket,
+  onAcceptTicket,
   onBack,
   onCancelTicket,
+  onRefresh,
+  refreshing,
 }: {
   event: AppEvent;
   ticket: AppTicket | null;
+  onAcceptTicket: (ticket: AppTicket) => Promise<void>;
   onBack: () => void;
   onCancelTicket: (ticket: AppTicket) => Promise<void>;
+  onRefresh: () => Promise<void>;
+  refreshing: boolean;
 }) {
   const insets = useSafeAreaInsets();
   const [qrOpen, setQrOpen] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [accepting, setAccepting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
+  const ticketCaptureRef = useRef<View>(null);
   const ticketCode = ticket?.referenceCode ?? `BNV-${event.id}`;
   const qrValue = ticket?.qrValue ?? `BNV:${ticketCode}:${event.id}`;
   const shareMessage = useMemo(
@@ -42,12 +49,6 @@ export function TicketScreen({
   };
 
   const handleSaveImage = async () => {
-    const imageUrl = typeof event.ticketImage === 'string' ? event.ticketImage : typeof event.image === 'string' ? event.image : null;
-    if (!imageUrl) {
-      Alert.alert('Image unavailable', 'This ticket image is not ready to save yet.');
-      return;
-    }
-
     setSaving(true);
 
     try {
@@ -56,23 +57,23 @@ export function TicketScreen({
         return;
       }
 
-      const permission = await MediaLibrary.requestPermissionsAsync();
+      const permission = await MediaLibrary.requestPermissionsAsync(true);
       if (!permission.granted) {
         throw new Error('Allow photo access so we can save ticket artwork.');
       }
 
-      const fileUri = `${FileSystem.cacheDirectory ?? ''}ticket-${ticketCode}.jpg`;
-      const downloaded = await FileSystem.downloadAsync(imageUrl, fileUri);
-      await MediaLibrary.saveToLibraryAsync(downloaded.uri);
-
-      if (await Sharing.isAvailableAsync()) {
-        await Sharing.shareAsync(downloaded.uri, {
-          mimeType: 'image/jpeg',
-          dialogTitle: 'Share ticket image',
-        });
+      if (!ticketCaptureRef.current) {
+        throw new Error('The ticket is still preparing. Try again in a moment.');
       }
 
-      Alert.alert('Saved', 'The ticket image is now in your library.');
+      const capturedUri = await captureRef(ticketCaptureRef, {
+        format: 'png',
+        quality: 1,
+        result: 'tmpfile',
+      });
+      await MediaLibrary.saveToLibraryAsync(capturedUri);
+
+      Alert.alert('Saved', 'The ticket image with its QR code is now in your library.');
     } catch (error) {
       Alert.alert('Save failed', error instanceof Error ? error.message : 'The ticket image could not be saved right now.');
     } finally {
@@ -95,6 +96,21 @@ export function TicketScreen({
     }
   };
 
+  const handleAccept = async () => {
+    if (!ticket || !ticket.canAccept) {
+      return;
+    }
+
+    setAccepting(true);
+    try {
+      await onAcceptTicket(ticket);
+    } catch (error) {
+      Alert.alert('Accept failed', error instanceof Error ? error.message : 'The booking could not be accepted right now.');
+    } finally {
+      setAccepting(false);
+    }
+  };
+
   return (
     <>
       <ScrollView
@@ -102,6 +118,15 @@ export function TicketScreen({
           styles.content,
           { paddingTop: insets.top + 8, paddingBottom: insets.bottom + 28 },
         ]}
+        refreshControl={
+          <RefreshControl
+            colors={[theme.colors.accentStrong]}
+            progressBackgroundColor={theme.colors.surfaceStrong}
+            refreshing={refreshing}
+            tintColor={theme.colors.accentStrong}
+            onRefresh={() => void onRefresh()}
+          />
+        }
         showsVerticalScrollIndicator={false}
       >
         <View style={styles.header}>
@@ -110,7 +135,7 @@ export function TicketScreen({
           <IconButton icon="share-2" onPress={() => void handleShare()} accessibilityLabel="Share ticket" />
         </View>
 
-        <View style={styles.ticketShell}>
+        <View ref={ticketCaptureRef} collapsable={false} style={styles.ticketShell}>
           <View style={styles.imageWrap}>
             <Image source={event.ticketImage ?? event.image} contentFit="cover" style={styles.ticketImage} transition={220} />
           </View>
@@ -134,6 +159,8 @@ export function TicketScreen({
                 <TicketField label="Access" value={formatTicketAction(ticket?.actionType)} rightAligned />
                 <TicketField label="Paid" value={ticket ? `${ticket.currency} ${ticket.totalAmount}` : event.price} />
                 <TicketField label="Payment" value={ticket?.paymentStatus ?? 'not_required'} rightAligned />
+                <TicketField label="Quantity" value={String(ticket?.quantity ?? 1)} />
+                <TicketField label="Request" value={ticket?.requestNote || 'None'} rightAligned />
                 <TicketField label="Reference" value={ticketCode} />
                 <TicketField label="Status" value={ticket?.status ?? 'confirmed'} rightAligned />
               </View>
@@ -154,6 +181,23 @@ export function TicketScreen({
                   />
                 ))}
               </View>
+
+              <View style={styles.dashedLine} />
+
+              <View style={styles.ticketQrRow}>
+                <View style={styles.ticketQrCard}>
+                  <QRCode value={qrValue} size={92} color={theme.colors.paperInk} backgroundColor={theme.colors.paper} />
+                </View>
+                <View style={styles.ticketQrCopy}>
+                  <Text style={styles.ticketQrLabel}>Scan reference</Text>
+                  <Text numberOfLines={2} style={styles.ticketQrCode}>
+                    {ticketCode}
+                  </Text>
+                  <Text numberOfLines={2} style={styles.ticketQrHint}>
+                    This QR is generated from the ticket reference.
+                  </Text>
+                </View>
+              </View>
             </View>
           </View>
         </View>
@@ -165,6 +209,13 @@ export function TicketScreen({
 
         {ticket?.canCancel ? (
           <View style={styles.cancelWrap}>
+            {ticket.canAccept ? (
+              <SecondaryButton
+                label={accepting ? 'Confirming...' : 'Confirm booking'}
+                icon="check"
+                onPress={() => void handleAccept()}
+              />
+            ) : null}
             <SecondaryButton
               label={cancelling ? 'Cancelling...' : 'Cancel ticket'}
               icon="x"
@@ -341,6 +392,41 @@ const styles = StyleSheet.create({
     backgroundColor: theme.colors.paperInk,
     borderRadius: 2,
   },
+  ticketQrRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 14,
+  },
+  ticketQrCard: {
+    borderRadius: 16,
+    backgroundColor: theme.colors.paper,
+    padding: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(27,23,20,0.12)',
+  },
+  ticketQrCopy: {
+    flex: 1,
+    gap: 5,
+  },
+  ticketQrLabel: {
+    color: 'rgba(27,23,20,0.42)',
+    fontSize: 11,
+    fontWeight: '800',
+    textTransform: 'uppercase',
+    letterSpacing: 0.8,
+  },
+  ticketQrCode: {
+    color: theme.colors.paperInk,
+    fontSize: 15,
+    fontWeight: '900',
+    letterSpacing: 0.5,
+  },
+  ticketQrHint: {
+    color: 'rgba(27,23,20,0.56)',
+    fontSize: 11,
+    lineHeight: 15,
+    fontWeight: '700',
+  },
   actions: {
     marginTop: 22,
     flexDirection: 'row',
@@ -348,6 +434,7 @@ const styles = StyleSheet.create({
   },
   cancelWrap: {
     marginTop: 12,
+    gap: 12,
   },
   modalScrim: {
     flex: 1,

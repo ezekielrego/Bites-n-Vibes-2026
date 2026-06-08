@@ -1,12 +1,14 @@
-import React, { useDeferredValue, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Animated,
+  BackHandler,
   Easing,
   FlatList,
   FlatListProps,
   NativeSyntheticEvent,
   type ViewToken,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleProp,
   StyleSheet,
@@ -21,14 +23,16 @@ import { Feather } from '@expo/vector-icons';
 import { Image } from 'expo-image';
 import { ResizeMode, type AVPlaybackStatus, Video } from 'expo-av';
 import { LinearGradient } from 'expo-linear-gradient';
+import * as Location from 'expo-location';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { APP_VERSION, TAB_ITEMS } from '../constants';
-import { fetchAppFeed } from '../api';
+import { fetchAppFeed, fetchAppSearchSuggestions, fetchAppSpotlight, recordSearchQuery } from '../api';
 import { theme, shadow } from '../theme';
 import {
   AppCategory,
   AppEvent,
   AppNotification,
+  AppSearchSuggestion,
   AppTicket,
   AppUser,
   CategoryId,
@@ -38,19 +42,23 @@ import {
   UpdateProfileInput,
 } from '../types';
 import {
-  CategoryPill,
   IconButton,
   ScreenTransition,
   SectionHeader,
   useJellyPressAnimation,
 } from './Primitives';
 import { CreateTabView, InboxTabView, ProfileTabView, StreamTabView } from './SecondaryTabViews';
+import { OnboardingTapCue } from './OnboardingTapCue';
 
 type FeatherName = React.ComponentProps<typeof Feather>['name'];
 const APP_LOGO = require('../../logo.png');
 const AnimatedFlatList = Animated.createAnimatedComponent(FlatList) as React.ComponentType<
   FlatListProps<AppEvent>
 >;
+type UserCoordinates = {
+  latitude: number;
+  longitude: number;
+};
 
 const SEARCH_HINTS = [
   'Search events',
@@ -59,9 +67,14 @@ const SEARCH_HINTS = [
   'Search nightlife',
 ];
 const FLOATING_SEARCH_THRESHOLD = 86;
-const FLOATING_HEADER_HEIGHT = 50;
-const FLOATING_HEADER_GAP = 14;
+const FLOATING_HEADER_HEIGHT = 38;
+const FLOATING_CATEGORY_RAIL_HEIGHT = 34;
+const FLOATING_HEADER_GAP = 10;
+const FLOATING_HEADER_TOP_PADDING = 8;
 const CARD_VIDEO_PREVIEW_DELAY_MS = 640;
+const FOR_YOU_CATEGORY_PAGE_SIZE = 8;
+const FLOATING_SEARCH_AUTO_REVEAL_MS = 4000;
+const FLOATING_SEARCH_VISIBLE_CYCLE_MS = 15000;
 
 export function HomeScreen({
   activeTab,
@@ -79,6 +92,7 @@ export function HomeScreen({
   tickets,
   unreadNotificationCount,
   profile,
+  onAcceptTicket,
   onCancelTicket,
   onClearHistory,
   onSelectEvent,
@@ -90,6 +104,7 @@ export function HomeScreen({
   onOpenNotification,
   onMarkAllRead,
   onMarkTicketUsed,
+  onRefresh,
   onCreateEvent,
   onCancelEditListing,
   onChangePassword,
@@ -97,11 +112,14 @@ export function HomeScreen({
   onSignOut,
   onStartEditListing,
   tabDirection,
+  refreshing,
   onToggleEmailNotifications,
   onTogglePushNotifications,
   onUpdateProfile,
   onDiscoverScroll,
   onMenuOpen,
+  onMenuVisibilityChange,
+  showMenuTapCue = false,
 }: {
   activeTab: TabId;
   categories: AppCategory[];
@@ -118,6 +136,7 @@ export function HomeScreen({
   tickets: AppTicket[];
   unreadNotificationCount: number;
   profile: AppUser | null;
+  onAcceptTicket: (ticket: AppTicket) => Promise<void>;
   onCancelTicket: (ticket: AppTicket) => Promise<void>;
   onClearHistory: () => Promise<void>;
   onSelectEvent: (event: AppEvent) => void;
@@ -129,6 +148,7 @@ export function HomeScreen({
   onOpenNotification: (notification: AppNotification) => void;
   onMarkAllRead: () => void;
   onMarkTicketUsed: (ticket: AppTicket) => Promise<void>;
+  onRefresh: () => Promise<void>;
   onCreateEvent: (input: CreateAppEventInput) => Promise<void>;
   onCancelEditListing: () => void;
   onChangePassword: (input: ChangePasswordInput) => Promise<{ message: string }>;
@@ -136,36 +156,52 @@ export function HomeScreen({
   onSignOut: () => void;
   onStartEditListing: (event: AppEvent) => void;
   tabDirection: 1 | -1;
+  refreshing: boolean;
   onToggleEmailNotifications: (enabled: boolean) => Promise<AppUser>;
   onTogglePushNotifications: (enabled: boolean) => Promise<AppUser>;
   onUpdateProfile: (input: UpdateProfileInput) => Promise<AppUser>;
   onDiscoverScroll?: (offsetY: number) => void;
   onMenuOpen?: () => void;
+  onMenuVisibilityChange?: (open: boolean) => void;
+  showMenuTapCue?: boolean;
 }) {
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
   const [activeCategory, setActiveCategory] = useState<CategoryId>('all');
   const [searchQuery, setSearchQuery] = useState('');
+  const [inboxSearchQuery, setInboxSearchQuery] = useState('');
+  const [isInboxSearchFocused, setIsInboxSearchFocused] = useState(false);
+  const [ticketSearchQuery, setTicketSearchQuery] = useState('');
+  const [isTicketSearchFocused, setIsTicketSearchFocused] = useState(false);
+  const [profileHeaderMode, setProfileHeaderMode] = useState<'default' | 'tickets'>('default');
   const [feedEvents, setFeedEvents] = useState<AppEvent[]>(events);
   const [feedNextPage, setFeedNextPage] = useState<number | null>(2);
   const [feedLoading, setFeedLoading] = useState(false);
   const [feedRefreshing, setFeedRefreshing] = useState(false);
   const [feedTotalCount, setFeedTotalCount] = useState(events.length);
+  const [homeUserLocation, setHomeUserLocation] = useState<UserCoordinates | null>(null);
+  const [searchSuggestions, setSearchSuggestions] = useState<AppSearchSuggestion[]>([]);
+  const [backendSpotlightEvents, setBackendSpotlightEvents] = useState<AppEvent[]>([]);
   const [isSearchFocused, setIsSearchFocused] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [floatingSearchVisible, setFloatingSearchVisible] = useState(false);
   const deferredSearchQuery = useDeferredValue(searchQuery);
-  const searchInputRef = useRef<TextInput>(null);
   const floatingSearchInputRef = useRef<TextInput>(null);
+  const inboxSearchInputRef = useRef<TextInput>(null);
+  const ticketSearchInputRef = useRef<TextInput>(null);
   const pendingSearchFocus = useRef(false);
   const searchFocusTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoSearchRevealTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
   const floatingSearchVisibleRef = useRef(false);
+  const autoSearchRevealedRef = useRef(false);
+  const discoverScrollOffsetRef = useRef(0);
   const feedRequestKeyRef = useRef('');
   const categoryRailRef = useRef<ScrollView>(null);
   const categoryLayoutsRef = useRef<Partial<Record<CategoryId, { width: number; x: number }>>>({});
   const menuTranslate = useRef(new Animated.Value(-Math.min(width * 0.76, 320))).current;
   const menuOverlayOpacity = useRef(new Animated.Value(0)).current;
   const scrollY = useRef(new Animated.Value(0)).current;
+  const autoSearchProgress = useRef(new Animated.Value(0)).current;
   const previewEventIdRef = useRef<string | null>(null);
   const [previewEventId, setPreviewEventId] = useState<string | null>(null);
   const viewabilityConfig = useRef({
@@ -185,6 +221,23 @@ export function HomeScreen({
     previewEventIdRef.current = nextPreviewId;
     setPreviewEventId(nextPreviewId);
   }).current;
+  const setAutoSearchVisible = useCallback((visible: boolean, animated = true) => {
+    autoSearchRevealedRef.current = visible;
+    floatingSearchVisibleRef.current = visible;
+    setFloatingSearchVisible(visible);
+
+    if (!animated) {
+      autoSearchProgress.setValue(visible ? 1 : 0);
+      return;
+    }
+
+    Animated.timing(autoSearchProgress, {
+      toValue: visible ? 1 : 0,
+      duration: 420,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: true,
+    }).start();
+  }, [autoSearchProgress]);
 
   useEffect(() => {
     const drawerWidth = Math.min(width * 0.76, 320);
@@ -211,10 +264,62 @@ export function HomeScreen({
   }, [activeTab]);
 
   useEffect(() => {
+    let cancelled = false;
+
+    if (autoSearchRevealTimeout.current) {
+      clearTimeout(autoSearchRevealTimeout.current);
+      autoSearchRevealTimeout.current = null;
+    }
+
+    if (activeTab !== 'discover') {
+      return;
+    }
+
+    const shouldShowSearchImmediately = searchQuery.trim().length > 0 || isSearchFocused;
+    setAutoSearchVisible(shouldShowSearchImmediately, false);
+
+    if (shouldShowSearchImmediately) {
+      return;
+    }
+
+    const scheduleCycle = (visible: boolean) => {
+      autoSearchRevealTimeout.current = setTimeout(
+        () => {
+          if (cancelled) {
+            return;
+          }
+
+          const nextVisible = !visible;
+          setAutoSearchVisible(nextVisible);
+          scheduleCycle(nextVisible);
+        },
+        visible ? FLOATING_SEARCH_VISIBLE_CYCLE_MS : FLOATING_SEARCH_AUTO_REVEAL_MS,
+      );
+    };
+
+    scheduleCycle(false);
+
+    return () => {
+      cancelled = true;
+      if (autoSearchRevealTimeout.current) {
+        clearTimeout(autoSearchRevealTimeout.current);
+        autoSearchRevealTimeout.current = null;
+      }
+    };
+  }, [activeTab, isSearchFocused, searchQuery, setAutoSearchVisible]);
+
+  useEffect(() => {
     if (menuOpen) {
       onMenuOpen?.();
     }
-  }, [menuOpen, onMenuOpen]);
+    onMenuVisibilityChange?.(menuOpen);
+  }, [menuOpen, onMenuOpen, onMenuVisibilityChange]);
+
+  useEffect(() => {
+    if (activeTab === 'inbox' && unreadNotificationCount > 0) {
+      void onMarkAllRead();
+    }
+  }, [activeTab, onMarkAllRead, unreadNotificationCount]);
 
   useEffect(() => {
     if (categories.length === 0) {
@@ -228,10 +333,92 @@ export function HomeScreen({
   }, [activeCategory, categories]);
 
   useEffect(() => {
-    setFeedEvents(events);
-    setFeedTotalCount(events.length);
+    if (activeTab !== 'discover') {
+      return;
+    }
+
+    let cancelled = false;
+
+    const loadHomeUserLocation = async () => {
+      try {
+        const permission = await Location.getForegroundPermissionsAsync();
+        if (!permission.granted) {
+          return;
+        }
+
+        const position = await Location.getCurrentPositionAsync({
+          accuracy: Location.Accuracy.Balanced,
+        });
+
+        if (cancelled) {
+          return;
+        }
+
+        setHomeUserLocation({
+          latitude: position.coords.latitude,
+          longitude: position.coords.longitude,
+        });
+      } catch {
+        if (!cancelled) {
+          setHomeUserLocation(null);
+        }
+      }
+    };
+
+    void loadHomeUserLocation();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (activeTab !== 'discover' || !isSearchFocused) {
+      return;
+    }
+
+    let cancelled = false;
+    const timeout = setTimeout(() => {
+      fetchAppSearchSuggestions({
+        categoryId: activeCategory,
+        query: searchQuery,
+        limit: 8,
+      })
+        .then((suggestions) => {
+          if (!cancelled) {
+            setSearchSuggestions(suggestions);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setSearchSuggestions(buildLocalSearchSuggestions(searchQuery, activeCategory, categories, events));
+          }
+        });
+    }, 160);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timeout);
+    };
+  }, [activeCategory, activeTab, categories, events, isSearchFocused, searchQuery]);
+
+  useEffect(() => {
+    const localEvents = events.filter((event) => eventMatchesFeedFilters(event, activeCategory, deferredSearchQuery));
+    setFeedEvents((current) => {
+      if (activeCategory !== 'all') {
+        return localEvents;
+      }
+
+      const currentMatchingEvents = current.filter((event) =>
+        eventMatchesFeedFilters(event, activeCategory, deferredSearchQuery),
+      );
+      return buildForYouMingledEvents(mergeUniqueEvents(currentMatchingEvents, localEvents));
+    });
+    setFeedTotalCount((current) =>
+      activeCategory === 'all' ? Math.max(current, localEvents.length) : localEvents.length,
+    );
     setFeedNextPage(2);
-  }, [events]);
+  }, [activeCategory, deferredSearchQuery, events]);
 
   useEffect(() => {
     if (!pendingSearchFocus.current || menuOpen || activeTab !== 'discover') {
@@ -243,11 +430,7 @@ export function HomeScreen({
     }
 
     searchFocusTimeout.current = setTimeout(() => {
-      if (floatingSearchVisibleRef.current) {
-        floatingSearchInputRef.current?.focus();
-      } else {
-        searchInputRef.current?.focus();
-      }
+      floatingSearchInputRef.current?.focus();
       pendingSearchFocus.current = false;
       searchFocusTimeout.current = null;
     }, 260);
@@ -264,6 +447,9 @@ export function HomeScreen({
     return () => {
       if (searchFocusTimeout.current) {
         clearTimeout(searchFocusTimeout.current);
+      }
+      if (autoSearchRevealTimeout.current) {
+        clearTimeout(autoSearchRevealTimeout.current);
       }
     };
   }, []);
@@ -320,10 +506,30 @@ export function HomeScreen({
         pageSize: 10,
         search: deferredSearchQuery,
       })
-        .then((page) => {
+        .then(async (page) => {
           if (feedRequestKeyRef.current !== requestKey) {
             return;
           }
+
+          if (activeCategory === 'all') {
+            const categoryEvents = await fetchForYouCategoryEvents(categories, deferredSearchQuery);
+            if (feedRequestKeyRef.current !== requestKey) {
+              return;
+            }
+
+            const mixedEvents = buildForYouMingledEvents(
+              mergeUniqueEvents(
+                page.events,
+                categoryEvents,
+                events.filter((event) => eventMatchesFeedFilters(event, activeCategory, deferredSearchQuery)),
+              ),
+            );
+            setFeedEvents(mixedEvents);
+            setFeedNextPage(page.nextPage);
+            setFeedTotalCount(Math.max(page.totalCount, mixedEvents.length));
+            return;
+          }
+
           setFeedEvents(page.events);
           setFeedNextPage(page.nextPage);
           setFeedTotalCount(page.totalCount);
@@ -332,19 +538,10 @@ export function HomeScreen({
           if (feedRequestKeyRef.current !== requestKey) {
             return;
           }
-          const localQuery = deferredSearchQuery.trim().toLowerCase();
-          const localEvents = events.filter((event) => {
-            const matchesCategory =
-              activeCategory === 'all' || event.categories.some((category) => category.id === activeCategory);
-            const matchesQuery =
-              localQuery.length === 0 ||
-              [event.artist, event.title, event.city, event.venue].some((value) =>
-                value.toLowerCase().includes(localQuery),
-              );
-
-            return matchesCategory && matchesQuery;
-          });
-          setFeedEvents(localEvents);
+          const localEvents = events.filter((event) =>
+            eventMatchesFeedFilters(event, activeCategory, deferredSearchQuery),
+          );
+          setFeedEvents(activeCategory === 'all' ? buildForYouMingledEvents(localEvents) : localEvents);
           setFeedNextPage(null);
           setFeedTotalCount(localEvents.length);
         })
@@ -357,6 +554,35 @@ export function HomeScreen({
 
     return () => clearTimeout(timeout);
   }, [activeCategory, activeTab, categories, deferredSearchQuery, events]);
+
+  useEffect(() => {
+    if (activeTab !== 'discover' || categories.length === 0) {
+      return;
+    }
+
+    let cancelled = false;
+    fetchAppSpotlight({
+      categories,
+      categoryId: activeCategory,
+      latitude: homeUserLocation?.latitude ?? null,
+      longitude: homeUserLocation?.longitude ?? null,
+      limit: 4,
+    })
+      .then((spotlightEvents) => {
+        if (!cancelled) {
+          setBackendSpotlightEvents(spotlightEvents);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setBackendSpotlightEvents([]);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeCategory, activeTab, categories, homeUserLocation]);
 
   const loadNextFeedPage = () => {
     if (feedLoading || feedRefreshing || !feedNextPage || activeTab !== 'discover') {
@@ -388,7 +614,18 @@ export function HomeScreen({
       .finally(() => setFeedLoading(false));
   };
 
-  const filteredEvents = feedEvents;
+  const filteredEvents = useMemo(
+    () =>
+      activeCategory === 'all'
+        ? buildForYouMingledEvents(
+            mergeUniqueEvents(
+              feedEvents.filter((event) => eventMatchesFeedFilters(event, activeCategory, deferredSearchQuery)),
+              events.filter((event) => eventMatchesFeedFilters(event, activeCategory, deferredSearchQuery)),
+            ),
+          )
+        : feedEvents.filter((event) => eventMatchesFeedFilters(event, activeCategory, deferredSearchQuery)),
+    [activeCategory, deferredSearchQuery, events, feedEvents],
+  );
   const activeCategoryDetails = categories.find((category) => category.id === activeCategory);
   const categoryFeedTitle =
     activeCategory === 'all' ? 'All categories' : activeCategoryDetails?.name ?? 'Category';
@@ -405,37 +642,102 @@ export function HomeScreen({
     }
   }, [filteredEvents, previewEventId]);
 
-  const spotlightEvents = buildDynamicSpotlightEvents(filteredEvents.length > 0 ? filteredEvents : events, activeCategory);
+  const spotlightEvents =
+    backendSpotlightEvents.length > 0
+      ? backendSpotlightEvents
+      : buildDynamicSpotlightEvents(filteredEvents.length > 0 ? filteredEvents : events, activeCategory);
   const spotlightCardWidth = Math.max(width - 84, 292);
   const savedEvents = events.filter((event) => event.isSaved);
+  const fixedTopNavOffset =
+    insets.top +
+    FLOATING_HEADER_TOP_PADDING +
+    FLOATING_HEADER_HEIGHT +
+    FLOATING_CATEGORY_RAIL_HEIGHT +
+    FLOATING_HEADER_GAP +
+    12;
   const discoverContentPadding: StyleProp<ViewStyle> = [
     styles.content,
     styles.discoverContent,
     {
-      paddingTop: insets.top + FLOATING_HEADER_HEIGHT + FLOATING_HEADER_GAP,
+      paddingTop:
+        insets.top +
+        FLOATING_HEADER_TOP_PADDING +
+        FLOATING_HEADER_HEIGHT +
+        FLOATING_CATEGORY_RAIL_HEIGHT +
+        FLOATING_HEADER_GAP +
+        12,
       paddingBottom: insets.bottom + 110,
     },
   ];
   const contentPadding: StyleProp<ViewStyle> = [
     styles.content,
     activeTab === 'create' ? styles.createContent : null,
-    { paddingTop: insets.top + 8, paddingBottom: insets.bottom + 110 },
+    {
+      paddingTop: activeTab === 'create' || activeTab === 'inbox' || activeTab === 'profile' ? fixedTopNavOffset + 12 : insets.top + 8,
+      paddingBottom: insets.bottom + 110,
+    },
   ];
-  const floatingSearchProgress = scrollY.interpolate({
-    inputRange: [0, FLOATING_SEARCH_THRESHOLD * 0.45, FLOATING_SEARCH_THRESHOLD],
-    outputRange: [0, 0.35, 1],
+  const floatingSearchRevealProgress = autoSearchProgress.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0, 1],
     extrapolate: 'clamp',
   });
 
   const handleDiscoverScroll = (event: NativeSyntheticEvent<NativeScrollEvent>) => {
-    onDiscoverScroll?.(event.nativeEvent.contentOffset.y);
+    const offsetY = event.nativeEvent.contentOffset.y;
+    discoverScrollOffsetRef.current = offsetY;
+    onDiscoverScroll?.(offsetY);
 
-    const nextVisible = event.nativeEvent.contentOffset.y >= FLOATING_SEARCH_THRESHOLD;
-    if (nextVisible !== floatingSearchVisibleRef.current) {
-      floatingSearchVisibleRef.current = nextVisible;
-      setFloatingSearchVisible(nextVisible);
+    if (offsetY >= FLOATING_SEARCH_THRESHOLD && !autoSearchRevealedRef.current) {
+      setAutoSearchVisible(true);
     }
   };
+
+  const handleSearchSuggestionPress = (suggestion: AppSearchSuggestion) => {
+    if (suggestion.type === 'nearby') {
+      onOpenNearby();
+      return;
+    }
+
+    setSearchQuery(suggestion.query);
+    setIsSearchFocused(false);
+    floatingSearchInputRef.current?.blur();
+    void recordSearchQuery({
+      categoryId: activeCategory,
+      query: suggestion.query,
+      resultCount: filteredEvents.length,
+    }).catch(() => undefined);
+  };
+
+  const handleCloseSearch = useCallback(() => {
+    setSearchQuery('');
+    setIsSearchFocused(false);
+    setSearchSuggestions([]);
+    floatingSearchInputRef.current?.blur();
+    setAutoSearchVisible(false);
+  }, [setAutoSearchVisible]);
+
+  useEffect(() => {
+    if (activeTab !== 'discover' || (!isSearchFocused && searchQuery.trim().length === 0)) {
+      return;
+    }
+
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      handleCloseSearch();
+      return true;
+    });
+
+    return () => subscription.remove();
+  }, [activeTab, handleCloseSearch, isSearchFocused, searchQuery]);
+
+  useEffect(() => {
+    if (activeTab !== 'profile') {
+      setProfileHeaderMode('default');
+      setTicketSearchQuery('');
+      setIsTicketSearchFocused(false);
+      ticketSearchInputRef.current?.blur();
+    }
+  }, [activeTab]);
 
   const content =
     activeTab !== 'discover' ? (
@@ -450,9 +752,10 @@ export function HomeScreen({
         createProgress={createProgress}
         createStage={createStage}
         historyEvents={historyEvents}
-        menuOpen={menuOpen}
+        inboxSearchQuery={inboxSearchQuery}
         myListings={myListings}
         notifications={notifications}
+        onAcceptTicket={onAcceptTicket}
         onCancelTicket={onCancelTicket}
         onClearHistory={onClearHistory}
         tickets={tickets}
@@ -464,22 +767,24 @@ export function HomeScreen({
         onMarkAllRead={onMarkAllRead}
         onMarkTicketUsed={onMarkTicketUsed}
         onOpenNotification={onOpenNotification}
-        onOpenNearby={onOpenNearby}
         onOpenTicket={onOpenTicket}
         onOpenCategory={handleOpenCategory}
         onRemoveHistoryItem={onRemoveHistoryItem}
+        onRefresh={onRefresh}
         onSelectEvent={onSelectEvent}
         onSignOut={onSignOut}
         onStartEditListing={onStartEditListing}
         onTabChange={onTabChange}
-        onToggleMenu={() => setMenuOpen((current) => !current)}
         onToggleEmailNotifications={onToggleEmailNotifications}
         onTogglePushNotifications={onTogglePushNotifications}
         onToggleSave={onToggleSave}
         onUpdateProfile={onUpdateProfile}
         profile={profile}
+        refreshing={refreshing}
         savedEvents={savedEvents}
+        ticketSearchQuery={ticketSearchQuery}
         unreadNotificationCount={unreadNotificationCount}
+        onProfileHeaderModeChange={setProfileHeaderMode}
       />
     ) : (
       <AnimatedFlatList
@@ -505,6 +810,15 @@ export function HomeScreen({
         windowSize={5}
         removeClippedSubviews
         showsVerticalScrollIndicator={false}
+        refreshControl={
+          <RefreshControl
+            colors={[theme.colors.accentStrong]}
+            progressBackgroundColor={theme.colors.surfaceStrong}
+            refreshing={refreshing}
+            tintColor={theme.colors.accentStrong}
+            onRefresh={() => void onRefresh()}
+          />
+        }
         ItemSeparatorComponent={() => <View style={styles.separator} />}
         ListEmptyComponent={
           <View style={styles.emptyCard}>
@@ -515,37 +829,6 @@ export function HomeScreen({
         ListFooterComponent={feedLoading ? <FeedFooterSkeleton /> : null}
         ListHeaderComponent={
           <>
-            <SearchShell
-              inputRef={searchInputRef}
-              isFocused={isSearchFocused}
-              query={searchQuery}
-              onBlur={() => setIsSearchFocused(false)}
-              onChangeText={setSearchQuery}
-              onFocus={() => setIsSearchFocused(true)}
-            />
-
-            <ScrollView
-              ref={categoryRailRef}
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              contentContainerStyle={styles.categoryRow}
-            >
-              {categories.map((category) => (
-                <View
-                  key={category.id}
-                  onLayout={(event) => {
-                    categoryLayoutsRef.current[category.id] = event.nativeEvent.layout;
-                  }}
-                >
-                  <CategoryPill
-                    active={category.id === activeCategory}
-                    category={category}
-                    onPress={() => handleOpenCategory(category.id)}
-                  />
-                </View>
-              ))}
-            </ScrollView>
-
             {activeCategory !== 'all' ? (
               <View style={styles.categoryFeedBanner}>
                 <View style={styles.categoryFeedIcon}>
@@ -571,33 +854,42 @@ export function HomeScreen({
                 contentContainerStyle={styles.spotlightRail}
               >
                 {spotlightEvents.map((spotlightEvent) => (
-                  <Pressable key={spotlightEvent.id} delayLongPress={120} onPress={() => onSelectEvent(spotlightEvent)}>
+                  <Pressable
+                    key={spotlightEvent.id}
+                    delayLongPress={120}
+                    onPress={() => onSelectEvent(spotlightEvent)}
+                    style={[styles.spotlightCard, { width: spotlightCardWidth }]}
+                  >
+                    <Image
+                      source={spotlightEvent.ticketImage ?? spotlightEvent.image}
+                      contentFit="cover"
+                      style={styles.spotlightImage}
+                      transition={200}
+                    />
                     <LinearGradient
-                      colors={['rgba(255,107,61,0.24)', 'rgba(40,48,70,0.95)']}
+                      colors={['rgba(8,10,14,0.02)', 'rgba(8,10,14,0.9)']}
+                      start={{ x: 0.4, y: 0.12 }}
+                      end={{ x: 0.5, y: 1 }}
+                      style={styles.spotlightImageFade}
+                    />
+                    <LinearGradient
+                      colors={['rgba(242,34,28,0.26)', 'rgba(242,34,28,0)']}
                       start={{ x: 0, y: 0 }}
-                      end={{ x: 1, y: 1 }}
-                      style={[styles.spotlightCard, { width: spotlightCardWidth }]}
-                    >
-                      <View style={styles.spotlightImageWrap}>
-                        <Image
-                          source={spotlightEvent.ticketImage ?? spotlightEvent.image}
-                          contentFit="cover"
-                          style={styles.spotlightImage}
-                          transition={200}
-                        />
-                        <LinearGradient
-                          colors={['rgba(40,48,70,0.98)', 'rgba(40,48,70,0.56)', 'rgba(40,48,70,0.04)']}
-                          start={{ x: 0, y: 0.5 }}
-                          end={{ x: 1, y: 0.5 }}
-                          style={styles.spotlightImageFade}
-                        />
-                      </View>
+                      end={{ x: 1, y: 0.75 }}
+                      style={styles.spotlightBrandWash}
+                    />
+                    <View style={styles.spotlightContent}>
                       <View style={styles.spotlightBody}>
                         <View style={styles.spotlightBadge}>
                           <View style={styles.spotlightDot} />
                           <Text style={styles.spotlightBadgeText}>Spotlight</Text>
                         </View>
-                        <Text style={styles.spotlightTitle}>{spotlightEvent.artist}</Text>
+                        <View style={styles.spotlightTitleRow}>
+                          <Text numberOfLines={1} ellipsizeMode="tail" style={styles.spotlightTitle}>
+                            {spotlightEvent.artist || spotlightEvent.title}
+                          </Text>
+                          {spotlightEvent.isVerified ? <VerifiedBadge /> : null}
+                        </View>
                         <Text style={styles.spotlightCopy} numberOfLines={2}>
                           {spotlightEvent.blurb}
                         </Text>
@@ -608,13 +900,17 @@ export function HomeScreen({
                           </Text>
                         </View>
                       </View>
-                    </LinearGradient>
+                    </View>
                   </Pressable>
                 ))}
               </ScrollView>
             ) : null}
 
-            <SectionHeader title={activeCategory === 'all' ? 'Upcoming events' : `${categoryFeedTitle} feed`} actionLabel="See all" />
+            <SectionHeader
+              title={activeCategory === 'all' ? 'Mixed Vibes' : `${categoryFeedTitle} feed`}
+              actionLabel="Find nearby"
+              onActionPress={onOpenNearby}
+            />
           </>
         }
         renderItem={({ item }) => (
@@ -623,6 +919,7 @@ export function HomeScreen({
             isPreviewActive={previewEventId === item.id}
             onPress={() => onSelectEvent(item)}
             onToggleSave={() => onToggleSave(item)}
+            userLocation={homeUserLocation}
           />
         )}
       />
@@ -636,20 +933,52 @@ export function HomeScreen({
 
       {activeTab === 'discover' ? (
       <DiscoverFloatingHeaderLayer
-        floatingSearchProgress={floatingSearchProgress}
+        activeCategory={activeCategory}
+        categories={categories}
+        categoryLayoutsRef={categoryLayoutsRef}
+        categoryRailRef={categoryRailRef}
+        floatingSearchProgress={floatingSearchRevealProgress}
         floatingSearchVisible={floatingSearchVisible}
         inputRef={floatingSearchInputRef}
         isFocused={isSearchFocused}
         menuOpen={menuOpen}
+        onCloseSearch={handleCloseSearch}
+        onOpenCategory={handleOpenCategory}
         onOpenNearby={onOpenNearby}
+        onSearchSuggestionPress={handleSearchSuggestionPress}
         profile={profile}
         query={searchQuery}
         safeTop={insets.top}
+        searchSuggestions={searchSuggestions}
         onBlur={() => setIsSearchFocused(false)}
         onChangeText={setSearchQuery}
         onFocus={() => setIsSearchFocused(true)}
         onToggleMenu={() => setMenuOpen((current) => !current)}
+        showMenuTapCue={showMenuTapCue}
       />
+      ) : null}
+
+      {activeTab === 'create' || activeTab === 'inbox' || activeTab === 'profile' ? (
+        <FixedAppHeaderLayer
+          activeCategory={activeCategory}
+          categories={categories}
+          categoryLayoutsRef={categoryLayoutsRef}
+          categoryRailRef={categoryRailRef}
+          headerMode={activeTab === 'inbox' ? 'inbox' : activeTab === 'profile' && profileHeaderMode === 'tickets' ? 'tickets' : 'default'}
+          inboxInputRef={activeTab === 'profile' && profileHeaderMode === 'tickets' ? ticketSearchInputRef : inboxSearchInputRef}
+          inboxIsFocused={activeTab === 'profile' && profileHeaderMode === 'tickets' ? isTicketSearchFocused : isInboxSearchFocused}
+          inboxQuery={activeTab === 'profile' && profileHeaderMode === 'tickets' ? ticketSearchQuery : inboxSearchQuery}
+          menuOpen={menuOpen}
+          onInboxBlur={() => (activeTab === 'profile' && profileHeaderMode === 'tickets' ? setIsTicketSearchFocused(false) : setIsInboxSearchFocused(false))}
+          onInboxChangeText={activeTab === 'profile' && profileHeaderMode === 'tickets' ? setTicketSearchQuery : setInboxSearchQuery}
+          onInboxFocus={() => (activeTab === 'profile' && profileHeaderMode === 'tickets' ? setIsTicketSearchFocused(true) : setIsInboxSearchFocused(true))}
+          onOpenCategory={handleOpenCategory}
+          onOpenNearby={onOpenNearby}
+          profile={profile}
+          safeTop={insets.top}
+          onToggleMenu={() => setMenuOpen((current) => !current)}
+          showMenuTapCue={showMenuTapCue}
+        />
       ) : null}
 
       <DrawerMenu
@@ -660,6 +989,7 @@ export function HomeScreen({
         onSearchPress={handleDrawerSearchPress}
         onTabChange={onTabChange}
         overlayOpacity={menuOverlayOpacity}
+        topOffset={0}
         translateX={menuTranslate}
         width={Math.min(width * 0.76, 320)}
       />
@@ -668,28 +998,66 @@ export function HomeScreen({
 }
 
 function SearchShell({
+  hints = SEARCH_HINTS,
   inputRef,
   isFocused,
+  leadingIcon = 'search',
+  leadingIconAccessibilityLabel = 'Search action',
+  leadingIconColor = theme.colors.textMuted,
+  onLeadingIconPress,
   query,
   onBlur,
   onChangeText,
   onFocus,
+  onSubmitSearch,
+  onSuggestionPress,
+  showSuggestions = false,
   style,
+  suggestions = [],
 }: {
+  hints?: string[];
   inputRef: React.RefObject<TextInput | null>;
   isFocused: boolean;
+  leadingIcon?: FeatherName;
+  leadingIconAccessibilityLabel?: string;
+  leadingIconColor?: string;
+  onLeadingIconPress?: () => void;
   query: string;
   onBlur: () => void;
   onChangeText: (value: string) => void;
   onFocus: () => void;
+  onSubmitSearch?: (query: string) => void;
+  onSuggestionPress?: (suggestion: AppSearchSuggestion) => void;
+  showSuggestions?: boolean;
   style?: StyleProp<ViewStyle>;
+  suggestions?: AppSearchSuggestion[];
 }) {
+  const leadingIconNode = <Feather color={leadingIconColor} name={leadingIcon} size={18} />;
+  const visibleSuggestions = showSuggestions ? suggestions.slice(0, 8) : [];
+
   return (
     <View style={[styles.searchShell, style]}>
-      <Feather color={theme.colors.textMuted} name={'search' as FeatherName} size={18} />
+      {onLeadingIconPress ? (
+        <Pressable
+          accessibilityLabel={leadingIconAccessibilityLabel}
+          accessibilityRole="button"
+          hitSlop={8}
+          onPress={onLeadingIconPress}
+          style={styles.searchLeadingIconButton}
+        >
+          {leadingIconNode}
+        </Pressable>
+      ) : (
+        <View style={styles.searchLeadingIconStatic}>{leadingIconNode}</View>
+      )}
       <View style={styles.searchInputWrap}>
-        {!query && !isFocused ? <JellySearchPlaceholder phrases={SEARCH_HINTS} /> : null}
+        {!query && !isFocused ? <JellySearchPlaceholder phrases={hints} /> : null}
         <TextInput
+          onSubmitEditing={() => {
+            if (query.trim().length > 0) {
+              onSubmitSearch?.(query);
+            }
+          }}
           placeholder=""
           ref={inputRef}
           style={styles.searchInput}
@@ -701,50 +1069,79 @@ function SearchShell({
       </View>
       <View style={styles.searchDivider} />
       <Feather color={theme.colors.textMuted} name={'sliders' as FeatherName} size={16} />
+      {visibleSuggestions.length > 0 ? (
+        <View style={styles.searchSuggestionsPanel}>
+          {visibleSuggestions.map((suggestion) => (
+            <Pressable
+              key={suggestion.id}
+              accessibilityRole="button"
+              onPress={() => onSuggestionPress?.(suggestion)}
+              style={styles.searchSuggestionRow}
+            >
+              <View style={styles.searchSuggestionIcon}>
+                <Feather color={theme.colors.accentStrong} name={getSearchSuggestionIcon(suggestion.type)} size={14} />
+              </View>
+              <View style={styles.searchSuggestionCopy}>
+                <Text numberOfLines={1} style={styles.searchSuggestionLabel}>{suggestion.label}</Text>
+                {suggestion.hint ? (
+                  <Text numberOfLines={1} style={styles.searchSuggestionHint}>{suggestion.hint}</Text>
+                ) : null}
+              </View>
+            </Pressable>
+          ))}
+        </View>
+      ) : null}
     </View>
   );
 }
 
 function JellySearchPlaceholder({ phrases }: { phrases: string[] }) {
+  const phraseKey = phrases.join('|');
+  const normalizedPhrases = useMemo(() => phrases.filter((phrase) => phrase.trim().length > 0), [phraseKey]);
   const [phraseIndex, setPhraseIndex] = useState(0);
-  const motion = useRef(new Animated.Value(0)).current;
+  const motion = useRef(new Animated.Value(1)).current;
 
   useEffect(() => {
-    if (phrases.length === 0) {
+    if (normalizedPhrases.length === 0) {
       return;
     }
 
     let cancelled = false;
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
-    motion.setValue(0);
+    setPhraseIndex(0);
+    motion.setValue(1);
 
-    Animated.spring(motion, {
-      toValue: 1,
-      stiffness: 110,
-      damping: 26,
-      mass: 1.12,
-      useNativeDriver: true,
-    }).start(({ finished }) => {
-      if (!finished || cancelled) {
-        return;
-      }
-
+    const scheduleNextPhrase = () => {
       timeoutId = setTimeout(() => {
         Animated.timing(motion, {
           toValue: 0,
-          duration: 300,
-          easing: Easing.inOut(Easing.cubic),
+          duration: 180,
+          easing: Easing.out(Easing.cubic),
           useNativeDriver: true,
         }).start(({ finished: didFinish }) => {
           if (!didFinish || cancelled) {
             return;
           }
 
-          setPhraseIndex((current) => (current + 1) % phrases.length);
+          setPhraseIndex((current) => (current + 1) % normalizedPhrases.length);
+          motion.setValue(0);
+
+          Animated.timing(motion, {
+            toValue: 1,
+            duration: 260,
+            easing: Easing.out(Easing.cubic),
+            useNativeDriver: true,
+          }).start(({ finished }) => {
+            if (finished && !cancelled) {
+              scheduleNextPhrase();
+            }
+          });
         });
-      }, 1680);
-    });
+      }, 2200);
+    };
+
+    scheduleNextPhrase();
 
     return () => {
       cancelled = true;
@@ -753,9 +1150,9 @@ function JellySearchPlaceholder({ phrases }: { phrases: string[] }) {
       }
       motion.stopAnimation();
     };
-  }, [motion, phraseIndex, phrases]);
+  }, [motion, normalizedPhrases.length, phraseKey]);
 
-  const phrase = phrases[phraseIndex];
+  const phrase = normalizedPhrases[phraseIndex % Math.max(normalizedPhrases.length, 1)];
 
   if (!phrase) {
     return null;
@@ -768,26 +1165,14 @@ function JellySearchPlaceholder({ phrases }: { phrases: string[] }) {
         styles.animatedPlaceholder,
         {
           opacity: motion.interpolate({
-            inputRange: [0, 0.52, 1],
-            outputRange: [0, 0.7, 1],
+            inputRange: [0, 1],
+            outputRange: [0, 0.52],
           }),
           transform: [
             {
               translateY: motion.interpolate({
                 inputRange: [0, 1],
-                outputRange: [14, 0],
-              }),
-            },
-            {
-              scaleX: motion.interpolate({
-                inputRange: [0, 0.62, 1],
-                outputRange: [0.985, 1.012, 1],
-              }),
-            },
-            {
-              scaleY: motion.interpolate({
-                inputRange: [0, 0.62, 1],
-                outputRange: [1.035, 0.982, 1],
+                outputRange: [5, 0],
               }),
             },
           ],
@@ -801,6 +1186,24 @@ function JellySearchPlaceholder({ phrases }: { phrases: string[] }) {
   );
 }
 
+function getSearchSuggestionIcon(type: AppSearchSuggestion['type']): FeatherName {
+  switch (type) {
+    case 'nearby':
+      return 'map-pin';
+    case 'listing':
+      return 'coffee';
+    case 'category':
+      return 'grid';
+    case 'tag':
+      return 'hash' as FeatherName;
+    case 'recent':
+      return 'clock';
+    case 'popular':
+    default:
+      return 'search';
+  }
+}
+
 function SecondaryTabContent({
   activeTab,
   categories,
@@ -812,9 +1215,10 @@ function SecondaryTabContent({
   createProgress,
   createStage,
   historyEvents,
-  menuOpen,
+  inboxSearchQuery,
   myListings,
   notifications,
+  onAcceptTicket,
   onCancelTicket,
   onClearHistory,
   tickets,
@@ -825,22 +1229,24 @@ function SecondaryTabContent({
   onCreateEvent,
   onMarkAllRead,
   onMarkTicketUsed,
-  onOpenNearby,
   onOpenNotification,
   onOpenTicket,
   onOpenCategory,
+  onProfileHeaderModeChange,
   onRemoveHistoryItem,
+  onRefresh,
   onSelectEvent,
   onSignOut,
   onStartEditListing,
   onTabChange,
-  onToggleMenu,
   onToggleEmailNotifications,
   onTogglePushNotifications,
   onToggleSave,
   onUpdateProfile,
   profile,
+  refreshing,
   savedEvents,
+  ticketSearchQuery,
   unreadNotificationCount,
 }: {
   activeTab: TabId;
@@ -853,9 +1259,10 @@ function SecondaryTabContent({
   createProgress: number;
   createStage: string | null;
   historyEvents: AppEvent[];
-  menuOpen: boolean;
+  inboxSearchQuery: string;
   myListings: AppEvent[];
   notifications: AppNotification[];
+  onAcceptTicket: (ticket: AppTicket) => Promise<void>;
   onCancelTicket: (ticket: AppTicket) => Promise<void>;
   onClearHistory: () => Promise<void>;
   tickets: AppTicket[];
@@ -866,32 +1273,52 @@ function SecondaryTabContent({
   onCreateEvent: (input: CreateAppEventInput) => Promise<void>;
   onMarkAllRead: () => void;
   onMarkTicketUsed: (ticket: AppTicket) => Promise<void>;
-  onOpenNearby: () => void;
   onOpenNotification: (notification: AppNotification) => void;
   onOpenTicket: (ticket: AppTicket) => void;
   onOpenCategory: (categoryId: CategoryId) => void;
+  onProfileHeaderModeChange: (mode: 'default' | 'tickets') => void;
   onRemoveHistoryItem: (event: AppEvent) => Promise<void>;
+  onRefresh: () => Promise<void>;
   onSelectEvent: (event: AppEvent) => void;
   onSignOut: () => void;
   onStartEditListing: (event: AppEvent) => void;
   onTabChange: (tab: TabId) => void;
-  onToggleMenu: () => void;
   onToggleEmailNotifications: (enabled: boolean) => Promise<AppUser>;
   onTogglePushNotifications: (enabled: boolean) => Promise<AppUser>;
   onToggleSave: (event: AppEvent) => void;
   onUpdateProfile: (input: UpdateProfileInput) => Promise<AppUser>;
   profile: AppUser | null;
+  refreshing: boolean;
   savedEvents: AppEvent[];
+  ticketSearchQuery: string;
   unreadNotificationCount: number;
 }) {
   if (activeTab === 'stream') {
-    return <StreamTabView events={events} onSelectEvent={onSelectEvent} onToggleSave={onToggleSave} />;
+    return (
+      <StreamTabView
+        events={events}
+        onRefresh={onRefresh}
+        onSelectEvent={onSelectEvent}
+        onToggleSave={onToggleSave}
+        refreshing={refreshing}
+      />
+    );
   }
 
   return (
-    <ScrollView contentContainerStyle={contentPadding} showsVerticalScrollIndicator={false}>
-      <HomeHeader menuOpen={menuOpen} onOpenNearby={onOpenNearby} onToggleMenu={onToggleMenu} profile={profile} />
-
+    <ScrollView
+      contentContainerStyle={contentPadding}
+      refreshControl={
+        <RefreshControl
+          colors={[theme.colors.accentStrong]}
+          progressBackgroundColor={theme.colors.surfaceStrong}
+          refreshing={refreshing}
+          tintColor={theme.colors.accentStrong}
+          onRefresh={() => void onRefresh()}
+        />
+      }
+      showsVerticalScrollIndicator={false}
+    >
       {activeTab === 'create' ? (
         <CreateTabView
           categories={categories}
@@ -911,8 +1338,8 @@ function SecondaryTabContent({
           notifications={notifications}
           receivedTickets={receivedTickets}
           tickets={tickets}
-          unreadCount={unreadNotificationCount}
-          onMarkAllRead={onMarkAllRead}
+          searchQuery={inboxSearchQuery}
+          onAcceptTicket={onAcceptTicket}
           onOpenNotification={onOpenNotification}
           onOpenTicket={onOpenTicket}
         />
@@ -930,7 +1357,7 @@ function SecondaryTabContent({
           onEditListing={onStartEditListing}
           onMarkTicketUsed={onMarkTicketUsed}
           onOpenCategory={onOpenCategory}
-          onOpenSavedTab={() => onTabChange('stream')}
+          onHeaderModeChange={onProfileHeaderModeChange}
           onSignOut={onSignOut}
           onStartCreate={() => {
             onCancelEditListing();
@@ -944,40 +1371,13 @@ function SecondaryTabContent({
           onOpenTicket={onOpenTicket}
           onRemoveHistoryItem={onRemoveHistoryItem}
           savedEvents={savedEvents}
+          ticketSearchQuery={ticketSearchQuery}
           tickets={tickets}
           unreadCount={unreadNotificationCount}
           onSelectEvent={onSelectEvent}
         />
       ) : null}
     </ScrollView>
-  );
-}
-
-function HomeHeader({
-  menuOpen,
-  onOpenNearby,
-  onToggleMenu,
-  profile,
-}: {
-  menuOpen: boolean;
-  onOpenNearby: () => void;
-  onToggleMenu: () => void;
-  profile?: AppUser | null;
-}) {
-  const avatarSource = profile?.avatar ? profile.avatar : APP_LOGO;
-
-  return (
-    <View style={styles.headerRow}>
-      <IconButton
-        icon={menuOpen ? 'x' : 'menu'}
-        onPress={onToggleMenu}
-        accessibilityLabel={menuOpen ? 'Close menu' : 'Open menu'}
-      />
-      <NearbyTrigger onPress={onOpenNearby} />
-      <View style={styles.avatar}>
-        <Image source={avatarSource} contentFit="cover" style={styles.avatarImage} transition={120} />
-      </View>
-    </View>
   );
 }
 
@@ -997,13 +1397,19 @@ function NearbyTrigger({
     <Pressable onPress={onPress} onPressIn={jelly.onPressIn} onPressOut={jelly.onPressOut}>
       <Animated.View style={[styles.locationChip, style, jelly.animatedStyle]}>
         <Feather color={theme.colors.accentStrong} name={'map-pin' as FeatherName} size={15} />
-        <Text style={styles.locationText}>Explore nearby</Text>
+        <Text numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.82} style={styles.locationText}>
+          Bites n Vibes | Explore Nearby
+        </Text>
       </Animated.View>
     </Pressable>
   );
 }
 
 function DiscoverFloatingHeaderLayer({
+  activeCategory,
+  categories,
+  categoryLayoutsRef,
+  categoryRailRef,
   floatingSearchProgress,
   floatingSearchVisible,
   inputRef,
@@ -1015,9 +1421,18 @@ function DiscoverFloatingHeaderLayer({
   safeTop,
   onBlur,
   onChangeText,
+  onCloseSearch,
   onFocus,
+  onOpenCategory,
   onToggleMenu,
+  onSearchSuggestionPress,
+  showMenuTapCue,
+  searchSuggestions,
 }: {
+  activeCategory: CategoryId;
+  categories: AppCategory[];
+  categoryLayoutsRef: React.MutableRefObject<Partial<Record<CategoryId, { width: number; x: number }>>>;
+  categoryRailRef: React.RefObject<ScrollView | null>;
   floatingSearchProgress: Animated.AnimatedInterpolation<string | number>;
   floatingSearchVisible: boolean;
   inputRef: React.RefObject<TextInput | null>;
@@ -1029,114 +1444,291 @@ function DiscoverFloatingHeaderLayer({
   safeTop: number;
   onBlur: () => void;
   onChangeText: (value: string) => void;
+  onCloseSearch: () => void;
   onFocus: () => void;
+  onOpenCategory: (categoryId: CategoryId) => void;
   onToggleMenu: () => void;
+  onSearchSuggestionPress: (suggestion: AppSearchSuggestion) => void;
+  showMenuTapCue: boolean;
+  searchSuggestions: AppSearchSuggestion[];
+}) {
+  const avatarSource = profile?.avatar ? profile.avatar : APP_LOGO;
+  const hasSearchQuery = query.trim().length > 0;
+
+  return (
+    <View pointerEvents="box-none" style={[styles.floatingHeaderWrap, { paddingTop: safeTop + FLOATING_HEADER_TOP_PADDING }]}>
+      <View style={styles.floatingHeaderShell}>
+        <View style={styles.floatingHeaderRow}>
+          <View style={styles.menuButtonTarget}>
+            <IconButton
+              compact
+              darkGlass
+              icon={menuOpen ? 'x' : 'menu'}
+              onPress={onToggleMenu}
+              accessibilityLabel={menuOpen ? 'Close menu' : 'Open menu'}
+            />
+            {showMenuTapCue ? <OnboardingTapCue iconSize={27} size={38} style={styles.menuTapCue} /> : null}
+          </View>
+
+          <View pointerEvents="box-none" style={styles.floatingCenterRail}>
+            <Animated.View
+              pointerEvents={floatingSearchVisible || isFocused ? 'none' : 'auto'}
+              style={[
+                styles.floatingLocationLayer,
+                {
+                  opacity: floatingSearchProgress.interpolate({
+                    inputRange: [0, 0.54, 1],
+                    outputRange: isFocused ? [0, 0, 0] : [1, 0.16, 0],
+                    extrapolate: 'clamp',
+                  }),
+                  transform: [
+                    {
+                      translateY: floatingSearchProgress.interpolate({
+                        inputRange: [0, 1],
+                        outputRange: [0, -7],
+                        extrapolate: 'clamp',
+                      }),
+                    },
+                    {
+                      scaleX: floatingSearchProgress.interpolate({
+                        inputRange: [0, 0.68, 1],
+                        outputRange: [1, 1.01, 0.96],
+                        extrapolate: 'clamp',
+                      }),
+                    },
+                    {
+                      scaleY: floatingSearchProgress.interpolate({
+                        inputRange: [0, 0.68, 1],
+                        outputRange: [1, 0.992, 0.94],
+                        extrapolate: 'clamp',
+                      }),
+                    },
+                  ],
+                },
+              ]}
+            >
+              <NearbyTrigger onPress={onOpenNearby} style={styles.floatingLocationChip} />
+            </Animated.View>
+
+            <Animated.View
+              pointerEvents={floatingSearchVisible || isFocused ? 'auto' : 'none'}
+              style={[
+                styles.floatingSearchLayer,
+                {
+                  opacity: floatingSearchProgress.interpolate({
+                    inputRange: [0, 0.42, 1],
+                    outputRange: isFocused ? [1, 1, 1] : [0, 0.1, 1],
+                    extrapolate: 'clamp',
+                  }),
+                  transform: [
+                    {
+                      translateY: floatingSearchProgress.interpolate({
+                        inputRange: [0, 1],
+                        outputRange: [10, 0],
+                        extrapolate: 'clamp',
+                      }),
+                    },
+                    {
+                      scaleX: floatingSearchProgress.interpolate({
+                        inputRange: [0, 0.66, 1],
+                        outputRange: [0.95, 1.008, 1],
+                        extrapolate: 'clamp',
+                      }),
+                    },
+                    {
+                      scaleY: floatingSearchProgress.interpolate({
+                        inputRange: [0, 0.66, 1],
+                        outputRange: [1.035, 0.986, 1],
+                        extrapolate: 'clamp',
+                      }),
+                    },
+                  ],
+                },
+              ]}
+            >
+              <SearchShell
+                inputRef={inputRef}
+                isFocused={isFocused}
+                leadingIcon={(hasSearchQuery ? 'chevron-left' : 'map-pin') as FeatherName}
+                leadingIconAccessibilityLabel={hasSearchQuery ? 'Clear search' : 'Explore nearby'}
+                leadingIconColor={theme.colors.accentStrong}
+                onLeadingIconPress={hasSearchQuery ? onCloseSearch : onOpenNearby}
+                query={query}
+                onBlur={onBlur}
+                onChangeText={onChangeText}
+                onFocus={onFocus}
+                onSubmitSearch={(submittedQuery) => {
+                  void recordSearchQuery({
+                    categoryId: activeCategory,
+                    query: submittedQuery,
+                  }).catch(() => undefined);
+                }}
+                onSuggestionPress={onSearchSuggestionPress}
+                showSuggestions={isFocused}
+                style={styles.floatingSearchShell}
+                suggestions={searchSuggestions}
+              />
+            </Animated.View>
+          </View>
+
+          <View style={styles.avatar}>
+            <Image source={avatarSource} contentFit="cover" style={styles.avatarImage} transition={120} />
+          </View>
+        </View>
+
+        <ScrollView
+          ref={categoryRailRef}
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={styles.floatingCategoryRow}
+        >
+          {categories.map((category) => (
+            <View
+              key={category.id}
+              onLayout={(event) => {
+                categoryLayoutsRef.current[category.id] = event.nativeEvent.layout;
+              }}
+            >
+              <HeaderCategoryTab
+                active={category.id === activeCategory}
+                label={category.name}
+                onPress={() => onOpenCategory(category.id)}
+              />
+            </View>
+          ))}
+        </ScrollView>
+      </View>
+    </View>
+  );
+}
+
+function FixedAppHeaderLayer({
+  activeCategory,
+  categories,
+  categoryLayoutsRef,
+  categoryRailRef,
+  headerMode,
+  inboxInputRef,
+  inboxIsFocused,
+  inboxQuery,
+  menuOpen,
+  onInboxBlur,
+  onInboxChangeText,
+  onInboxFocus,
+  onOpenCategory,
+  onOpenNearby,
+  profile,
+  safeTop,
+  onToggleMenu,
+  showMenuTapCue,
+}: {
+  activeCategory: CategoryId;
+  categories: AppCategory[];
+  categoryLayoutsRef: React.MutableRefObject<Partial<Record<CategoryId, { width: number; x: number }>>>;
+  categoryRailRef: React.RefObject<ScrollView | null>;
+  headerMode: 'default' | 'inbox' | 'tickets';
+  inboxInputRef: React.RefObject<TextInput | null>;
+  inboxIsFocused: boolean;
+  inboxQuery: string;
+  menuOpen: boolean;
+  onInboxBlur: () => void;
+  onInboxChangeText: (value: string) => void;
+  onInboxFocus: () => void;
+  onOpenCategory: (categoryId: CategoryId) => void;
+  onOpenNearby: () => void;
+  profile?: AppUser | null;
+  safeTop: number;
+  onToggleMenu: () => void;
+  showMenuTapCue: boolean;
 }) {
   const avatarSource = profile?.avatar ? profile.avatar : APP_LOGO;
 
   return (
-    <View pointerEvents="box-none" style={[styles.floatingHeaderWrap, { paddingTop: safeTop + 8 }]}>
-      <View style={styles.floatingHeaderRow}>
-        <IconButton
-          darkGlass
-          icon={menuOpen ? 'x' : 'menu'}
-          onPress={onToggleMenu}
-          accessibilityLabel={menuOpen ? 'Close menu' : 'Open menu'}
-        />
-
-        <View pointerEvents="box-none" style={styles.floatingCenterRail}>
-          <Animated.View
-            pointerEvents={floatingSearchVisible || isFocused ? 'none' : 'auto'}
-            style={[
-              styles.floatingLocationLayer,
-              {
-                opacity: floatingSearchProgress.interpolate({
-                  inputRange: [0, 0.54, 1],
-                  outputRange: [1, 0.16, 0],
-                  extrapolate: 'clamp',
-                }),
-                transform: [
-                  {
-                    translateY: floatingSearchProgress.interpolate({
-                      inputRange: [0, 1],
-                      outputRange: [0, -9],
-                      extrapolate: 'clamp',
-                    }),
-                  },
-                  {
-                    scaleX: floatingSearchProgress.interpolate({
-                      inputRange: [0, 0.68, 1],
-                      outputRange: [1, 1.015, 0.95],
-                      extrapolate: 'clamp',
-                    }),
-                  },
-                  {
-                    scaleY: floatingSearchProgress.interpolate({
-                      inputRange: [0, 0.68, 1],
-                      outputRange: [1, 0.992, 0.92],
-                      extrapolate: 'clamp',
-                    }),
-                  },
-                ],
-              },
-            ]}
-          >
-            <NearbyTrigger onPress={onOpenNearby} style={styles.floatingLocationChip} />
-          </Animated.View>
-
-          <Animated.View
-            pointerEvents={floatingSearchVisible || isFocused ? 'auto' : 'none'}
-            style={[
-              styles.floatingSearchLayer,
-              {
-                opacity: floatingSearchProgress.interpolate({
-                  inputRange: [0, 0.42, 1],
-                  outputRange: [0, 0.1, 1],
-                  extrapolate: 'clamp',
-                }),
-                transform: [
-                  {
-                    translateY: floatingSearchProgress.interpolate({
-                      inputRange: [0, 1],
-                      outputRange: [12, 0],
-                      extrapolate: 'clamp',
-                    }),
-                  },
-                  {
-                    scaleX: floatingSearchProgress.interpolate({
-                      inputRange: [0, 0.66, 1],
-                      outputRange: [0.945, 1.012, 1],
-                      extrapolate: 'clamp',
-                    }),
-                  },
-                  {
-                    scaleY: floatingSearchProgress.interpolate({
-                      inputRange: [0, 0.66, 1],
-                      outputRange: [1.045, 0.986, 1],
-                      extrapolate: 'clamp',
-                    }),
-                  },
-                ],
-              },
-            ]}
-          >
-            <SearchShell
-              inputRef={inputRef}
-              isFocused={isFocused}
-              query={query}
-              onBlur={onBlur}
-              onChangeText={onChangeText}
-              onFocus={onFocus}
-              style={styles.floatingSearchShell}
+    <View pointerEvents="box-none" style={[styles.floatingHeaderWrap, { paddingTop: safeTop + FLOATING_HEADER_TOP_PADDING }]}>
+      <View style={styles.floatingHeaderShell}>
+        <View style={styles.floatingHeaderRow}>
+          <View style={styles.menuButtonTarget}>
+            <IconButton
+              compact
+              darkGlass
+              icon={menuOpen ? 'x' : 'menu'}
+              onPress={onToggleMenu}
+              accessibilityLabel={menuOpen ? 'Close menu' : 'Open menu'}
             />
-          </Animated.View>
+            {showMenuTapCue ? <OnboardingTapCue iconSize={27} size={38} style={styles.menuTapCue} /> : null}
+          </View>
+
+          <View style={styles.fixedHeaderCenter}>
+            {headerMode === 'inbox' || headerMode === 'tickets' ? (
+              <SearchShell
+                hints={[headerMode === 'tickets' ? 'Search tickets' : 'Search inbox']}
+                inputRef={inboxInputRef}
+                isFocused={inboxIsFocused}
+                query={inboxQuery}
+                onBlur={onInboxBlur}
+                onChangeText={onInboxChangeText}
+                onFocus={onInboxFocus}
+                style={styles.floatingSearchShell}
+              />
+            ) : (
+              <NearbyTrigger onPress={onOpenNearby} style={styles.floatingLocationChip} />
+            )}
+          </View>
+
+          <View style={styles.avatar}>
+            <Image source={avatarSource} contentFit="cover" style={styles.avatarImage} transition={120} />
+          </View>
         </View>
 
-        <View style={styles.avatar}>
-          <Image source={avatarSource} contentFit="cover" style={styles.avatarImage} transition={120} />
-        </View>
+        <ScrollView
+          ref={categoryRailRef}
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={styles.floatingCategoryRow}
+        >
+          {categories.map((category) => (
+            <View
+              key={category.id}
+              onLayout={(event) => {
+                categoryLayoutsRef.current[category.id] = event.nativeEvent.layout;
+              }}
+            >
+              <HeaderCategoryTab
+                active={category.id === activeCategory}
+                label={category.name}
+                onPress={() => onOpenCategory(category.id)}
+              />
+            </View>
+          ))}
+        </ScrollView>
       </View>
     </View>
+  );
+}
+
+function HeaderCategoryTab({
+  active,
+  label,
+  onPress,
+}: {
+  active: boolean;
+  label: string;
+  onPress: () => void;
+}) {
+  const jelly = useJellyPressAnimation({
+    pressedScaleX: 1.025,
+    pressedScaleY: 0.94,
+  });
+
+  return (
+    <Pressable accessibilityRole="button" onPress={onPress} onPressIn={jelly.onPressIn} onPressOut={jelly.onPressOut}>
+      <Animated.View style={[styles.headerCategoryTab, jelly.animatedStyle]}>
+        <Text numberOfLines={1} style={[styles.headerCategoryText, active && styles.headerCategoryTextActive]}>
+          {label}
+        </Text>
+        <View style={[styles.headerCategoryUnderline, active && styles.headerCategoryUnderlineActive]} />
+      </Animated.View>
+    </Pressable>
   );
 }
 
@@ -1148,6 +1740,7 @@ function DrawerMenu({
   onSearchPress,
   onTabChange,
   overlayOpacity,
+  topOffset,
   translateX,
   width,
 }: {
@@ -1158,13 +1751,14 @@ function DrawerMenu({
   onSearchPress: () => void;
   onTabChange: (tab: TabId) => void;
   overlayOpacity: Animated.Value;
+  topOffset: number;
   translateX: Animated.Value;
   width: number;
 }) {
   const avatarSource = profile?.avatar ? profile.avatar : APP_LOGO;
 
   return (
-    <View pointerEvents={menuOpen ? 'auto' : 'box-none'} style={StyleSheet.absoluteFillObject}>
+    <View pointerEvents={menuOpen ? 'auto' : 'box-none'} style={[StyleSheet.absoluteFillObject, styles.drawerLayer, { top: topOffset }]}>
       <Animated.View pointerEvents={menuOpen ? 'auto' : 'none'} style={[styles.drawerOverlay, { opacity: overlayOpacity }]}>
         <Pressable onPress={onClose} style={styles.drawerOverlayPressable} />
       </Animated.View>
@@ -1180,7 +1774,7 @@ function DrawerMenu({
       >
         <ScrollView
           bounces
-          contentContainerStyle={styles.drawerScrollContent}
+          contentContainerStyle={[styles.drawerScrollContent, topOffset > 0 && styles.drawerScrollContentBelowTopNav]}
           showsVerticalScrollIndicator={false}
           style={styles.drawerScroll}
         >
@@ -1392,11 +1986,13 @@ function EventCard({
   isPreviewActive,
   onPress,
   onToggleSave,
+  userLocation,
 }: {
   event: AppEvent;
   isPreviewActive: boolean;
   onPress: () => void;
   onToggleSave: () => void;
+  userLocation: UserCoordinates | null;
 }) {
   const jelly = useJellyPressAnimation({
     pressedScaleX: 1.012,
@@ -1409,6 +2005,17 @@ function EventCard({
   const previewDelayTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showVideoPreview, setShowVideoPreview] = useState(false);
   const [videoReady, setVideoReady] = useState(false);
+  const distanceKm = userLocation
+    ? calculateDistanceKm(
+        userLocation.latitude,
+        userLocation.longitude,
+        event.location.latitude,
+        event.location.longitude,
+      )
+    : null;
+  const locationMeta = distanceKm == null
+    ? `${event.city}  -  ${event.time}`
+    : `${event.city}  -  ${getHomeDistanceLabel(distanceKm)}  -  ${event.time}`;
 
   useEffect(() => {
     if (!previewVideo || !isPreviewActive) {
@@ -1531,11 +2138,19 @@ function EventCard({
 
           <View style={styles.cardFooter}>
             <View style={styles.cardTextBlock}>
-              <Text numberOfLines={1} style={styles.cardTitle}>
-                {event.title}
-              </Text>
+              <View style={styles.cardTitleRow}>
+                <Text numberOfLines={1} ellipsizeMode="tail" style={styles.cardTitle}>
+                  {event.title}
+                </Text>
+                {event.isVerified || previewVideo ? (
+                  <View style={styles.cardTitleBadgeGroup}>
+                    {event.isVerified ? <VerifiedBadge /> : null}
+                    {previewVideo ? <PreviewBadge /> : null}
+                  </View>
+                ) : null}
+              </View>
               <Text numberOfLines={1} style={styles.cardMeta}>
-                {event.city}  -  {event.time}
+                {locationMeta}
               </Text>
               <Text numberOfLines={2} style={styles.cardAbout}>
                 {event.blurb || event.about}
@@ -1546,16 +2161,27 @@ function EventCard({
               <Text style={styles.priceText}>{event.price}</Text>
             </View>
           </View>
-
-          {previewVideo ? (
-            <View style={styles.cardVideoChip}>
-              <Feather color={theme.colors.white} name={'play-circle' as FeatherName} size={14} />
-              <Text style={styles.cardVideoChipText}>Preview</Text>
-            </View>
-          ) : null}
         </View>
       </Animated.View>
     </Pressable>
+  );
+}
+
+function VerifiedBadge() {
+  return (
+    <View style={styles.verifiedBadge}>
+      <Feather color={theme.colors.white} name={'check' as FeatherName} size={9} />
+      <Text style={styles.verifiedBadgeText}>Verified</Text>
+    </View>
+  );
+}
+
+function PreviewBadge() {
+  return (
+    <View style={styles.previewBadge}>
+      <Feather color={theme.colors.white} name={'play-circle' as FeatherName} size={9} />
+      <Text style={styles.previewBadgeText}>Preview</Text>
+    </View>
   );
 }
 
@@ -1597,6 +2223,222 @@ function getCardPreviewVideo(event: AppEvent) {
     ?? event.media.find((item) => item.kind === 'video');
 }
 
+function eventMatchesFeedFilters(event: AppEvent, activeCategory: CategoryId, searchQuery: string) {
+  const matchesCategory =
+    activeCategory === 'all' || event.categories.some((category) => category.id === activeCategory);
+  const query = searchQuery.trim().toLowerCase();
+  const matchesQuery =
+    query.length === 0 ||
+    [event.artist, event.title, event.city, event.venue].some((value) => value.toLowerCase().includes(query));
+
+  return matchesCategory && matchesQuery;
+}
+
+function buildLocalSearchSuggestions(
+  query: string,
+  activeCategory: CategoryId,
+  categories: AppCategory[],
+  events: AppEvent[],
+) {
+  const normalizedQuery = query.trim().toLowerCase();
+  const suggestions: AppSearchSuggestion[] = [];
+  const seen = new Set<string>();
+
+  const addSuggestion = (suggestion: AppSearchSuggestion) => {
+    const key = suggestion.query.trim().toLowerCase();
+    if (!key || seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    suggestions.push(suggestion);
+  };
+
+  if (!normalizedQuery || 'near me'.includes(normalizedQuery) || 'nearby'.includes(normalizedQuery)) {
+    addSuggestion({
+      id: 'local-near-me',
+      label: 'Near me',
+      query: 'near me',
+      type: 'nearby',
+      hint: 'Closest listings around you',
+    });
+  }
+
+  ['Pizza', 'Fast food', 'Restaurants', 'Tonight', 'Live music'].forEach((phrase, index) => {
+    if (!normalizedQuery || phrase.toLowerCase().includes(normalizedQuery)) {
+      addSuggestion({
+        id: `local-popular-${index}`,
+        label: phrase,
+        query: phrase,
+        type: 'popular',
+        hint: 'Popular search',
+      });
+    }
+  });
+
+  categories
+    .filter((category) => category.id !== 'all')
+    .filter((category) => !normalizedQuery || category.name.toLowerCase().includes(normalizedQuery))
+    .slice(0, 3)
+    .forEach((category) => {
+      addSuggestion({
+        id: `local-category-${category.id}`,
+        label: category.name,
+        query: category.name,
+        type: 'category',
+        hint: 'Category',
+      });
+    });
+
+  events
+    .filter((event) => eventMatchesFeedFilters(event, activeCategory, query))
+    .slice(0, 4)
+    .forEach((event) => {
+      addSuggestion({
+        id: `local-listing-${event.id}`,
+        label: event.title,
+        query: event.title,
+        type: 'listing',
+        hint: event.city,
+      });
+    });
+
+  return suggestions.slice(0, 8);
+}
+
+async function fetchForYouCategoryEvents(categories: AppCategory[], searchQuery: string) {
+  const feedCategories = categories.filter((category) => category.id !== 'all');
+  const categoryPages = await Promise.allSettled(
+    feedCategories.map((category) =>
+      fetchAppFeed({
+        categories,
+        categoryId: category.id,
+        page: 1,
+        pageSize: FOR_YOU_CATEGORY_PAGE_SIZE,
+        search: searchQuery,
+      }),
+    ),
+  );
+
+  return categoryPages.flatMap((result) => (result.status === 'fulfilled' ? result.value.events : []));
+}
+
+function mergeUniqueEvents(...eventGroups: AppEvent[][]) {
+  const seen = new Set<string>();
+  const merged: AppEvent[] = [];
+
+  eventGroups.flat().forEach((event) => {
+    if (seen.has(event.id)) {
+      return;
+    }
+
+    seen.add(event.id);
+    merged.push(event);
+  });
+
+  return merged;
+}
+
+function buildForYouMingledEvents(sourceEvents: AppEvent[]) {
+  const uniqueEvents = mergeUniqueEvents(sourceEvents);
+  const buckets = new Map<CategoryId, Array<{ event: AppEvent; score: number }>>();
+  const categoryOrder: CategoryId[] = [];
+
+  uniqueEvents.forEach((event, index) => {
+    const categoryId = event.categories[0]?.id ?? 'uncategorized';
+    if (!buckets.has(categoryId)) {
+      buckets.set(categoryId, []);
+      categoryOrder.push(categoryId);
+    }
+
+    buckets.get(categoryId)?.push({
+      event,
+      score: getForYouEventScore(event, index),
+    });
+  });
+
+  const orderedBuckets = categoryOrder
+    .map((categoryId) => (buckets.get(categoryId) ?? []).sort((left, right) => right.score - left.score))
+    .sort((left, right) => (right[0]?.score ?? 0) - (left[0]?.score ?? 0));
+  const mingledEvents: AppEvent[] = [];
+  let index = 0;
+  let addedEvent = true;
+
+  while (addedEvent) {
+    addedEvent = false;
+    orderedBuckets.forEach((bucket) => {
+      const entry = bucket[index];
+      if (entry) {
+        mingledEvents.push(entry.event);
+        addedEvent = true;
+      }
+    });
+    index += 1;
+  }
+
+  return mingledEvents;
+}
+
+function getForYouEventScore(event: AppEvent, sourceIndex: number) {
+  const createdAgeHours = event.createdAt ? Math.max(0, (Date.now() - Date.parse(event.createdAt)) / 3_600_000) : 240;
+  const freshness = createdAgeHours <= 48 ? 22 : createdAgeHours <= 168 ? 13 : createdAgeHours <= 720 ? 6 : 0;
+
+  return (
+    (event.isSaved ? 120 : 0) +
+    (event.isFeatured ? 36 : 0) +
+    (event.isTrending ? 30 : 0) +
+    (event.isVerified ? 8 : 0) +
+    freshness +
+    Math.min(event.rating * 5, 25) +
+    Math.min((event.ratingCount ?? 0) * 1.4, 18) +
+    Math.min(event.saveCount * 1.5, 30) +
+    Math.min((event.commentCount ?? 0), 16) +
+    Math.min((event.vibePercentage ?? 25) / 6, 14) -
+    sourceIndex * 0.25
+  );
+}
+
+function calculateDistanceKm(startLat: number, startLng: number, endLat: number, endLng: number) {
+  if (![startLat, startLng, endLat, endLng].every(Number.isFinite)) {
+    return null;
+  }
+
+  if (Math.abs(endLat) < 0.000001 && Math.abs(endLng) < 0.000001) {
+    return null;
+  }
+
+  const toRadians = (value: number) => (value * Math.PI) / 180;
+  const earthRadiusKm = 6371;
+  const latDelta = toRadians(endLat - startLat);
+  const lngDelta = toRadians(endLng - startLng);
+  const a =
+    Math.sin(latDelta / 2) * Math.sin(latDelta / 2) +
+    Math.cos(toRadians(startLat)) *
+      Math.cos(toRadians(endLat)) *
+      Math.sin(lngDelta / 2) *
+      Math.sin(lngDelta / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return earthRadiusKm * c;
+}
+
+function getHomeDistanceLabel(distanceKm: number) {
+  const distance = formatHomeDistance(distanceKm);
+  if (distanceKm <= 5) {
+    return `Nearby  -  ${distance}`;
+  }
+  if (distanceKm <= 25) {
+    return `Around you  -  ${distance}`;
+  }
+  return `${distance} away`;
+}
+
+function formatHomeDistance(distanceKm: number) {
+  if (distanceKm < 1) {
+    return `${Math.max(100, Math.round(distanceKm * 1000))} m`;
+  }
+
+  return `${distanceKm.toFixed(distanceKm < 10 ? 1 : 0)} km`;
+}
+
 function buildCardPreviewSegments(durationMillis: number) {
   const clipLength = 5000;
   const clipCount = 4;
@@ -1624,38 +2466,123 @@ function buildCardPreviewSegments(durationMillis: number) {
 function buildDynamicSpotlightEvents(sourceEvents: AppEvent[], activeCategory: CategoryId) {
   const pool = sourceEvents.filter((event) => event.image || event.media.length > 0);
   const todaySeed = Math.floor(Date.now() / 86_400_000);
-
-  return pool
+  const scoredEvents = pool
     .map((event, index) => ({
       event,
       score: getSpotlightScore(event, index, activeCategory, todaySeed),
     }))
-    .sort((left, right) => right.score - left.score)
+    .sort((left, right) => right.score - left.score);
+  const signalCandidates = scoredEvents.filter((entry) => hasSpotlightSignal(entry.event));
+  const spotlightCandidates = signalCandidates.length >= 4 ? signalCandidates : scoredEvents;
+
+  if (activeCategory === 'all') {
+    return mingleSpotlightByCategory(spotlightCandidates).slice(0, 4);
+  }
+
+  return spotlightCandidates
     .slice(0, 4)
     .map((entry) => entry.event);
 }
 
+function mingleSpotlightByCategory(scoredEvents: Array<{ event: AppEvent; score: number }>) {
+  const buckets = new Map<CategoryId, Array<{ event: AppEvent; score: number }>>();
+  const categoryOrder: CategoryId[] = [];
+
+  scoredEvents.forEach((entry) => {
+    const categoryId = entry.event.categories[0]?.id ?? 'uncategorized';
+    if (!buckets.has(categoryId)) {
+      buckets.set(categoryId, []);
+      categoryOrder.push(categoryId);
+    }
+
+    buckets.get(categoryId)?.push(entry);
+  });
+
+  const orderedBuckets = categoryOrder
+    .map((categoryId) => buckets.get(categoryId) ?? [])
+    .sort((left, right) => (right[0]?.score ?? 0) - (left[0]?.score ?? 0));
+  const mixedEvents: AppEvent[] = [];
+  let index = 0;
+  let addedEvent = true;
+
+  while (addedEvent) {
+    addedEvent = false;
+    orderedBuckets.forEach((bucket) => {
+      const entry = bucket[index];
+      if (entry) {
+        mixedEvents.push(entry.event);
+        addedEvent = true;
+      }
+    });
+    index += 1;
+  }
+
+  return mixedEvents;
+}
+
 function getSpotlightScore(event: AppEvent, index: number, activeCategory: CategoryId, seed: number) {
   const categoryMatch = activeCategory !== 'all' && event.categories.some((category) => category.id === activeCategory);
-  const hasVideo = event.media.some((media) => media.kind === 'video');
   const createdAgeHours = event.createdAt ? Math.max(0, (Date.now() - Date.parse(event.createdAt)) / 3_600_000) : 240;
-  const freshness = createdAgeHours <= 48 ? 26 : createdAgeHours <= 168 ? 15 : createdAgeHours <= 720 ? 7 : 0;
-  const rotation = seededSpotlightNoise(event.id, seed) * 18;
+  const freshness = getSpotlightFreshnessScore(createdAgeHours);
+  const engagement = getSpotlightEngagementScore(event);
+  const weakSignalPenalty = engagement <= 0 && !event.isFeatured && !event.isTrending && !event.isSaved ? 42 : 0;
+  const stalePenalty = createdAgeHours > 720 && engagement <= 6 && !event.isFeatured ? 24 : 0;
+  const rotation = seededSpotlightNoise(event.id, seed) * 6;
 
   return (
-    (event.isFeatured ? 48 : 0) +
-    (event.isTrending ? 36 : 0) +
+    (event.isFeatured ? 42 : 0) +
+    (event.isSaved ? 70 : 0) +
+    (event.isTrending ? 42 : 0) +
     (event.isVerified ? 8 : 0) +
     (categoryMatch ? 18 : 0) +
-    (hasVideo ? 10 : 0) +
     freshness +
-    Math.min(event.rating * 4, 20) +
-    Math.min((event.ratingCount ?? 0) * 1.5, 12) +
-    Math.min(event.saveCount * 1.2, 24) +
-    Math.min((event.commentCount ?? 0) * 1.1, 14) +
-    Math.min((event.vibePercentage ?? 25) / 8, 12) +
+    engagement +
+    Math.min((event.vibePercentage ?? 25) / 10, 10) +
     rotation -
+    weakSignalPenalty -
+    stalePenalty -
     index * 0.65
+  );
+}
+
+function hasSpotlightSignal(event: AppEvent) {
+  const createdAgeHours = event.createdAt ? Math.max(0, (Date.now() - Date.parse(event.createdAt)) / 3_600_000) : 240;
+  return (
+    event.isFeatured ||
+    event.isTrending ||
+    event.isSaved ||
+    createdAgeHours <= 168 ||
+    (event.ratingCount ?? 0) > 0 ||
+    event.saveCount > 0 ||
+    (event.commentCount ?? 0) > 0
+  );
+}
+
+function getSpotlightFreshnessScore(createdAgeHours: number) {
+  if (createdAgeHours <= 24) {
+    return 42;
+  }
+  if (createdAgeHours <= 72) {
+    return 34;
+  }
+  if (createdAgeHours <= 168) {
+    return 24;
+  }
+  if (createdAgeHours <= 720) {
+    return 9;
+  }
+  return 0;
+}
+
+function getSpotlightEngagementScore(event: AppEvent) {
+  const ratingCount = event.ratingCount ?? 0;
+  const commentCount = event.commentCount ?? 0;
+
+  return (
+    Math.min(ratingCount * 4.5, 36) +
+    Math.min(event.saveCount * 3.2, 38) +
+    Math.min(commentCount * 3.6, 32) +
+    (ratingCount > 0 ? Math.min(event.rating * 3.2, 18) : 0)
   );
 }
 
@@ -1690,21 +2617,44 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
   },
+  menuButtonTarget: {
+    position: 'relative',
+    width: 36,
+    height: 36,
+  },
+  menuTapCue: {
+    top: -1,
+    left: -1,
+  },
   floatingHeaderWrap: {
     position: 'absolute',
     top: 0,
-    left: 20,
-    right: 20,
+    left: 0,
+    right: 0,
     zIndex: 12,
+    backgroundColor: 'rgba(12,15,23,0.92)',
+    borderBottomWidth: 1,
+    borderBottomColor: theme.colors.border,
+  },
+  floatingHeaderShell: {
+    paddingHorizontal: 12,
+    paddingBottom: 7,
+    gap: 6,
   },
   floatingHeaderRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 12,
+    gap: 9,
   },
   floatingCenterRail: {
     flex: 1,
     minHeight: FLOATING_HEADER_HEIGHT,
+    justifyContent: 'center',
+  },
+  fixedHeaderCenter: {
+    flex: 1,
+    minHeight: FLOATING_HEADER_HEIGHT,
+    alignItems: 'center',
     justifyContent: 'center',
   },
   floatingLocationLayer: {
@@ -1718,17 +2668,25 @@ const styles = StyleSheet.create({
   },
   floatingSearchShell: {
     width: '100%',
+    minHeight: 36,
     marginBottom: 0,
-    backgroundColor: 'rgba(8,10,14,0.44)',
-    borderColor: 'rgba(255,255,255,0.07)',
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    backgroundColor: 'rgba(8,10,14,0.28)',
+    borderColor: 'rgba(255,255,255,0.06)',
   },
   floatingLocationChip: {
-    backgroundColor: 'rgba(8,10,14,0.4)',
-    borderColor: 'rgba(255,255,255,0.07)',
+    alignSelf: 'stretch',
+    minHeight: 36,
+    paddingHorizontal: 10,
+    borderRadius: 12,
+    backgroundColor: 'rgba(8,10,14,0.28)',
+    borderColor: 'rgba(255,255,255,0.06)',
   },
   locationChip: {
+    maxWidth: '100%',
     minHeight: 40,
-    paddingHorizontal: 14,
+    paddingHorizontal: 12,
     borderRadius: 11,
     backgroundColor: theme.colors.surfaceMuted,
     borderWidth: 1,
@@ -1738,18 +2696,20 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   locationText: {
+    flexShrink: 1,
+    minWidth: 0,
     color: theme.colors.text,
-    fontSize: 13,
-    fontWeight: '700',
+    fontSize: 12,
+    fontWeight: '800',
     letterSpacing: 0.2,
   },
   avatar: {
-    width: 42,
-    height: 42,
-    borderRadius: 21,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
     backgroundColor: theme.colors.accentSoft,
     borderWidth: 1,
-    borderColor: 'rgba(255,107,61,0.2)',
+    borderColor: 'rgba(242,34,28,0.2)',
     alignItems: 'center',
     justifyContent: 'center',
     overflow: 'hidden',
@@ -1770,6 +2730,18 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 12,
   },
+  searchLeadingIconButton: {
+    width: 22,
+    height: 28,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  searchLeadingIconStatic: {
+    width: 22,
+    height: 28,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   searchInputWrap: {
     flex: 1,
     minHeight: 24,
@@ -1785,6 +2757,7 @@ const styles = StyleSheet.create({
     color: theme.colors.textSoft,
     fontSize: 14,
     fontWeight: '600',
+    opacity: 0.72,
   },
   searchInput: {
     flex: 1,
@@ -1798,8 +2771,81 @@ const styles = StyleSheet.create({
     height: 18,
     backgroundColor: theme.colors.border,
   },
+  searchSuggestionsPanel: {
+    position: 'absolute',
+    top: 44,
+    left: 0,
+    right: 0,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: 'rgba(12,15,23,0.98)',
+    overflow: 'hidden',
+    zIndex: 30,
+    elevation: 30,
+    ...shadow,
+  },
+  searchSuggestionRow: {
+    minHeight: 44,
+    paddingHorizontal: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.06)',
+  },
+  searchSuggestionIcon: {
+    width: 24,
+    height: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  searchSuggestionCopy: {
+    flex: 1,
+    minWidth: 0,
+  },
+  searchSuggestionLabel: {
+    color: theme.colors.text,
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  searchSuggestionHint: {
+    color: theme.colors.textSoft,
+    fontSize: 11,
+    fontWeight: '600',
+  },
   categoryRow: {
     paddingBottom: 10,
+  },
+  floatingCategoryRow: {
+    minHeight: FLOATING_CATEGORY_RAIL_HEIGHT,
+    alignItems: 'center',
+    paddingRight: 16,
+    gap: 18,
+  },
+  headerCategoryTab: {
+    minHeight: FLOATING_CATEGORY_RAIL_HEIGHT,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
+  },
+  headerCategoryText: {
+    color: theme.colors.textSoft,
+    fontSize: 12,
+    fontWeight: '800',
+    letterSpacing: 0.2,
+  },
+  headerCategoryTextActive: {
+    color: theme.colors.white,
+  },
+  headerCategoryUnderline: {
+    width: '100%',
+    height: 2,
+    borderRadius: 999,
+    backgroundColor: 'transparent',
+  },
+  headerCategoryUnderlineActive: {
+    backgroundColor: theme.colors.accentStrong,
   },
   categoryFeedBanner: {
     minHeight: 60,
@@ -1844,24 +2890,22 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(255,255,255,0.08)',
     overflow: 'hidden',
     padding: 16,
-    minHeight: 178,
-    justifyContent: 'center',
+    minHeight: 224,
+    justifyContent: 'flex-end',
   },
   spotlightRail: {
     gap: 12,
     paddingRight: 42,
   },
   spotlightBody: {
-    width: '54%',
+    width: '100%',
     gap: 8,
     zIndex: 2,
   },
-  spotlightImageWrap: {
-    position: 'absolute',
-    top: 0,
-    right: 0,
-    bottom: 0,
-    width: '56%',
+  spotlightContent: {
+    flex: 1,
+    justifyContent: 'flex-end',
+    zIndex: 2,
   },
   spotlightBadge: {
     alignSelf: 'flex-start',
@@ -1887,15 +2931,24 @@ const styles = StyleSheet.create({
     letterSpacing: 0.6,
   },
   spotlightTitle: {
+    flexShrink: 1,
+    minWidth: 0,
     color: theme.colors.white,
     fontSize: 20,
     fontWeight: '800',
     letterSpacing: 0.2,
   },
+  spotlightTitleRow: {
+    minWidth: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+  },
   spotlightCopy: {
-    color: theme.colors.textMuted,
+    color: 'rgba(245,247,252,0.78)',
     fontSize: 13,
     lineHeight: 18,
+    fontWeight: '500',
   },
   spotlightMeta: {
     marginTop: 2,
@@ -1909,15 +2962,17 @@ const styles = StyleSheet.create({
     fontWeight: '800',
   },
   spotlightMetaText: {
-    color: theme.colors.textSoft,
+    color: theme.colors.textMuted,
     fontSize: 12,
     fontWeight: '700',
   },
   spotlightImage: {
-    width: '100%',
-    height: '100%',
+    ...StyleSheet.absoluteFillObject,
   },
   spotlightImageFade: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  spotlightBrandWash: {
     ...StyleSheet.absoluteFillObject,
   },
   cardShell: {
@@ -2007,7 +3062,7 @@ const styles = StyleSheet.create({
   },
   saveChipButtonActive: {
     backgroundColor: theme.colors.accentSoft,
-    borderColor: 'rgba(255,107,61,0.24)',
+    borderColor: 'rgba(242,34,28,0.24)',
   },
   cardFooter: {
     position: 'absolute',
@@ -2021,13 +3076,61 @@ const styles = StyleSheet.create({
   },
   cardTextBlock: {
     flex: 1,
+    minWidth: 0,
     gap: 7,
   },
+  cardTitleRow: {
+    minWidth: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
   cardTitle: {
+    flex: 1,
+    flexShrink: 1,
+    minWidth: 0,
     color: theme.colors.white,
     fontSize: 24,
     fontWeight: '800',
     letterSpacing: 0.2,
+  },
+  cardTitleBadgeGroup: {
+    flexShrink: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    gap: 6,
+  },
+  verifiedBadge: {
+    minHeight: 18,
+    flexShrink: 0,
+    borderRadius: 9,
+    backgroundColor: 'rgba(242,34,28,0.82)',
+    paddingHorizontal: 6,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 3,
+  },
+  verifiedBadgeText: {
+    color: theme.colors.white,
+    fontSize: 9,
+    fontWeight: '900',
+  },
+  previewBadge: {
+    minHeight: 18,
+    flexShrink: 0,
+    borderRadius: 9,
+    backgroundColor: 'rgba(255,255,255,0.15)',
+    paddingHorizontal: 6,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 3,
+  },
+  previewBadgeText: {
+    color: theme.colors.white,
+    fontSize: 9,
+    fontWeight: '900',
   },
   cardMeta: {
     color: theme.colors.textMuted,
@@ -2052,26 +3155,6 @@ const styles = StyleSheet.create({
     color: theme.colors.paperInk,
     fontSize: 14,
     fontWeight: '800',
-  },
-  cardVideoChip: {
-    position: 'absolute',
-    right: 16,
-    bottom: 82,
-    minHeight: 28,
-    paddingHorizontal: 10,
-    borderRadius: theme.radius.pill,
-    backgroundColor: 'rgba(8,10,14,0.78)',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.08)',
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  cardVideoChipText: {
-    color: theme.colors.white,
-    fontSize: 11,
-    fontWeight: '800',
-    letterSpacing: 0.2,
   },
   emptyCard: {
     marginTop: 8,
@@ -2103,6 +3186,10 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: 'rgba(255,255,255,0.08)',
   },
+  drawerLayer: {
+    zIndex: 80,
+    elevation: 80,
+  },
   drawerOverlay: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: 'rgba(4, 7, 13, 0.52)',
@@ -2129,6 +3216,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
     paddingBottom: 156,
   },
+  drawerScrollContentBelowTopNav: {
+    paddingTop: 24,
+  },
   drawerProfile: {
     marginBottom: 22,
     alignItems: 'center',
@@ -2140,7 +3230,7 @@ const styles = StyleSheet.create({
     borderRadius: 41,
     backgroundColor: theme.colors.accentSoft,
     borderWidth: 1,
-    borderColor: 'rgba(255,107,61,0.24)',
+    borderColor: 'rgba(242,34,28,0.24)',
     alignItems: 'center',
     justifyContent: 'center',
     overflow: 'hidden',
@@ -2234,7 +3324,7 @@ const styles = StyleSheet.create({
   },
   drawerOptionActive: {
     backgroundColor: 'transparent',
-    borderBottomColor: 'rgba(255,107,61,0.24)',
+    borderBottomColor: 'rgba(242,34,28,0.24)',
   },
   drawerIconWrap: {
     width: 22,

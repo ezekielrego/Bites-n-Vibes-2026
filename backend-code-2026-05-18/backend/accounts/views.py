@@ -398,6 +398,7 @@ def google_oauth_callback(request):
     """Handle Google OAuth callback - exchange code for tokens and login user."""
     from django.conf import settings
     import requests
+    from requests import RequestException
     
     code = request.GET.get('code')
     error = request.GET.get('error')
@@ -416,13 +417,28 @@ def google_oauth_callback(request):
         redirect_uri = f"{request.scheme}://{request.get_host()}/api/auth/google/callback/"
         
         # Exchange code for tokens
-        token_response = requests.post('https://oauth2.googleapis.com/token', data={
-            'code': code,
-            'client_id': client_id,
-            'client_secret': client_secret,
-            'redirect_uri': redirect_uri,
-            'grant_type': 'authorization_code'
-        })
+        try:
+            token_response = requests.post(
+                'https://oauth2.googleapis.com/token',
+                data={
+                    'code': code,
+                    'client_id': client_id,
+                    'client_secret': client_secret,
+                    'redirect_uri': redirect_uri,
+                    'grant_type': 'authorization_code',
+                },
+                timeout=12,
+            )
+        except RequestException as exc:
+            return _redirect_to_auth_target(
+                _append_query_params(
+                    redirect_to,
+                    {
+                        'error': 'token_exchange_unreachable',
+                        'detail': str(exc)[:100],
+                    },
+                )
+            )
         
         if token_response.status_code != 200:
             error_detail = token_response.text
@@ -446,10 +462,22 @@ def google_oauth_callback(request):
             return _redirect_to_auth_target(_append_query_params(redirect_to, {'error': 'no_access_token'}))
         
         # Get user info from Google
-        user_response = requests.get(
-            'https://www.googleapis.com/oauth2/v2/userinfo',
-            headers={'Authorization': f'Bearer {access_token}'}
-        )
+        try:
+            user_response = requests.get(
+                'https://www.googleapis.com/oauth2/v2/userinfo',
+                headers={'Authorization': f'Bearer {access_token}'},
+                timeout=12,
+            )
+        except RequestException as exc:
+            return _redirect_to_auth_target(
+                _append_query_params(
+                    redirect_to,
+                    {
+                        'error': 'user_info_unreachable',
+                        'detail': str(exc)[:100],
+                    },
+                )
+            )
         
         if user_response.status_code != 200:
             return _redirect_to_auth_target(_append_query_params(redirect_to, {'error': 'user_info_failed'}))

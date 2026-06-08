@@ -6,7 +6,6 @@ import {
   Pressable,
   StyleSheet,
   Text,
-  useWindowDimensions,
   View,
 } from 'react-native';
 import { Feather } from '@expo/vector-icons';
@@ -15,28 +14,27 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { TAB_ITEMS } from '../constants';
 import { theme, shadow } from '../theme';
 import { TabId } from '../types';
+import { OnboardingTapCue } from './OnboardingTapCue';
 
 type FeatherName = React.ComponentProps<typeof Feather>['name'];
 
 export function BottomNav({
   activeTab,
   onTabChange,
-  onTabTargetLayout,
+  showCreateTapCue = false,
   unreadCount = 0,
 }: {
   activeTab: TabId;
   onTabChange: (tab: TabId) => void;
-  onTabTargetLayout?: (tab: TabId, target: { x: number; y: number }) => void;
+  showCreateTapCue?: boolean;
   unreadCount?: number;
 }) {
   const insets = useSafeAreaInsets();
-  const { height } = useWindowDimensions();
   const indicatorX = useRef(new Animated.Value(0)).current;
   const indicatorWidth = useRef(new Animated.Value(72)).current;
   const jelly = useRef(new Animated.Value(0)).current;
   const hasMounted = useRef(false);
   const [layouts, setLayouts] = useState<Partial<Record<TabId, { height: number; width: number; x: number; y: number }>>>({});
-  const [shellLayout, setShellLayout] = useState<{ height: number; width: number; x: number } | null>(null);
 
   useEffect(() => {
     const activeLayout = layouts[activeTab];
@@ -91,26 +89,6 @@ export function BottomNav({
     ]).start();
   }, [activeTab, indicatorWidth, indicatorX, jelly, layouts]);
 
-  useEffect(() => {
-    if (!shellLayout || !onTabTargetLayout) {
-      return;
-    }
-
-    const shellTop = height - (insets.bottom + 10) - shellLayout.height;
-
-    TAB_ITEMS.forEach((tab) => {
-      const layout = layouts[tab.id];
-      if (!layout) {
-        return;
-      }
-
-      onTabTargetLayout(tab.id, {
-        x: shellLayout.x + layout.x + layout.width / 2,
-        y: shellTop + layout.y + layout.height / 2,
-      });
-    });
-  }, [height, insets.bottom, layouts, onTabTargetLayout, shellLayout]);
-
   const handleItemLayout = (tabId: TabId, event: LayoutChangeEvent) => {
     const { height, width, x, y } = event.nativeEvent.layout;
 
@@ -140,17 +118,7 @@ export function BottomNav({
 
   return (
     <View pointerEvents="box-none" style={[styles.outer, { paddingBottom: insets.bottom + 10 }]}>
-      <View
-        onLayout={(event) => {
-          const { height, width, x } = event.nativeEvent.layout;
-          setShellLayout((current) =>
-            current && current.height === height && current.width === width && current.x === x
-              ? current
-              : { height, width, x },
-          );
-        }}
-        style={styles.shell}
-      >
+      <View style={styles.shell}>
         <Animated.View
           pointerEvents="none"
           style={[
@@ -188,6 +156,7 @@ export function BottomNav({
             badgeCount={tab.id === 'inbox' ? unreadCount : 0}
             onLayout={(event) => handleItemLayout(tab.id, event)}
             onPress={() => onTabChange(tab.id)}
+            showTapCue={showCreateTapCue && tab.id === 'create'}
           />
         ))}
       </View>
@@ -202,6 +171,7 @@ function NavItem({
   badgeCount,
   onLayout,
   onPress,
+  showTapCue,
 }: {
   active: boolean;
   icon: FeatherName;
@@ -209,6 +179,7 @@ function NavItem({
   badgeCount: number;
   onLayout: (event: LayoutChangeEvent) => void;
   onPress: () => void;
+  showTapCue: boolean;
 }) {
   const scale = useRef(new Animated.Value(1)).current;
   const labelOpacity = useRef(new Animated.Value(active ? 1 : 0)).current;
@@ -268,13 +239,14 @@ function NavItem({
         >
           {label}
         </Animated.Text>
+        {showTapCue ? <OnboardingTapCue iconSize={29} size={42} style={styles.createTapCue} /> : null}
       </Animated.View>
     </Pressable>
   );
 }
 
 function NotificationBadge({ count }: { count: number }) {
-  const displayCount = count > 99 ? '99+' : String(count);
+  const displayCount = formatCompactCount(count);
 
   return (
     <View style={styles.badgeWrap}>
@@ -286,11 +258,30 @@ function NotificationBadge({ count }: { count: number }) {
         style={styles.badgeBorder}
       >
         <View style={styles.badgeInner}>
-          <Text style={styles.badgeText}>{displayCount}</Text>
+          <Text numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.72} style={styles.badgeText}>
+            {displayCount}
+          </Text>
         </View>
       </LinearGradient>
     </View>
   );
+}
+
+function formatCompactCount(count: number) {
+  const safeCount = Math.max(0, Math.floor(Number.isFinite(count) ? count : 0));
+  if (safeCount < 1000) {
+    return String(safeCount);
+  }
+
+  const units = [
+    { value: 1_000_000_000, suffix: 'B' },
+    { value: 1_000_000, suffix: 'M' },
+    { value: 1_000, suffix: 'k' },
+  ];
+  const unit = units.find((item) => safeCount >= item.value) ?? units[2];
+  const value = safeCount / unit.value;
+  const formatted = value >= 10 ? Math.floor(value).toString() : value.toFixed(1).replace(/\.0$/, '');
+  return `${formatted}${unit.suffix}`;
 }
 
 const styles = StyleSheet.create({
@@ -341,6 +332,7 @@ const styles = StyleSheet.create({
     flexBasis: 0,
   },
   item: {
+    position: 'relative',
     minHeight: 46,
     width: '100%',
     paddingHorizontal: 10,
@@ -353,11 +345,17 @@ const styles = StyleSheet.create({
   iconWrap: {
     position: 'relative',
   },
+  createTapCue: {
+    top: 4,
+    left: '50%',
+    marginLeft: -21,
+  },
   badgeWrap: {
     position: 'absolute',
     top: -9,
     right: -13,
     minWidth: 18,
+    maxWidth: 42,
     height: 18,
     borderRadius: 9,
     overflow: 'hidden',
@@ -365,11 +363,14 @@ const styles = StyleSheet.create({
   badgeBorder: {
     flex: 1,
     minWidth: 18,
+    maxWidth: 42,
     padding: 1,
   },
   badgeInner: {
     flex: 1,
     minWidth: 16,
+    maxWidth: 40,
+    paddingHorizontal: 3,
     borderRadius: 999,
     backgroundColor: 'rgba(12,15,23,0.96)',
     alignItems: 'center',
@@ -380,6 +381,8 @@ const styles = StyleSheet.create({
     fontSize: 9,
     fontWeight: '900',
     includeFontPadding: false,
+    letterSpacing: 0,
+    textAlign: 'center',
   },
   label: {
     color: theme.colors.white,

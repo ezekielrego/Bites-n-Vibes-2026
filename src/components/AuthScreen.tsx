@@ -2,14 +2,13 @@ import React, { useState } from 'react';
 import { Animated, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { Image } from 'expo-image';
-import { LinearGradient } from 'expo-linear-gradient';
 import { SvgXml } from 'react-native-svg';
 import { theme } from '../theme';
 import { useJellyPressAnimation } from './Primitives';
 
 type FeatherName = React.ComponentProps<typeof Feather>['name'];
 
-const APP_LOGO = require('../../logo.webp');
+const APP_LOGO = require('../../logo.png');
 const GOOGLE_ICON_XML = `
 <svg width="800px" height="800px" viewBox="-3 0 262 262" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid">
   <path d="M255.878 133.451c0-10.734-.871-18.567-2.756-26.69H130.55v48.448h71.947c-1.45 12.04-9.283 30.172-26.69 42.356l-.244 1.622 38.755 30.023 2.685.268c24.659-22.774 38.875-56.282 38.875-96.027" fill="#4285F4"/>
@@ -116,9 +115,11 @@ export function AuthScreen({
         <Image source={APP_LOGO} contentFit="contain" style={styles.logo} transition={0} />
       </View>
 
-      <View style={styles.copyWrap}>
-        <Text style={styles.title}>{passwordResetToken ? 'Reset password' : 'Welcome back'}</Text>
-      </View>
+      {passwordResetToken ? (
+        <View style={styles.copyWrap}>
+          <Text style={styles.title}>Reset password</Text>
+        </View>
+      ) : null}
 
       <View style={styles.authCard}>
         {passwordResetToken ? (
@@ -175,6 +176,7 @@ export function AuthScreen({
               icon="chrome"
               label={busyProvider === 'google' ? 'Opening Google...' : 'Continue with Google'}
               onPress={() => void onGoogleLogin()}
+              outlined
               tone="paper"
             />
 
@@ -222,6 +224,7 @@ export function AuthScreen({
               icon="lock"
               label={busyProvider === 'password' ? 'Signing in...' : 'Sign in'}
               onPress={() => void handlePasswordLogin()}
+              outlined
               tone="accent"
             />
 
@@ -251,6 +254,7 @@ function AuthButton({
   icon,
   label,
   onPress,
+  outlined = false,
   tone,
 }: {
   disabled: boolean;
@@ -258,6 +262,7 @@ function AuthButton({
   icon: FeatherName;
   label: string;
   onPress: () => void;
+  outlined?: boolean;
   tone: 'accent' | 'paper';
 }) {
   const jelly = useJellyPressAnimation({
@@ -277,25 +282,16 @@ function AuthButton({
         style={[
           styles.button,
           tone === 'accent' ? styles.buttonAccent : styles.buttonPaper,
+          outlined && styles.buttonOutlined,
           disabled && styles.buttonDisabled,
           jelly.animatedStyle,
         ]}
       >
-        {tone === 'accent' ? (
-          <LinearGradient
-            colors={['#E53935', theme.colors.accent, theme.colors.accent]}
-            locations={[0, 0.34, 1]}
-            start={{ x: 0, y: 0.5 }}
-            end={{ x: 1, y: 0.5 }}
-            pointerEvents="none"
-            style={StyleSheet.absoluteFillObject}
-          />
-        ) : null}
         {googleIcon ? (
           <SvgXml height={16} width={16} xml={GOOGLE_ICON_XML} />
         ) : (
           <Feather
-            color={tone === 'accent' ? theme.colors.white : theme.colors.paperInk}
+            color={tone === 'accent' ? theme.colors.accentStrong : theme.colors.textMuted}
             name={icon}
             size={16}
           />
@@ -354,44 +350,47 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   authCard: {
-    borderRadius: 22,
-    borderWidth: 1,
-    borderColor: theme.colors.border,
-    backgroundColor: 'rgba(18,23,34,0.94)',
-    padding: 16,
+    backgroundColor: 'transparent',
+    paddingHorizontal: 2,
     gap: 14,
   },
   buttonPressable: {
     alignSelf: 'stretch',
   },
   button: {
-    minHeight: 50,
-    borderRadius: 16,
-    overflow: 'hidden',
-    paddingHorizontal: 16,
+    minHeight: 42,
+    borderRadius: 14,
+    paddingHorizontal: 14,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 10,
+    gap: 8,
+  },
+  buttonOutlined: {
+    alignSelf: 'stretch',
+    minHeight: 48,
+    borderWidth: 1,
+    borderColor: 'rgba(242,34,28,0.34)',
+    backgroundColor: 'rgba(255,255,255,0.02)',
   },
   buttonAccent: {
-    backgroundColor: theme.colors.accent,
+    backgroundColor: 'transparent',
   },
   buttonPaper: {
-    backgroundColor: theme.colors.paper,
+    backgroundColor: 'transparent',
   },
   buttonDisabled: {
-    opacity: 0.6,
+    opacity: 0.48,
   },
   buttonText: {
     fontSize: 15,
     fontWeight: '800',
   },
   buttonTextAccent: {
-    color: theme.colors.white,
+    color: theme.colors.accentStrong,
   },
   buttonTextPaper: {
-    color: theme.colors.paperInk,
+    color: theme.colors.text,
   },
   dividerRow: {
     flexDirection: 'row',
@@ -452,8 +451,8 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   statusCardError: {
-    backgroundColor: 'rgba(255,107,61,0.09)',
-    borderColor: 'rgba(255,107,61,0.18)',
+    backgroundColor: 'rgba(242,34,28,0.09)',
+    borderColor: 'rgba(242,34,28,0.18)',
   },
   statusCardSuccess: {
     backgroundColor: 'rgba(94,194,94,0.1)',

@@ -7,6 +7,7 @@ import {
   NativeSyntheticEvent,
   Platform,
   Pressable,
+  RefreshControl,
   Share,
   ScrollView,
   StyleSheet,
@@ -15,15 +16,25 @@ import {
   View,
   useWindowDimensions,
 } from 'react-native';
+import Constants from 'expo-constants';
 import { Feather, FontAwesome6, MaterialCommunityIcons } from '@expo/vector-icons';
 import { ResizeMode, type AVPlaybackStatus, Video } from 'expo-av';
 import { Image } from 'expo-image';
 import { LinearGradient } from 'expo-linear-gradient';
-import MapView, { Marker } from 'react-native-maps';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { theme, shadow } from '../theme';
-import { AppEvent, AppEventMedia, AppTicket, AppUser, BookingCheckoutInput, BookingPaymentMethod, ContactIconName, SocialPlatform } from '../types';
-import { IconButton, PrimaryButton, Tag, useJellyPressAnimation } from './Primitives';
+import {
+  AppEvent,
+  AppEventMedia,
+  AppTicket,
+  AppUser,
+  BookingCheckoutInput,
+  BookingPaymentMethod,
+  ContactIconName,
+  EventLocation,
+  SocialPlatform,
+} from '../types';
+import { IconButton, Tag, useJellyPressAnimation } from './Primitives';
 import { CommentsSheet } from './CommentsSheet';
 
 type FeatherName = React.ComponentProps<typeof Feather>['name'];
@@ -33,7 +44,7 @@ const SOCIAL_ICON_MAP: Record<SocialPlatform, { name: FontAwesome6Name; brand?: 
   tiktok: { name: 'tiktok', brand: true, color: theme.colors.text },
   youtube: { name: 'youtube', brand: true, color: '#FF6E66' },
   facebook: { name: 'facebook', brand: true, color: '#78A8FF' },
-  instagram: { name: 'instagram', brand: true, color: '#FF9C74' },
+  instagram: { name: 'instagram', brand: true, color: '#FF6F6A' },
   x: { name: 'x-twitter', brand: true, color: theme.colors.text },
   web: { name: 'globe', color: theme.colors.textMuted },
 };
@@ -45,6 +56,40 @@ const PAYMENT_METHODS: Array<{ id: BookingPaymentMethod; label: string }> = [
   { id: 'omari', label: 'Omari' },
 ];
 
+function useAnimatedProgressSnapshot(motion: Animated.Value) {
+  const [progress, setProgress] = useState(0);
+
+  useEffect(() => {
+    const listenerId = motion.addListener(({ value }) => {
+      setProgress(Math.max(0, Math.min(value, 1)));
+    });
+
+    return () => {
+      motion.removeListener(listenerId);
+    };
+  }, [motion]);
+
+  return progress;
+}
+
+function interpolateNumber(value: number, inputRange: number[], outputRange: number[]) {
+  const clamped = Math.max(inputRange[0] ?? 0, Math.min(value, inputRange[inputRange.length - 1] ?? 1));
+
+  for (let index = 0; index < inputRange.length - 1; index += 1) {
+    const inputStart = inputRange[index];
+    const inputEnd = inputRange[index + 1];
+
+    if (clamped >= inputStart && clamped <= inputEnd) {
+      const segmentProgress = inputEnd === inputStart ? 0 : (clamped - inputStart) / (inputEnd - inputStart);
+      const outputStart = outputRange[index];
+      const outputEnd = outputRange[index + 1];
+      return outputStart + (outputEnd - outputStart) * segmentProgress;
+    }
+  }
+
+  return outputRange[outputRange.length - 1] ?? 0;
+}
+
 export function DetailsScreen({
   event,
   isSaved,
@@ -53,7 +98,9 @@ export function DetailsScreen({
   onBook,
   onCommentCountChange,
   onRate,
+  onRefresh,
   onToggleSave,
+  refreshing,
 }: {
   event: AppEvent;
   isSaved: boolean;
@@ -62,7 +109,9 @@ export function DetailsScreen({
   onBook: (input?: BookingCheckoutInput) => Promise<AppTicket | null>;
   onCommentCountChange: (nextCount: number) => void;
   onRate: (value: number) => Promise<void>;
+  onRefresh: () => Promise<void>;
   onToggleSave: () => void;
+  refreshing: boolean;
 }) {
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
@@ -79,6 +128,8 @@ export function DetailsScreen({
   const [checkoutPending, setCheckoutPending] = useState(false);
   const [paymentMethod, setPaymentMethod] = useState<BookingPaymentMethod>('ecocash');
   const [paymentPhone, setPaymentPhone] = useState('');
+  const [requestQuantity, setRequestQuantity] = useState('1');
+  const [requestNote, setRequestNote] = useState('');
   const tags = event.categories.map((category) => category.name);
   const heroMedia = useMemo(() => buildHeroMedia(event), [event]);
   const activeMedia = heroMedia[activeMediaIndex] ?? heroMedia[0] ?? null;
@@ -90,6 +141,8 @@ export function DetailsScreen({
   const actionBarInset = insets.bottom + 96;
   const bookingAction = useMemo(() => getBookingAction(event), [event]);
   const ctaLabel = event.hasTicket ? `View ${bookingAction.noun}` : bookingAction.cta;
+  const canRenderNativeMap = canRenderNativeMapForLocation(event.location);
+  const ratingBarProgress = useRef(new Animated.Value(0)).current;
   const heroPagerRef = useRef<ScrollView>(null);
   const autoplayHoldUntil = useRef(0);
   const mapPreviewJelly = useJellyPressAnimation({
@@ -106,11 +159,26 @@ export function DetailsScreen({
     setCommentsOpen(false);
     setActiveMediaIndex(0);
     setFullscreenVideo(null);
+    setCheckoutOpen(false);
+    setCheckoutPending(false);
+    setPaymentPhone('');
+    setRequestQuantity('1');
+    setRequestNote('');
   }, [event.id]);
 
   useEffect(() => {
     setCommentCount(event.commentCount ?? 0);
   }, [event.commentCount]);
+
+  useEffect(() => {
+    Animated.spring(ratingBarProgress, {
+      toValue: ratingOpen ? 1 : 0,
+      stiffness: ratingOpen ? 250 : 280,
+      damping: 24,
+      mass: 0.9,
+      useNativeDriver: false,
+    }).start();
+  }, [ratingBarProgress, ratingOpen]);
 
   const openLink = (url: string) => {
     void Linking.openURL(url).catch(() => undefined);
@@ -164,8 +232,7 @@ export function DetailsScreen({
   );
 
   const handleOpenDirections = async () => {
-    const { latitude, longitude } = event.location;
-    const destination = `${latitude},${longitude}`;
+    const destination = getDirectionsDestination(event.location);
     const fallbackUrl = `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(destination)}&travelmode=driving`;
     const appUrl =
       Platform.OS === 'ios'
@@ -211,7 +278,8 @@ export function DetailsScreen({
   };
 
   const handlePrimaryAction = () => {
-    if (event.hasTicket || !eventNeedsPayment(event)) {
+    setRatingOpen(false);
+    if (event.hasTicket) {
       void onBook();
       return;
     }
@@ -220,25 +288,45 @@ export function DetailsScreen({
   };
 
   const handleConfirmCheckout = async () => {
-    if (!paymentPhone.trim()) {
+    const needsPayment = eventNeedsPayment(event);
+    const quantity = Math.max(1, Math.min(Number.parseInt(requestQuantity, 10) || 1, 20));
+
+    if (!requestNote.trim()) {
+      return;
+    }
+
+    if (needsPayment && !paymentPhone.trim()) {
       return;
     }
 
     setCheckoutPending(true);
     const ticket = await onBook({
-      paymentMethod,
-      phone: paymentPhone.trim(),
-      quantity: 1,
+      paymentMethod: needsPayment ? paymentMethod : undefined,
+      phone: needsPayment ? paymentPhone.trim() : undefined,
+      quantity,
+      requestNote: requestNote.trim(),
     });
     setCheckoutPending(false);
-    if (ticket?.status === 'confirmed') {
+    if (ticket && ['requested', 'confirmed', 'accepted'].includes(ticket.status)) {
       setCheckoutOpen(false);
     }
   };
 
   return (
     <View style={styles.container}>
-      <ScrollView contentContainerStyle={{ paddingBottom: insets.bottom + 132 }} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        contentContainerStyle={{ paddingBottom: insets.bottom + 132 }}
+        refreshControl={
+          <RefreshControl
+            colors={[theme.colors.accentStrong]}
+            progressBackgroundColor={theme.colors.surfaceStrong}
+            refreshing={refreshing}
+            tintColor={theme.colors.accentStrong}
+            onRefresh={() => void onRefresh()}
+          />
+        }
+        showsVerticalScrollIndicator={false}
+      >
         <View style={[styles.hero, { height: heroHeight }]}>
           <ScrollView
             ref={heroPagerRef}
@@ -316,49 +404,35 @@ export function DetailsScreen({
           <View style={styles.section}>
             <Text style={styles.sectionTitle}>Location</Text>
             <View style={styles.mapCard}>
-              <Pressable
-                onPress={() => setMapExpanded(true)}
-                onPressIn={mapPreviewJelly.onPressIn}
-                onPressOut={mapPreviewJelly.onPressOut}
-                style={styles.mapPreviewPressable}
-              >
-                <Animated.View style={[styles.mapFrame, mapPreviewJelly.animatedStyle]}>
-                  <MapView
-                    key={event.id}
-                    initialRegion={{
-                      latitude: event.location.latitude,
-                      longitude: event.location.longitude,
-                      latitudeDelta: event.location.latitudeDelta,
-                      longitudeDelta: event.location.longitudeDelta,
-                    }}
-                    loadingEnabled
-                    pitchEnabled={false}
-                    rotateEnabled={false}
-                    scrollEnabled={false}
-                    showsCompass={false}
-                    style={styles.map}
-                    toolbarEnabled={false}
-                    zoomEnabled={false}
-                  >
-                    <Marker
-                      coordinate={{
-                        latitude: event.location.latitude,
-                        longitude: event.location.longitude,
-                      }}
-                      description={event.location.address}
-                      title={event.venue}
-                    />
-                  </MapView>
-                  <View pointerEvents="none" style={styles.mapBadge}>
-                    <Feather color={theme.colors.accentStrong} name="map-pin" size={13} />
-                    <Text style={styles.mapBadgeText}>{event.location.label}</Text>
+              {canRenderNativeMap ? (
+                <Pressable
+                  onPress={() => setMapExpanded(true)}
+                  onPressIn={mapPreviewJelly.onPressIn}
+                  onPressOut={mapPreviewJelly.onPressOut}
+                  style={styles.mapPreviewPressable}
+                >
+                  <Animated.View style={[styles.mapFrame, mapPreviewJelly.animatedStyle]}>
+                    <NativeMapPreview event={event} />
+                    <View pointerEvents="none" style={styles.mapBadge}>
+                      <Feather color={theme.colors.accentStrong} name="map-pin" size={13} />
+                      <Text style={styles.mapBadgeText}>{event.location.label}</Text>
+                    </View>
+                    <View pointerEvents="none" style={styles.mapExpandHint}>
+                      <Feather color={theme.colors.text} name="maximize-2" size={12} />
+                      <Text style={styles.mapExpandHintText}>Open map</Text>
+                    </View>
+                  </Animated.View>
+                </Pressable>
+              ) : (
+                <View style={styles.mapFallbackFrame}>
+                  <View style={styles.mapFallbackIcon}>
+                    <Feather color={theme.colors.accentStrong} name="map-pin" size={22} />
                   </View>
-                  <View pointerEvents="none" style={styles.mapExpandHint}>
-                    <Feather color={theme.colors.text} name="maximize-2" size={12} />
-                    <Text style={styles.mapExpandHintText}>Open map</Text>
-                  </View>
-                </Animated.View>
-              </Pressable>
+                  <Text style={styles.mapFallbackTitle}>{event.location.label}</Text>
+                  <Text style={styles.mapFallbackAddress}>{event.location.address}</Text>
+                  <MapDirectionsButton onPress={() => void handleOpenDirections()} />
+                </View>
+              )}
 
               <View style={styles.mapMeta}>
                 <Text style={styles.mapAddress}>{event.location.address}</Text>
@@ -412,17 +486,24 @@ export function DetailsScreen({
         </View>
       </ScrollView>
 
+      {ratingOpen ? <Pressable onPress={() => setRatingOpen(false)} style={styles.ratingDismissLayer} /> : null}
+
       <View style={[styles.bottomBar, { paddingBottom: insets.bottom + 12 }]}>
         <View style={styles.bottomBarInner}>
-          <PrimaryButton label={ctaLabel} onPress={handlePrimaryAction} />
+          <ReserveActionButton label={ctaLabel} motion={ratingBarProgress} onPress={handlePrimaryAction} width={width} />
           <RatingDock
             isOpen={ratingOpen}
             isSubmitting={ratingPending}
+            motion={ratingBarProgress}
             onRate={handleRate}
             onToggle={() => setRatingOpen((open) => !open)}
             selectedRating={selectedRating}
+            width={width}
           />
-          <CommentDock count={commentCount} onPress={() => setCommentsOpen(true)} />
+          <CommentDock count={commentCount} onPress={() => {
+            setRatingOpen(false);
+            setCommentsOpen(true);
+          }} />
         </View>
       </View>
 
@@ -441,9 +522,13 @@ export function DetailsScreen({
         method={paymentMethod}
         phone={paymentPhone}
         pending={checkoutPending}
+        quantity={requestQuantity}
+        requestNote={requestNote}
         visible={checkoutOpen}
         onChangeMethod={setPaymentMethod}
         onChangePhone={setPaymentPhone}
+        onChangeQuantity={setRequestQuantity}
+        onChangeRequestNote={setRequestNote}
         onClose={() => {
           if (!checkoutPending) {
             setCheckoutOpen(false);
@@ -452,7 +537,7 @@ export function DetailsScreen({
         onConfirm={handleConfirmCheckout}
       />
 
-      {mapExpanded ? (
+      {mapExpanded && canRenderNativeMap ? (
         <View pointerEvents="box-none" style={StyleSheet.absoluteFillObject}>
           <View style={[styles.mapExpandedOverlay, { bottom: actionBarInset, paddingTop: insets.top + 8 }]}>
             <View style={styles.mapExpandedHeader}>
@@ -464,29 +549,7 @@ export function DetailsScreen({
             </View>
 
             <View style={styles.mapExpandedFrame}>
-              <MapView
-                key={`${event.id}-expanded`}
-                initialRegion={{
-                  latitude: event.location.latitude,
-                  longitude: event.location.longitude,
-                  latitudeDelta: event.location.latitudeDelta,
-                  longitudeDelta: event.location.longitudeDelta,
-                }}
-                loadingEnabled
-                showsCompass
-                showsScale
-                style={styles.mapExpandedMap}
-                toolbarEnabled
-              >
-                <Marker
-                  coordinate={{
-                    latitude: event.location.latitude,
-                    longitude: event.location.longitude,
-                  }}
-                  description={event.location.address}
-                  title={event.venue}
-                />
-              </MapView>
+              <NativeMapPreview event={event} expanded />
 
               <View pointerEvents="box-none" style={styles.mapExpandedFloatingAction}>
                 <MapDirectionsButton onPress={() => void handleOpenDirections()} />
@@ -533,9 +596,13 @@ function BookingCheckoutSheet({
   method,
   phone,
   pending,
+  quantity,
+  requestNote,
   visible,
   onChangeMethod,
   onChangePhone,
+  onChangeQuantity,
+  onChangeRequestNote,
   onClose,
   onConfirm,
 }: {
@@ -544,14 +611,19 @@ function BookingCheckoutSheet({
   method: BookingPaymentMethod;
   phone: string;
   pending: boolean;
+  quantity: string;
+  requestNote: string;
   visible: boolean;
   onChangeMethod: (method: BookingPaymentMethod) => void;
   onChangePhone: (phone: string) => void;
+  onChangeQuantity: (quantity: string) => void;
+  onChangeRequestNote: (note: string) => void;
   onClose: () => void;
   onConfirm: () => void;
 }) {
   const insets = useSafeAreaInsets();
-  const canSubmit = phone.trim().length >= 7 && !pending;
+  const needsPayment = eventNeedsPayment(event);
+  const canSubmit = requestNote.trim().length > 0 && (!needsPayment || phone.trim().length >= 7) && !pending;
 
   return (
     <Modal animationType="slide" transparent visible={visible} onRequestClose={onClose}>
@@ -572,34 +644,67 @@ function BookingCheckoutSheet({
             <Text style={styles.checkoutAmount}>{event.price}</Text>
           </View>
 
-          <Text style={styles.checkoutLabel}>Pay with</Text>
-          <View style={styles.paymentMethodGrid}>
-            {PAYMENT_METHODS.map((item) => (
-              <PaymentMethodChip
-                key={item.id}
-                active={item.id === method}
-                label={item.label}
-                onPress={() => onChangeMethod(item.id)}
-              />
-            ))}
-          </View>
-
-          <Text style={styles.checkoutLabel}>Wallet phone number</Text>
+          <Text style={styles.checkoutLabel}>Quantity</Text>
           <View style={styles.checkoutInputLine}>
-            <Feather color={theme.colors.textMuted} name="phone" size={16} />
+            <Feather color={theme.colors.textMuted} name="hash" size={16} />
             <TextInput
-              keyboardType="phone-pad"
-              onChangeText={onChangePhone}
-              placeholder="e.g. 0771234567"
+              keyboardType="number-pad"
+              onChangeText={(value) => onChangeQuantity(value.replace(/[^\d]/g, '').slice(0, 2))}
+              placeholder="1"
               placeholderTextColor={theme.colors.textMuted}
               style={styles.checkoutInput}
-              value={phone}
+              value={quantity}
             />
           </View>
 
-          <Text style={styles.checkoutHelp}>
-            We will ask Paynow to send the prompt to your phone, then keep polling until your unique reference and QR are ready.
-          </Text>
+          <Text style={styles.checkoutLabel}>Message to the host</Text>
+          <View style={[styles.checkoutInputLine, styles.checkoutNoteLine]}>
+            <Feather color={theme.colors.textMuted} name="message-square" size={16} />
+            <TextInput
+              multiline
+              onChangeText={onChangeRequestNote}
+              placeholder="Tell them your preferred time, quantity, table size, or anything they should review."
+              placeholderTextColor={theme.colors.textMuted}
+              style={[styles.checkoutInput, styles.checkoutNoteInput]}
+              textAlignVertical="top"
+              value={requestNote}
+            />
+          </View>
+
+          {needsPayment ? (
+            <>
+              <Text style={styles.checkoutLabel}>Pay with</Text>
+              <View style={styles.paymentMethodGrid}>
+                {PAYMENT_METHODS.map((item) => (
+                  <PaymentMethodChip
+                    key={item.id}
+                    active={item.id === method}
+                    label={item.label}
+                    onPress={() => onChangeMethod(item.id)}
+                  />
+                ))}
+              </View>
+
+              <Text style={styles.checkoutLabel}>Wallet phone number</Text>
+              <View style={styles.checkoutInputLine}>
+                <Feather color={theme.colors.textMuted} name="phone" size={16} />
+                <TextInput
+                  keyboardType="phone-pad"
+                  onChangeText={onChangePhone}
+                  placeholder="e.g. 0771234567"
+                  placeholderTextColor={theme.colors.textMuted}
+                  style={styles.checkoutInput}
+                  value={phone}
+                />
+              </View>
+
+              <Text style={styles.checkoutHelp}>
+                Wait for the payment merchant prompt to show on your phone, then confirm by entering your PIN.
+              </Text>
+            </>
+          ) : (
+            <Text style={styles.checkoutHelp}>The host will review your request and confirm it in the app.</Text>
+          )}
 
           <Pressable
             accessibilityRole="button"
@@ -613,7 +718,7 @@ function BookingCheckoutSheet({
               end={{ x: 1, y: 1 }}
               style={styles.checkoutSubmitGradient}
             >
-              <Text style={styles.checkoutSubmitText}>{pending ? 'Checking payment...' : `Pay ${event.price}`}</Text>
+              <Text style={styles.checkoutSubmitText}>{pending ? 'Sending...' : needsPayment ? `Pay ${event.price}` : 'Send request'}</Text>
             </LinearGradient>
           </Pressable>
         </View>
@@ -823,6 +928,41 @@ function HeroPaginationDots({
   );
 }
 
+function NativeMapPreview({ event, expanded = false }: { event: AppEvent; expanded?: boolean }) {
+  const { default: MapView, Marker } = require('react-native-maps') as typeof import('react-native-maps');
+  const location = event.location;
+
+  return (
+    <MapView
+      key={expanded ? `${event.id}-expanded` : event.id}
+      initialRegion={{
+        latitude: location.latitude,
+        longitude: location.longitude,
+        latitudeDelta: location.latitudeDelta,
+        longitudeDelta: location.longitudeDelta,
+      }}
+      loadingEnabled
+      pitchEnabled={expanded}
+      rotateEnabled={expanded}
+      scrollEnabled={expanded}
+      showsCompass={expanded}
+      showsScale={expanded}
+      style={expanded ? styles.mapExpandedMap : styles.map}
+      toolbarEnabled={expanded}
+      zoomEnabled={expanded}
+    >
+      <Marker
+        coordinate={{
+          latitude: location.latitude,
+          longitude: location.longitude,
+        }}
+        description={location.address}
+        title={event.venue}
+      />
+    </MapView>
+  );
+}
+
 function MetricCard({
   icon,
   label,
@@ -905,77 +1045,121 @@ function SocialButton({
   );
 }
 
+function ReserveActionButton({
+  label,
+  motion,
+  onPress,
+  width,
+}: {
+  label: string;
+  motion: Animated.Value;
+  onPress: () => void;
+  width: number;
+}) {
+  const jelly = useJellyPressAnimation({
+    pressedScaleX: 1.07,
+    pressedScaleY: 0.92,
+  });
+  const motionProgress = useAnimatedProgressSnapshot(motion);
+  const expandedWidth = Math.max(width - 150, 174);
+  const actionWidth = interpolateNumber(motionProgress, [0, 1], [expandedWidth, 52]);
+  const labelOpacity = interpolateNumber(motionProgress, [0, 0.58, 1], [1, 0.2, 0]);
+  const labelTranslateX = interpolateNumber(motionProgress, [0, 1], [0, -8]);
+  const labelMaxWidth = interpolateNumber(motionProgress, [0, 1], [expandedWidth - 72, 0]);
+  const labelMarginLeft = interpolateNumber(motionProgress, [0, 1], [8, 0]);
+
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={label}
+      onPress={onPress}
+      onPressIn={jelly.onPressIn}
+      onPressOut={jelly.onPressOut}
+      style={styles.reserveActionPressable}
+    >
+      <View style={[styles.reserveActionSizer, { width: actionWidth }]}>
+        <Animated.View style={[styles.reserveActionButton, jelly.animatedStyle]}>
+          <LinearGradient
+            colors={['#E7392F', theme.colors.accentStrong, theme.colors.accent]}
+            locations={[0, 0.48, 1]}
+            start={{ x: 0, y: 0.5 }}
+            end={{ x: 1, y: 0.5 }}
+            style={StyleSheet.absoluteFillObject}
+          />
+          <Feather color={theme.colors.white} name="calendar" size={19} />
+          <Text
+            numberOfLines={1}
+            style={[
+              styles.reserveActionText,
+              {
+                marginLeft: labelMarginLeft,
+                maxWidth: labelMaxWidth,
+                opacity: labelOpacity,
+                transform: [{ translateX: labelTranslateX }],
+              },
+            ]}
+          >
+            {label}
+          </Text>
+        </Animated.View>
+      </View>
+    </Pressable>
+  );
+}
+
 function RatingDock({
   selectedRating,
   isOpen,
   isSubmitting,
+  motion,
   onToggle,
   onRate,
+  width,
 }: {
   selectedRating: number;
   isOpen: boolean;
   isSubmitting: boolean;
+  motion: Animated.Value;
   onToggle: () => void;
   onRate: (value: number) => Promise<void>;
+  width: number;
 }) {
-  const progress = useRef(new Animated.Value(isOpen ? 1 : 0)).current;
   const triggerJelly = useJellyPressAnimation({
     pressedScaleX: 1.07,
     pressedScaleY: 0.92,
   });
-
-  useEffect(() => {
-    Animated.spring(progress, {
-      toValue: isOpen ? 1 : 0,
-      stiffness: isOpen ? 250 : 280,
-      damping: 18,
-      mass: 0.8,
-      useNativeDriver: true,
-    }).start();
-  }, [isOpen, progress]);
+  const motionProgress = useAnimatedProgressSnapshot(motion);
+  const availableWidth = Math.max(width - 32, 280);
+  const openRailWidth = Math.max(222, availableWidth - 52 - 52 - 52 - 24);
+  const railWidth = interpolateNumber(motionProgress, [0, 1], [0, openRailWidth]);
+  const railTranslateX = interpolateNumber(motionProgress, [0, 1], [18, 0]);
+  const railScaleX = interpolateNumber(motionProgress, [0, 0.65, 1], [0.72, 1.04, 1]);
+  const railScaleY = interpolateNumber(motionProgress, [0, 0.65, 1], [0.8, 1.08, 1]);
 
   return (
-    <View style={styles.ratingDock}>
-      <Animated.View
+    <View style={styles.ratingDockRow}>
+      <View
         pointerEvents={isOpen ? 'auto' : 'none'}
         style={[
           styles.ratingRail,
           {
-            opacity: progress,
-            transform: [
-              {
-                translateY: progress.interpolate({
-                  inputRange: [0, 1],
-                  outputRange: [18, 0],
-                }),
-              },
-              {
-                scaleX: progress.interpolate({
-                  inputRange: [0, 0.65, 1],
-                  outputRange: [0.78, 1.06, 1],
-                }),
-              },
-              {
-                scaleY: progress.interpolate({
-                  inputRange: [0, 0.65, 1],
-                  outputRange: [0.58, 1.12, 1],
-                }),
-              },
-            ],
+            opacity: motionProgress,
+            width: railWidth,
+            transform: [{ translateX: railTranslateX }, { scaleX: railScaleX }, { scaleY: railScaleY }],
           },
         ]}
       >
-        {[5, 4, 3, 2, 1].map((value, index) => (
+        {[1, 2, 3, 4, 5].map((value, index) => (
           <RatingStarButton
             key={value}
             active={value <= selectedRating}
             index={index}
-            motion={progress}
+            motion={motion}
             onPress={() => onRate(value)}
             value={value}
           />
         ))}
-      </Animated.View>
+      </View>
 
       <Pressable
         accessibilityRole="button"
@@ -1004,6 +1188,7 @@ function CommentDock({
     pressedScaleX: 1.07,
     pressedScaleY: 0.92,
   });
+  const displayCount = formatCompactCount(count);
 
   return (
     <Pressable
@@ -1018,12 +1203,31 @@ function CommentDock({
         <Feather color={theme.colors.accentStrong} name="message-circle" size={18} />
         {count > 0 ? (
           <View style={styles.commentBadge}>
-            <Text style={styles.commentBadgeText}>{count > 99 ? '99+' : String(count)}</Text>
+            <Text numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.72} style={styles.commentBadgeText}>
+              {displayCount}
+            </Text>
           </View>
         ) : null}
       </Animated.View>
     </Pressable>
   );
+}
+
+function formatCompactCount(count: number) {
+  const safeCount = Math.max(0, Math.floor(Number.isFinite(count) ? count : 0));
+  if (safeCount < 1000) {
+    return String(safeCount);
+  }
+
+  const units = [
+    { value: 1_000_000_000, suffix: 'B' },
+    { value: 1_000_000, suffix: 'M' },
+    { value: 1_000, suffix: 'k' },
+  ];
+  const unit = units.find((item) => safeCount >= item.value) ?? units[2];
+  const value = safeCount / unit.value;
+  const formatted = value >= 10 ? Math.floor(value).toString() : value.toFixed(1).replace(/\.0$/, '');
+  return `${formatted}${unit.suffix}`;
 }
 
 function RatingStarButton({
@@ -1063,9 +1267,9 @@ function RatingStarButton({
             }),
             transform: [
               {
-                translateY: motion.interpolate({
+                translateX: motion.interpolate({
                   inputRange: [0, 1],
-                  outputRange: [12 + index * 6, 0],
+                  outputRange: [18 + index * 5, 0],
                 }),
               },
             ],
@@ -1074,10 +1278,11 @@ function RatingStarButton({
       >
         <Animated.View style={[styles.ratingStar, active && styles.ratingStarActive, jelly.animatedStyle]}>
           <MaterialCommunityIcons
-            color={active ? theme.colors.white : theme.colors.textMuted}
+            color={active ? '#FBBF24' : theme.colors.textMuted}
             name={active ? 'star' : 'star-outline'}
-            size={16}
+            size={22}
           />
+          <Text style={[styles.ratingStarNumber, active && styles.ratingStarNumberActive]}>{value}</Text>
         </Animated.View>
       </Animated.View>
     </Pressable>
@@ -1159,6 +1364,44 @@ function eventNeedsPayment(event: AppEvent) {
   return event.acceptsInternalPayments && /\d/.test(event.price) && !/free|tba|soon/i.test(event.price);
 }
 
+function canRenderNativeMapForLocation(location: EventLocation) {
+  if (!hasMappableCoordinates(location)) {
+    return false;
+  }
+
+  if (Platform.OS === 'android') {
+    return hasAndroidGoogleMapsApiKey();
+  }
+
+  return Platform.OS !== 'web';
+}
+
+function hasAndroidGoogleMapsApiKey() {
+  const androidConfig = Constants.expoConfig?.android as
+    | { config?: { googleMaps?: { apiKey?: string | null } } }
+    | undefined;
+  return typeof androidConfig?.config?.googleMaps?.apiKey === 'string' && androidConfig.config.googleMaps.apiKey.trim().length > 0;
+}
+
+function hasMappableCoordinates(location: EventLocation) {
+  const { latitude, longitude, latitudeDelta, longitudeDelta } = location;
+  return (
+    Number.isFinite(latitude) &&
+    Number.isFinite(longitude) &&
+    Number.isFinite(latitudeDelta) &&
+    Number.isFinite(longitudeDelta) &&
+    !(latitude === 0 && longitude === 0)
+  );
+}
+
+function getDirectionsDestination(location: EventLocation) {
+  if (hasMappableCoordinates(location)) {
+    return `${location.latitude},${location.longitude}`;
+  }
+
+  return location.address || location.label;
+}
+
 const styles = StyleSheet.create({
   container: {
     flex: 1,
@@ -1222,8 +1465,8 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   heroSaveButtonActive: {
-    backgroundColor: 'rgba(255,107,61,0.24)',
-    borderColor: 'rgba(255,107,61,0.28)',
+    backgroundColor: 'rgba(242,34,28,0.24)',
+    borderColor: 'rgba(242,34,28,0.28)',
   },
   heroFooter: {
     position: 'absolute',
@@ -1405,7 +1648,7 @@ const styles = StyleSheet.create({
     borderRadius: theme.radius.pill,
     backgroundColor: 'rgba(10,13,19,0.88)',
     borderWidth: 1,
-    borderColor: 'rgba(255,107,61,0.22)',
+    borderColor: 'rgba(242,34,28,0.22)',
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
@@ -1433,6 +1676,35 @@ const styles = StyleSheet.create({
     color: theme.colors.text,
     fontSize: 11,
     fontWeight: '700',
+  },
+  mapFallbackFrame: {
+    minHeight: 184,
+    borderRadius: theme.radius.md,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: theme.colors.surfaceStrong,
+    padding: 18,
+    alignItems: 'flex-start',
+    justifyContent: 'center',
+    gap: 10,
+  },
+  mapFallbackIcon: {
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    backgroundColor: theme.colors.accentSoft,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  mapFallbackTitle: {
+    color: theme.colors.text,
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  mapFallbackAddress: {
+    color: theme.colors.textMuted,
+    fontSize: 13,
+    lineHeight: 19,
   },
   mapMeta: {
     gap: 6,
@@ -1706,7 +1978,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   paymentMethodChipActive: {
-    backgroundColor: 'rgba(255,107,61,0.16)',
+    backgroundColor: 'rgba(242,34,28,0.16)',
     borderColor: 'rgba(231,57,47,0.54)',
   },
   paymentMethodText: {
@@ -1725,12 +1997,21 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 10,
   },
+  checkoutNoteLine: {
+    minHeight: 92,
+    alignItems: 'flex-start',
+    paddingTop: 12,
+  },
   checkoutInput: {
     flex: 1,
     color: theme.colors.text,
     fontSize: 15,
     fontWeight: '700',
     paddingVertical: 0,
+  },
+  checkoutNoteInput: {
+    minHeight: 76,
+    lineHeight: 19,
   },
   checkoutHelp: {
     color: theme.colors.textMuted,
@@ -1754,11 +2035,16 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '900',
   },
+  ratingDismissLayer: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 2,
+  },
   bottomBar: {
     position: 'absolute',
     left: 0,
     right: 0,
     bottom: 0,
+    zIndex: 3,
     paddingTop: 24,
     paddingHorizontal: 16,
     backgroundColor: 'rgba(10,13,19,0.82)',
@@ -1766,24 +2052,45 @@ const styles = StyleSheet.create({
   bottomBarInner: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 12,
+    gap: 7,
   },
-  ratingDock: {
-    position: 'relative',
-    width: 54,
+  reserveActionPressable: {
+    alignSelf: 'flex-end',
+  },
+  reserveActionSizer: {
+    minHeight: 48,
+  },
+  reserveActionButton: {
+    width: '100%',
+    minHeight: 48,
+    borderRadius: 24,
+    paddingHorizontal: 17,
+    flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'center',
+    overflow: 'hidden',
+    ...shadow,
+  },
+  reserveActionText: {
+    flexShrink: 1,
+    color: theme.colors.white,
+    fontSize: 14,
+    fontWeight: '900',
+  },
+  ratingDockRow: {
+    position: 'relative',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
   },
   ratingRail: {
-    position: 'absolute',
-    right: 0,
-    bottom: 56,
-    padding: 6,
-    borderRadius: 22,
-    backgroundColor: 'rgba(12,15,23,0.96)',
-    borderWidth: 1,
-    borderColor: 'rgba(255,107,61,0.2)',
-    gap: 6,
-    ...shadow,
+    height: 48,
+    backgroundColor: 'transparent',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    overflow: 'hidden',
+    gap: 3,
   },
   ratingStarPressable: {
     alignSelf: 'center',
@@ -1792,18 +2099,24 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   ratingStar: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
+    width: 40,
+    height: 44,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: theme.colors.surfaceMuted,
-    borderWidth: 1,
-    borderColor: theme.colors.border,
+    backgroundColor: 'transparent',
+    gap: 1,
   },
   ratingStarActive: {
-    backgroundColor: theme.colors.accentSoft,
-    borderColor: 'rgba(255,107,61,0.28)',
+    backgroundColor: 'transparent',
+  },
+  ratingStarNumber: {
+    color: theme.colors.textSoft,
+    fontSize: 10,
+    fontWeight: '900',
+    includeFontPadding: false,
+  },
+  ratingStarNumberActive: {
+    color: theme.colors.white,
   },
   ratingTriggerPressable: {
     alignSelf: 'flex-end',
@@ -1814,7 +2127,7 @@ const styles = StyleSheet.create({
     borderRadius: 24,
     backgroundColor: theme.colors.surfaceStrong,
     borderWidth: 1,
-    borderColor: 'rgba(255,107,61,0.18)',
+    borderColor: 'rgba(242,34,28,0.18)',
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -1827,18 +2140,20 @@ const styles = StyleSheet.create({
     borderRadius: 24,
     backgroundColor: theme.colors.surfaceStrong,
     borderWidth: 1,
-    borderColor: 'rgba(255,107,61,0.18)',
+    borderColor: 'rgba(242,34,28,0.18)',
     alignItems: 'center',
     justifyContent: 'center',
+    overflow: 'visible',
   },
   commentBadge: {
     position: 'absolute',
     top: -4,
     right: -3,
     minWidth: 18,
+    maxWidth: 42,
     height: 18,
     borderRadius: 9,
-    paddingHorizontal: 4,
+    paddingHorizontal: 5,
     backgroundColor: theme.colors.accent,
     borderWidth: 1,
     borderColor: 'rgba(10,13,19,0.82)',
@@ -1849,6 +2164,8 @@ const styles = StyleSheet.create({
     color: theme.colors.white,
     fontSize: 9,
     fontWeight: '800',
-    letterSpacing: 0.2,
+    letterSpacing: 0,
+    includeFontPadding: false,
+    textAlign: 'center',
   },
 });

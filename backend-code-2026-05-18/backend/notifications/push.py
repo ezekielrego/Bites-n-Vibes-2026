@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from urllib.parse import urljoin
 
 from django.conf import settings
 
@@ -32,6 +33,7 @@ def send_push_for_notification(notification):
         return {'sent': 0, 'skipped': 'firebase-unavailable'}
 
     messaging = firebase['messaging']
+    image_url = _notification_image_url(notification)
     sent = 0
     for device in devices:
         message = messaging.Message(
@@ -39,6 +41,7 @@ def send_push_for_notification(notification):
             notification=messaging.Notification(
                 title=notification.title,
                 body=notification.message,
+                image=image_url,
             ),
             data={
                 'notification_id': str(notification.id),
@@ -49,7 +52,7 @@ def send_push_for_notification(notification):
                 priority='high',
                 notification=messaging.AndroidNotification(
                     channel_id='default',
-                    color='#FF6B3D',
+                    color='#F2221C',
                     sound='default',
                 ),
             ),
@@ -74,6 +77,22 @@ def send_push_for_notification(notification):
             device.save(update_fields=['failure_count', 'last_error', 'is_active', 'updated_at'])
 
     return {'sent': sent}
+
+
+def _notification_image_url(notification):
+    listing = getattr(notification, 'listing', None)
+    if not listing:
+        return None
+
+    image_url = getattr(listing, 'primary_image', None)
+    if not image_url:
+        return None
+
+    image_url = str(image_url)
+    if image_url.startswith(('http://', 'https://')):
+        return image_url
+
+    return urljoin(settings.PUBLIC_SITE_URL, image_url)
 
 
 def _load_firebase():

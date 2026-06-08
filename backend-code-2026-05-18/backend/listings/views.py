@@ -6,8 +6,9 @@ from django.conf import settings
 from django_filters.rest_framework import DjangoFilterBackend
 from django.core.paginator import Paginator
 from django.db import transaction
-from django.db.models import F, Q
+from django.db.models import Count, F, Q
 from django.utils import timezone
+from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 import re
 from accounts.serializers import UserSerializer
@@ -141,7 +142,7 @@ class ListingViewSet(viewsets.ModelViewSet):
         expires_at = timezone.localtime(listing.owner_edit_expires_at)
         formatted = expires_at.strftime('%d %b at %H:%M')
         return Response(
-            {'detail': f'This listing can only be edited in the first 24 hours after posting. The edit window closed on {formatted}.'},
+            {'detail': f'This listing can only be edited in the first 48 hours after posting. The edit window closed on {formatted}.'},
             status=status.HTTP_403_FORBIDDEN,
         )
 
@@ -251,6 +252,157 @@ class ListingViewSet(viewsets.ModelViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticatedOrReadOnly], url_path='app-search-suggestions')
+    def app_search_suggestions(self, request):
+        """Search suggestions for the mobile home search box."""
+        query = (request.query_params.get('q') or '').strip()
+        category = (request.query_params.get('category') or '').strip()
+        limit = min(max(int(request.query_params.get('limit', 8) or 8), 4), 12)
+        category_obj = self._resolve_category(category)
+        suggestions = []
+        seen_queries = set()
+
+        def add_suggestion(label, suggestion_query=None, suggestion_type='popular', hint=''):
+            cleaned_label = (label or '').strip()
+            cleaned_query = (suggestion_query or cleaned_label).strip()
+            if not cleaned_label or not cleaned_query:
+                return
+
+            dedupe_key = cleaned_query.lower()
+            if dedupe_key in seen_queries:
+                return
+
+            seen_queries.add(dedupe_key)
+            suggestions.append({
+                'id': f'{suggestion_type}-{len(suggestions) + 1}',
+                'label': cleaned_label,
+                'query': cleaned_query,
+                'type': suggestion_type,
+                'hint': hint,
+            })
+
+        if not query or 'near'.startswith(query.lower()) or query.lower() in {'near me', 'nearby'}:
+            add_suggestion('Near me', 'near me', 'nearby', 'Closest listings around you')
+
+        logs = SearchQueryLog.objects.all()
+        if category_obj:
+            logs = logs.filter(Q(category=category_obj) | Q(category__isnull=True))
+        if query:
+            logs = logs.filter(query__icontains=query)
+
+        for item in (
+            logs.values('query')
+            .annotate(search_count=Count('id'))
+            .order_by('-search_count', '-query')[:limit]
+        ):
+            add_suggestion(item['query'], item['query'], 'popular', f"{item['search_count']} searches")
+
+        category_queryset = Category.objects.filter(is_active=True)
+        if query:
+            category_queryset = category_queryset.filter(name__icontains=query)
+        for item in category_queryset.order_by('order', 'name')[:4]:
+            add_suggestion(item.name, item.name, 'category', 'Category')
+
+        tag_queryset = Tag.objects.all()
+        if query:
+            tag_queryset = tag_queryset.filter(name__icontains=query)
+        for item in tag_queryset.order_by('name')[:4]:
+            add_suggestion(item.name, item.name, 'tag', 'Popular tag')
+
+        listing_queryset = self.get_queryset()
+        if category_obj:
+            listing_queryset = listing_queryset.filter(category=category_obj)
+        if query:
+            listing_queryset = listing_queryset.filter(
+                Q(name__icontains=query)
+                | Q(description__icontains=query)
+                | Q(address__icontains=query)
+                | Q(tags__name__icontains=query)
+            )
+        for item in listing_queryset.distinct().order_by('-is_featured', '-is_trending', '-created_at')[:4]:
+            add_suggestion(item.name, item.name, 'listing', item.category.name)
+
+        return Response(
+            {
+                'results': suggestions[:limit],
+                'meta': {
+                    'query': query,
+                    'category': category or 'all',
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticatedOrReadOnly], url_path='app-search-log')
+    def app_search_log(self, request):
+        """Explicit search logging for selected suggestions or submitted terms."""
+        user = request.user if getattr(request.user, 'is_authenticated', False) else None
+        query = (request.data.get('query') or '').strip()
+        category = (request.data.get('category') or '').strip()
+        result_count = request.data.get('result_count') or 0
+
+        if not query:
+            return Response({'detail': 'query is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            result_count = max(int(result_count), 0)
+        except (TypeError, ValueError):
+            result_count = 0
+
+        SearchQueryLog.objects.create(
+            user=user,
+            query=query[:180],
+            category=self._resolve_category(category),
+            result_count=result_count,
+        )
+
+        return Response({'ok': True}, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticatedOrReadOnly], url_path='app-spotlight')
+    def app_spotlight(self, request):
+        """Backend-decided Spotlight listings for the mobile home surface."""
+        self._run_media_cleanup()
+
+        category = (request.query_params.get('category') or '').strip()
+        limit = min(max(int(request.query_params.get('limit', 30) or 30), 1), 30)
+        category_obj = self._resolve_category(category)
+        queryset = self.get_queryset()
+
+        if category_obj:
+            queryset = queryset.filter(category=category_obj)
+
+        ranked_listings = self._rank_spotlight_listings(queryset)
+        results = ListingSerializer(
+            ranked_listings[:limit],
+            many=True,
+            context={'request': request},
+        ).data
+
+        self._record_feed_signals(
+            request.user,
+            ranked_listings[:limit],
+            '',
+            category_obj,
+            len(ranked_listings),
+            1,
+            1,
+            source='app_spotlight',
+        )
+
+        return Response(
+            {
+                'count': len(ranked_listings),
+                'results': results,
+                'meta': {
+                    'category': category or 'all',
+                    'ranking': 'rolling_24h_engagement',
+                    'ranking_window_hours': 24,
+                    'fallback': 'previous_24h_then_all_time_engagement',
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
     def _read_float_query_param(self, request, name):
         value = request.query_params.get(name)
         if value in (None, ''):
@@ -260,11 +412,19 @@ class ListingViewSet(viewsets.ModelViewSet):
         except (TypeError, ValueError):
             return None
 
-    def _record_feed_signals(self, user, listings, search, category, result_count, start_position, page_number):
+    def _resolve_category(self, category):
+        category = (category or '').strip()
+        if not category or category == 'all':
+            return None
+        if category.isdigit():
+            return Category.objects.filter(id=int(category)).first()
+        return Category.objects.filter(slug=category).first()
+
+    def _record_feed_signals(self, user, listings, search, category, result_count, start_position, page_number, source='app_feed'):
         if not getattr(user, 'is_authenticated', False):
             return
 
-        if search and page_number == 1:
+        if source == 'app_feed' and search and page_number == 1:
             SearchQueryLog.objects.create(
                 user=user,
                 query=search[:180],
@@ -278,6 +438,7 @@ class ListingViewSet(viewsets.ModelViewSet):
                 listing=listing,
                 category=category,
                 search_query=search[:180],
+                source=source,
                 position=start_position + index,
             )
             for index, listing in enumerate(listings)
@@ -386,6 +547,96 @@ class ListingViewSet(viewsets.ModelViewSet):
 
         return sorted(listings, key=lambda listing: (score_listing(listing), listing.created_at), reverse=True)
 
+    def _rank_spotlight_listings(self, queryset):
+        now = timezone.now()
+        current_start = now - timedelta(hours=24)
+        previous_start = now - timedelta(hours=48)
+        listings = list(
+            queryset.select_related('category', 'owner').prefetch_related(
+                'tags', 'images', 'ratings', 'saved_by', 'tickets', 'comments'
+            )[:500]
+        )
+
+        def in_window(value, start=None, end=None):
+            if value is None:
+                return False
+            if start is not None and value < start:
+                return False
+            if end is not None and value >= end:
+                return False
+            return True
+
+        def score_window(listing, start=None, end=None):
+            vibe_items = [
+                vibe for vibe in listing.vibes.all()
+                if vibe.is_vibing and in_window(vibe.created_at, start, end)
+            ]
+            saved_items = [
+                saved for saved in listing.saved_by.all()
+                if in_window(saved.created_at, start, end)
+            ]
+            rating_items = [
+                rating for rating in listing.ratings.all()
+                if in_window(rating.created_at, start, end)
+            ]
+            comment_items = [
+                comment for comment in listing.comments.all()
+                if not comment.is_deleted and in_window(comment.created_at, start, end)
+            ]
+            ticket_items = [
+                ticket for ticket in listing.tickets.all()
+                if in_window(ticket.booked_at, start, end)
+            ]
+            latest_times = [
+                item.created_at for item in vibe_items
+            ] + [
+                item.created_at for item in saved_items
+            ] + [
+                item.created_at for item in rating_items
+            ] + [
+                item.created_at for item in comment_items
+            ] + [
+                item.booked_at for item in ticket_items
+            ]
+            score = (
+                len(vibe_items)
+                + len(saved_items)
+                + sum(float(rating.rating or 0) for rating in rating_items)
+                + len(comment_items)
+                + len(ticket_items)
+            )
+            latest_activity = max(latest_times) if latest_times else listing.created_at
+            return score, latest_activity
+
+        def ranked_for_window(start=None, end=None):
+            scored = [
+                (listing, *score_window(listing, start, end))
+                for listing in listings
+            ]
+            engaged = [
+                item for item in scored
+                if item[1] > 0
+            ]
+            return [
+                item[0]
+                for item in sorted(engaged, key=lambda item: (item[1], item[2], item[0].created_at), reverse=True)
+            ]
+
+        ranked = []
+        seen_ids = set()
+        for window_ranked in (
+            ranked_for_window(current_start, now),
+            ranked_for_window(previous_start, current_start),
+            ranked_for_window(),
+        ):
+            for listing in window_ranked:
+                if listing.id in seen_ids:
+                    continue
+                ranked.append(listing)
+                seen_ids.add(listing.id)
+
+        return ranked
+
     @action(detail=False, methods=['get'], permission_classes=[AllowAny], url_path='app-version')
     def app_version(self, request):
         platform = (request.query_params.get('platform') or 'android').strip().lower()
@@ -476,7 +727,7 @@ class ListingViewSet(viewsets.ModelViewSet):
             return Response({'detail': 'Booking reference not found.'}, status=status.HTTP_404_NOT_FOUND)
 
         if status_value in SUCCESS_STATUSES:
-            ticket.status = 'confirmed'
+            ticket.status = 'requested'
             ticket.payment_status = 'paid'
             ticket.paid_at = timezone.now()
         elif status_value in FAILED_STATUSES:
@@ -731,6 +982,7 @@ class ListingViewSet(viewsets.ModelViewSet):
         quantity = request.data.get('quantity', 1)
         payment_method = str(request.data.get('payment_method') or '').strip().lower()
         payer_phone = str(request.data.get('phone') or '').strip()
+        request_note = str(request.data.get('request_note') or request.data.get('note') or '').strip()
         unit_price = amount_for_listing(listing)
 
         try:
@@ -753,13 +1005,19 @@ class ListingViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        if not request_note:
+            return Response(
+                {'detail': 'Tell the host your preferred time, quantity, or any request details.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         existing_ticket = Ticket.objects.filter(
             listing=listing,
             user=request.user,
-            status__in=['pending', 'confirmed'],
+            status__in=['requested', 'pending', 'confirmed', 'accepted'],
         ).order_by('-booked_at').first()
 
-        if existing_ticket and existing_ticket.status == 'confirmed':
+        if existing_ticket and existing_ticket.status in {'confirmed', 'accepted'}:
             serializer = TicketSerializer(existing_ticket, context={'request': request})
             return Response(
                 {
@@ -784,11 +1042,12 @@ class ListingViewSet(viewsets.ModelViewSet):
             ticket.currency = 'USD'
             ticket.payment_method = payment_method if needs_payment else ''
             ticket.payer_phone = payer_phone if needs_payment else ''
+            ticket.request_note = request_note
 
             if not needs_payment:
-                ticket.status = 'confirmed'
+                ticket.status = 'requested'
                 ticket.payment_status = 'not_required'
-                ticket.paid_at = timezone.now()
+                ticket.paid_at = None
                 ticket.save()
             else:
                 ticket.status = 'pending'
@@ -818,7 +1077,7 @@ class ListingViewSet(viewsets.ModelViewSet):
                 ticket.payment_last_response = checkout.get('raw') or checkout
 
                 if checkout.get('status') in SUCCESS_STATUSES:
-                    ticket.status = 'confirmed'
+                    ticket.status = 'requested'
                     ticket.payment_status = 'paid'
                     ticket.paid_at = timezone.now()
                 elif checkout.get('status') in FAILED_STATUSES:
@@ -835,29 +1094,32 @@ class ListingViewSet(viewsets.ModelViewSet):
                     'updated_at',
                 ])
 
-        title = 'Ticket ready' if action_type == 'ticket' else f'{payment_label_for_action(action_type).title()} ready'
+        title = 'Request sent'
         if ticket.status == 'pending':
             title = 'Payment started'
+        elif ticket.payment_status == 'paid':
+            title = 'Payment received'
 
         Notification.objects.create(
             user=request.user,
             notification_type='ticket' if action_type == 'ticket' else 'booking',
             title=title,
             message=(
-                f'Your {payment_label_for_action(action_type)} for {listing.name} is ready in the app.'
-                if ticket.status == 'confirmed'
+                f'Your {payment_label_for_action(action_type)} for {listing.name} was sent to the host for confirmation.'
+                if ticket.status == 'requested'
                 else f'Approve the {ticket.payment_method} payment on your phone to complete {listing.name}.'
             ),
             listing=listing,
         )
 
-        if listing.owner_id and listing.owner_id != request.user.id and ticket.status == 'confirmed':
+        if listing.owner_id and listing.owner_id != request.user.id and ticket.status == 'requested':
             buyer_name = getattr(request.user, 'name', '') or request.user.email
+            note_preview = f' Note: {ticket.request_note[:120]}' if ticket.request_note else ''
             Notification.objects.create(
                 user=listing.owner,
                 notification_type='booking',
-                title=f'New {payment_label_for_action(action_type)}',
-                message=f'{buyer_name} completed a {payment_label_for_action(action_type)} for {listing.name}.',
+                title=f'Confirm {payment_label_for_action(action_type)}',
+                message=f'{buyer_name} requested {quantity} for {listing.name}.{note_preview}',
                 listing=listing,
             )
 
@@ -964,7 +1226,7 @@ class TicketViewSet(viewsets.ReadOnlyModelViewSet):
     def poll_payment(self, request, pk=None):
         ticket = self.get_object()
 
-        if ticket.payment_status == 'paid' or ticket.status == 'confirmed':
+        if ticket.payment_status == 'paid' or ticket.status in {'requested', 'confirmed', 'accepted'}:
             return Response({'ticket': self.get_serializer(ticket).data}, status=status.HTTP_200_OK)
 
         try:
@@ -978,7 +1240,7 @@ class TicketViewSet(viewsets.ReadOnlyModelViewSet):
         previous_status = ticket.status
         ticket.payment_last_response = payment.get('raw') or payment
         if payment.get('status') in SUCCESS_STATUSES:
-            ticket.status = 'confirmed'
+            ticket.status = 'requested'
             ticket.payment_status = 'paid'
             ticket.paid_at = timezone.now()
         elif payment.get('status') in FAILED_STATUSES:
@@ -986,21 +1248,22 @@ class TicketViewSet(viewsets.ReadOnlyModelViewSet):
             ticket.payment_status = 'failed'
         ticket.save(update_fields=['status', 'payment_status', 'payment_last_response', 'paid_at', 'updated_at'])
 
-        if previous_status != 'confirmed' and ticket.status == 'confirmed':
+        if previous_status != 'requested' and ticket.status == 'requested':
             Notification.objects.create(
                 user=ticket.user,
                 notification_type='ticket' if ticket.action_type == 'ticket' else 'booking',
-                title='Payment confirmed',
-                message=f'Your {payment_label_for_action(ticket.action_type)} for {ticket.listing.name} is confirmed.',
+                title='Payment received',
+                message=f'Your {payment_label_for_action(ticket.action_type)} for {ticket.listing.name} is waiting for host confirmation.',
                 listing=ticket.listing,
             )
             if ticket.listing.owner_id and ticket.listing.owner_id != ticket.user_id:
                 buyer_name = getattr(ticket.user, 'name', '') or ticket.user.email
+                note_preview = f' Note: {ticket.request_note[:120]}' if ticket.request_note else ''
                 Notification.objects.create(
                     user=ticket.listing.owner,
                     notification_type='booking',
-                    title=f'Paid {payment_label_for_action(ticket.action_type)}',
-                    message=f'{buyer_name} paid {ticket.currency} {ticket.total_amount} for {ticket.listing.name}.',
+                    title=f'Confirm paid {payment_label_for_action(ticket.action_type)}',
+                    message=f'{buyer_name} paid {ticket.currency} {ticket.total_amount} for {ticket.listing.name}.{note_preview}',
                     listing=ticket.listing,
                 )
 
@@ -1025,7 +1288,7 @@ class TicketViewSet(viewsets.ReadOnlyModelViewSet):
         if not (request.user.is_superuser or request.user.id == ticket.listing.owner_id):
             return Response({'detail': 'Only the listing owner can verify this booking.'}, status=status.HTTP_403_FORBIDDEN)
 
-        if ticket.status == 'confirmed':
+        if ticket.status in {'confirmed', 'accepted'}:
             ticket.status = 'used'
             ticket.save(update_fields=['status', 'updated_at'])
             if ticket.user_id != request.user.id:
@@ -1046,13 +1309,66 @@ class TicketViewSet(viewsets.ReadOnlyModelViewSet):
             status=status.HTTP_200_OK,
         )
 
+    def _confirm_ticket(self, request, ticket):
+        if ticket.status == 'confirmed':
+            return Response(
+                {
+                    'message': 'Booking is already confirmed.',
+                    'ticket': self.get_serializer(ticket).data,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        if ticket.status != 'requested':
+            return Response(
+                {'detail': 'Only requested bookings can be confirmed.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not (request.user.is_superuser or request.user.id == ticket.listing.owner_id):
+            return Response(
+                {'detail': 'You do not have permission to confirm this booking.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        ticket.status = 'confirmed'
+        ticket.save(update_fields=['status', 'updated_at'])
+
+        if ticket.user_id != request.user.id:
+            Notification.objects.create(
+                user=ticket.user,
+                notification_type='ticket' if ticket.action_type == 'ticket' else 'booking',
+                title='Booking confirmed',
+                message=f'Your {payment_label_for_action(ticket.action_type)} for {ticket.listing.name} has been confirmed by the host.',
+                listing=ticket.listing,
+            )
+
+        serializer = self.get_serializer(ticket)
+        return Response(
+            {
+                'message': 'Booking confirmed.',
+                'ticket': serializer.data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=['post'])
+    def confirm(self, request, pk=None):
+        ticket = self.get_object()
+        return self._confirm_ticket(request, ticket)
+
+    @action(detail=True, methods=['post'])
+    def accept(self, request, pk=None):
+        ticket = self.get_object()
+        return self._confirm_ticket(request, ticket)
+
     @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
         ticket = self.get_object()
 
-        if ticket.status != 'confirmed':
+        if ticket.status not in {'requested', 'pending', 'confirmed', 'accepted'}:
             return Response(
-                {'detail': 'Only confirmed tickets can be cancelled.'},
+                {'detail': 'Only active ticket requests can be cancelled.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -1098,9 +1414,9 @@ class TicketViewSet(viewsets.ReadOnlyModelViewSet):
     def mark_used(self, request, pk=None):
         ticket = self.get_object()
 
-        if ticket.status != 'confirmed':
+        if ticket.status not in {'confirmed', 'accepted'}:
             return Response(
-                {'detail': 'Only confirmed tickets can be marked as used.'},
+                {'detail': 'Only confirmed or accepted tickets can be marked as used.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 

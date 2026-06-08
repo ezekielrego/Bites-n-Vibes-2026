@@ -16,6 +16,7 @@ export type NotificationType =
   | 'system';
 export type AppIconName =
   | 'calendar'
+  | 'check'
   | 'chevron-left'
   | 'clock'
   | 'coffee'
@@ -25,6 +26,7 @@ export type AppIconName =
   | 'grid'
   | 'heart'
   | 'info'
+  | 'inbox'
   | 'map-pin'
   | 'menu'
   | 'message-circle'
@@ -135,11 +137,13 @@ export interface AppTicket {
   currency: string;
   referenceCode: string;
   qrValue: string;
-  status: 'pending' | 'confirmed' | 'used' | 'cancelled' | 'failed' | 'expired';
+  status: 'requested' | 'pending' | 'confirmed' | 'accepted' | 'used' | 'cancelled' | 'failed' | 'expired';
   paymentStatus: 'not_required' | 'pending' | 'paid' | 'failed' | 'cancelled' | 'expired';
   paymentMethod?: string | null;
   paynowReference?: string | null;
+  requestNote?: string;
   canCancel: boolean;
+  canAccept: boolean;
   canMarkUsed: boolean;
   canManage: boolean;
   bookedAt: string;
@@ -149,9 +153,10 @@ export interface AppTicket {
 export type BookingPaymentMethod = 'ecocash' | 'onemoney' | 'innbucks' | 'omari';
 
 export interface BookingCheckoutInput {
-  paymentMethod: BookingPaymentMethod;
-  phone: string;
+  paymentMethod?: BookingPaymentMethod;
+  phone?: string;
   quantity?: number;
+  requestNote: string;
 }
 
 export type CommentAttachmentType = 'image' | 'video' | 'link';
@@ -247,6 +252,16 @@ export interface AppEventPage {
   events: AppEvent[];
   nextPage: number | null;
   totalCount: number;
+}
+
+export type AppSearchSuggestionType = 'nearby' | 'popular' | 'recent' | 'listing' | 'category' | 'tag';
+
+export interface AppSearchSuggestion {
+  id: string;
+  label: string;
+  query: string;
+  type: AppSearchSuggestionType;
+  hint?: string;
 }
 
 export interface LocalUploadFile {

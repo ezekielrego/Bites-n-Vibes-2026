@@ -1,11 +1,12 @@
-import React, { useEffect, useRef } from 'react';
-import { Animated, Easing, Pressable, StyleProp, StyleSheet, Text, useWindowDimensions, View, ViewStyle } from 'react-native';
-import { Feather, MaterialIcons } from '@expo/vector-icons';
+import React, { useEffect } from 'react';
+import { Pressable, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
+import { Feather } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import LottieView from 'lottie-react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { theme, shadow } from '../theme';
 import type { AnimationObject } from 'lottie-react-native';
+import { OnboardingTapCue } from './OnboardingTapCue';
 
 const WELCOME_ANIMATION = require('../../assets/lottie/man-woman-hi.json') as AnimationObject;
 const FIREWORKS_ANIMATION = require('../../assets/lottie/fireworks.json') as AnimationObject;
@@ -13,22 +14,16 @@ const FIREWORKS_ANIMATION = require('../../assets/lottie/fireworks.json') as Ani
 export type OnboardingStage = 'checking' | 'welcome' | 'scroll' | 'create' | 'menu' | 'success' | 'done';
 
 export function OnboardingOverlay({
-  createTarget,
   stage,
   onNext,
   onFinish,
 }: {
-  createTarget?: { x: number; y: number };
   stage: OnboardingStage;
   onNext: () => void;
   onFinish: () => void;
 }) {
   const insets = useSafeAreaInsets();
-  const { height, width } = useWindowDimensions();
-  const createCuePosition = createTarget
-    ? centerCueOnTarget(createTarget, CREATE_CUE_SIZE, CREATE_CUE_Y_OFFSET)
-    : getCreateTabCuePosition(width, height, insets.bottom);
-  const menuCuePosition = getMenuCuePosition(insets.top);
+  const { width } = useWindowDimensions();
 
   useEffect(() => {
     if (stage !== 'success') {
@@ -39,7 +34,7 @@ export function OnboardingOverlay({
     return () => clearTimeout(timer);
   }, [onFinish, stage]);
 
-  if (stage === 'checking' || stage === 'done') {
+  if (stage === 'checking' || stage === 'create' || stage === 'menu' || stage === 'done') {
     return null;
   }
 
@@ -68,7 +63,7 @@ export function OnboardingOverlay({
 
         <Pressable accessibilityRole="button" onPress={onNext} style={styles.nextPressable}>
           <LinearGradient
-            colors={['#E53935', '#FF6B3D', '#FFB15C']}
+            colors={['#E53935', '#F2221C', '#FF9A96']}
             locations={[0, 0.48, 1]}
             start={{ x: 0, y: 0.5 }}
             end={{ x: 1, y: 0.5 }}
@@ -99,128 +94,19 @@ export function OnboardingOverlay({
   return (
     <View pointerEvents="none" style={styles.transparentScreen}>
       {stage === 'scroll' ? (
-        <PointerCue variant="scroll" style={[styles.scrollCue, { bottom: insets.bottom + 138, left: width / 2 - SCROLL_CUE_SIZE / 2 }]} />
-      ) : null}
-
-      {stage === 'create' ? (
-        <PointerCue variant="create" style={[styles.createCue, createCuePosition]} />
-      ) : null}
-
-      {stage === 'menu' ? (
-        <PointerCue variant="menu" style={[styles.menuCue, menuCuePosition]} />
-      ) : null}
-    </View>
-  );
-}
-
-function PointerCue({
-  variant,
-  style,
-}: {
-  variant: 'create' | 'menu' | 'scroll';
-  style: StyleProp<ViewStyle>;
-}) {
-  const motion = useRef(new Animated.Value(0)).current;
-
-  useEffect(() => {
-    const loop = Animated.loop(
-      Animated.sequence([
-        Animated.timing(motion, {
-          toValue: 1,
-          duration: 780,
-          easing: Easing.out(Easing.cubic),
-          useNativeDriver: true,
-        }),
-        Animated.timing(motion, {
-          toValue: 0,
-          duration: 520,
-          easing: Easing.inOut(Easing.quad),
-          useNativeDriver: true,
-        }),
-      ]),
-    );
-
-    loop.start();
-    return () => loop.stop();
-  }, [motion]);
-
-  const translateY = motion.interpolate({
-    inputRange: [0, 1],
-    outputRange: variant === 'scroll' ? [18, -26] : [7, -1],
-  });
-  const scale = motion.interpolate({
-    inputRange: [0, 0.72, 1],
-    outputRange: [1, 0.9, 1],
-  });
-  const opacity = motion.interpolate({
-    inputRange: [0, 0.2, 0.84, 1],
-    outputRange: [0.62, 1, 1, 0.72],
-  });
-
-  return (
-    <View style={[styles.cue, style]}>
-      <Animated.View
-        style={[
-          styles.pointerCueIcon,
-          variant === 'scroll'
-            ? styles.scrollPointerIcon
-            : variant === 'create'
-              ? styles.createPointerIcon
-              : styles.menuPointerIcon,
-          {
-            opacity,
-            transform: [{ translateY }, { scale }],
-          },
-        ]}
-      >
-        <MaterialIcons
-          color="#FFFFFF"
-          name="touch-app"
-          size={variant === 'scroll' ? 36 : variant === 'create' ? 32 : 28}
+        <OnboardingTapCue
+          backgroundColor="rgba(8,10,14,0.64)"
+          iconSize={36}
+          size={SCROLL_CUE_SIZE}
+          style={[styles.scrollCue, { bottom: insets.bottom + 138, left: width / 2 - SCROLL_CUE_SIZE / 2 }]}
+          travel={[18, -26]}
         />
-      </Animated.View>
+      ) : null}
     </View>
   );
 }
 
-const CREATE_CUE_SIZE = 46;
-const MENU_CUE_SIZE = 40;
 const SCROLL_CUE_SIZE = 58;
-const CREATE_CUE_Y_OFFSET = 14;
-
-function centerCueOnTarget(target: { x: number; y: number }, cueSize: number, yOffset = 0) {
-  return {
-    left: target.x - cueSize / 2,
-    top: target.y - cueSize / 2 + yOffset,
-  };
-}
-
-function getCreateTabCuePosition(viewportWidth: number, viewportHeight: number, bottomInset: number) {
-  const shellWidth = Math.min(viewportWidth * 0.94, 430);
-  const shellLeft = (viewportWidth - shellWidth) / 2;
-  const innerWidth = shellWidth - 16;
-  const totalGrow = 1.55 + 0.86 * 4;
-  const targetCenterX =
-    shellLeft +
-    8 +
-    innerWidth * ((1.55 + 0.86 + 0.86 / 2) / totalGrow);
-  const targetCenterY = viewportHeight - (bottomInset + 10 + 66 / 2);
-
-  return {
-    left: targetCenterX - CREATE_CUE_SIZE / 2,
-    top: targetCenterY - CREATE_CUE_SIZE / 2 + CREATE_CUE_Y_OFFSET,
-  };
-}
-
-function getMenuCuePosition(topInset: number) {
-  const targetCenterX = 20 + 42 / 2;
-  const targetCenterY = topInset + 8 + 42 / 2;
-
-  return {
-    left: targetCenterX - MENU_CUE_SIZE / 2 - 8,
-    top: targetCenterY - MENU_CUE_SIZE / 2,
-  };
-}
 
 const styles = StyleSheet.create({
   fullScreen: {
@@ -261,7 +147,7 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   eyebrow: {
-    color: '#FFB15C',
+    color: '#FF9A96',
     fontSize: 12,
     fontWeight: '900',
     letterSpacing: 1.6,
@@ -300,44 +186,8 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '900',
   },
-  cue: {
-    position: 'absolute',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  createCue: {
-    alignItems: 'center',
-  },
   scrollCue: {
-    alignItems: 'center',
-  },
-  menuCue: {
-    left: 30,
-    alignItems: 'flex-start',
-  },
-  pointerCueIcon: {
-    backgroundColor: 'rgba(8,10,14,0.64)',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.18)',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  createPointerIcon: {
-    width: CREATE_CUE_SIZE,
-    height: CREATE_CUE_SIZE,
-    borderRadius: CREATE_CUE_SIZE / 2,
-    ...shadow,
-  },
-  scrollPointerIcon: {
-    width: SCROLL_CUE_SIZE,
-    height: SCROLL_CUE_SIZE,
-    borderRadius: SCROLL_CUE_SIZE / 2,
-    ...shadow,
-  },
-  menuPointerIcon: {
-    width: MENU_CUE_SIZE,
-    height: MENU_CUE_SIZE,
-    borderRadius: MENU_CUE_SIZE / 2,
+    position: 'absolute',
   },
   fireworksAnimation: {
     width: '96%',
