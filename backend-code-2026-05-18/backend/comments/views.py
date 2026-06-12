@@ -4,11 +4,11 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from django.conf import settings
 from django.shortcuts import get_object_or_404
-from django.db.models import Q
+from django.db.models import Count, Q
 import logging
 from kombu.exceptions import OperationalError as KombuOperationalError
 from redis.exceptions import ConnectionError as RedisConnectionError
-from .models import Comment, CommentAttachment
+from .models import Comment, CommentAttachment, CommentFeedback
 from .serializers import (
     CommentSerializer, CommentCreateSerializer,
     CommentUpdateSerializer, CommentAttachmentSerializer
@@ -24,7 +24,7 @@ class CommentViewSet(viewsets.ModelViewSet):
     """ViewSet for Comments with nested replies."""
     queryset = Comment.objects.filter(is_deleted=False).select_related(
         'user', 'listing', 'parent'
-    ).prefetch_related('attachments', 'replies')
+    ).prefetch_related('attachments', 'feedbacks', 'replies')
     permission_classes = [permissions.IsAuthenticatedOrReadOnly]
     parser_classes = [JSONParser, FormParser, MultiPartParser]
     
@@ -63,6 +63,11 @@ class CommentViewSet(viewsets.ModelViewSet):
         elif is_top_level:
             queryset = queryset.filter(parent__isnull=True)
         
+        queryset = queryset.annotate(
+            useful_count=Count('feedbacks', filter=Q(feedbacks__vote=CommentFeedback.VOTE_USEFUL), distinct=True),
+            not_useful_count=Count('feedbacks', filter=Q(feedbacks__vote=CommentFeedback.VOTE_NOT_USEFUL), distinct=True),
+        )
+
         # Order by pinned first, then by created_at
         return queryset.order_by('-is_pinned', '-created_at')
     
@@ -127,6 +132,48 @@ class CommentViewSet(viewsets.ModelViewSet):
         headers = self.get_success_headers(output.data)
         return Response(output.data, status=status.HTTP_201_CREATED, headers=headers)
     
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    def feedback(self, request, pk=None):
+        """Toggle useful / not useful feedback for a comment."""
+        comment = self.get_object()
+        vote = request.data.get('vote')
+
+        if vote not in [CommentFeedback.VOTE_USEFUL, CommentFeedback.VOTE_NOT_USEFUL]:
+            return Response(
+                {'error': "vote must be 'useful' or 'not_useful'"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        feedback, created = CommentFeedback.objects.get_or_create(
+            comment=comment,
+            user=request.user,
+            defaults={'vote': vote},
+        )
+
+        if not created and feedback.vote == vote:
+            feedback.delete()
+            user_feedback = None
+        else:
+            feedback.vote = vote
+            feedback.save(update_fields=['vote', 'updated_at'])
+            user_feedback = vote
+
+        useful_count = CommentFeedback.objects.filter(
+            comment=comment,
+            vote=CommentFeedback.VOTE_USEFUL,
+        ).count()
+        not_useful_count = CommentFeedback.objects.filter(
+            comment=comment,
+            vote=CommentFeedback.VOTE_NOT_USEFUL,
+        ).count()
+
+        return Response({
+            'comment_id': comment.id,
+            'useful_count': useful_count,
+            'not_useful_count': not_useful_count,
+            'user_feedback': user_feedback,
+        })
+
     @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
     def add_attachment(self, request, pk=None):
         """Add attachment to a comment."""
@@ -214,7 +261,10 @@ class CommentViewSet(viewsets.ModelViewSet):
             listing=listing,
             parent__isnull=True,
             is_deleted=False
-        ).select_related('user').prefetch_related('attachments', 'replies').order_by('-is_pinned', '-created_at')
+        ).select_related('user').prefetch_related('attachments', 'feedbacks', 'replies').annotate(
+            useful_count=Count('feedbacks', filter=Q(feedbacks__vote=CommentFeedback.VOTE_USEFUL), distinct=True),
+            not_useful_count=Count('feedbacks', filter=Q(feedbacks__vote=CommentFeedback.VOTE_NOT_USEFUL), distinct=True),
+        ).order_by('-is_pinned', '-created_at')
         
         serializer = self.get_serializer(comments, many=True)
         return Response(serializer.data)

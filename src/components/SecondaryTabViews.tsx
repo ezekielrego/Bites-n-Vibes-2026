@@ -32,6 +32,7 @@ import { APP_VERSION } from '../constants';
 import { setListingInternalPayments, verifyTicketQr, verifyTicketReference } from '../api';
 import { BACKEND_ORIGIN } from '../config';
 import { shadow, theme } from '../theme';
+import { showAppToast } from '../toast';
 import {
   AppCategory,
   AppEvent,
@@ -156,13 +157,13 @@ export function StreamTabView({
   events,
   onRefresh,
   onSelectEvent,
-  onToggleSave,
+  onToggleVibe,
   refreshing,
 }: {
   events: AppEvent[];
   onRefresh: () => Promise<void>;
   onSelectEvent: (event: AppEvent) => void;
-  onToggleSave: (event: AppEvent) => void;
+  onToggleVibe: (event: AppEvent) => void;
   refreshing: boolean;
 }) {
   const insets = useSafeAreaInsets();
@@ -245,7 +246,7 @@ export function StreamTabView({
             safeTop={insets.top}
             onOpen={() => onSelectEvent(item.event)}
             onOpenViewer={() => setViewerItem(item)}
-            onToggleSave={() => onToggleSave(item.event)}
+            onToggleVibe={() => onToggleVibe(item.event)}
           />
         )}
       />
@@ -289,6 +290,8 @@ export function InboxTabView({
   searchQuery,
   tickets,
   onAcceptTicket,
+  onClearNotifications,
+  onDeleteNotification,
   onOpenNotification,
   onOpenTicket,
 }: {
@@ -297,10 +300,13 @@ export function InboxTabView({
   searchQuery: string;
   tickets: AppTicket[];
   onAcceptTicket: (ticket: AppTicket) => Promise<void>;
+  onClearNotifications: () => Promise<void>;
+  onDeleteNotification: (notification: AppNotification) => Promise<void>;
   onOpenNotification: (notification: AppNotification) => void;
   onOpenTicket: (ticket: AppTicket) => void;
 }) {
   const [confirmingTicketId, setConfirmingTicketId] = useState<string | null>(null);
+  const [notificationBusyKey, setNotificationBusyKey] = useState<string | null>(null);
   const normalizedInboxQuery = searchQuery.trim().toLowerCase();
   const ticketActivity = useMemo(
     () =>
@@ -335,12 +341,29 @@ export function InboxTabView({
     try {
       await onAcceptTicket(ticket);
     } catch (error) {
-      Alert.alert('Confirm failed', error instanceof Error ? error.message : 'The booking could not be confirmed right now.');
+      showAppToast({
+        tone: 'error',
+        title: 'Confirm failed',
+        message: error instanceof Error ? error.message : 'The booking could not be confirmed right now.',
+      });
     } finally {
       setConfirmingTicketId(null);
     }
   };
-
+  const handleDeleteNotification = async (notification: AppNotification) => {
+    setNotificationBusyKey(`delete:${notification.id}`);
+    try {
+      await onDeleteNotification(notification);
+    } catch (error) {
+      showAppToast({
+        tone: 'error',
+        title: 'Delete failed',
+        message: error instanceof Error ? error.message : 'The notification could not be deleted right now.',
+      });
+    } finally {
+      setNotificationBusyKey(null);
+    }
+  };
   return (
     <View style={styles.sectionStack}>
       {visibleTicketActivity.length > 0 ? (
@@ -379,7 +402,14 @@ export function InboxTabView({
           copy={normalizedInboxQuery ? 'Try a ticket reference, event name, venue, or notification keyword.' : 'Once tickets or listing updates arrive, they will show up here.'}
         />
       ) : visibleNotifications.length > 0 ? (
-        <View style={styles.notificationList}>
+        <View style={styles.profileSection}>
+          <View style={styles.compactSectionHeader}>
+            <View style={styles.compactSectionCopy}>
+              <Text style={styles.compactSectionTitle}>Notifications</Text>
+              <Text style={styles.compactSectionHint}>{visibleNotifications.length} visible</Text>
+            </View>
+          </View>
+          <View style={styles.notificationList}>
           {visibleNotifications.map((notification) => {
             const confirmTicket =
               notification.type === 'booking'
@@ -390,12 +420,15 @@ export function InboxTabView({
               <NotificationCard
                 key={notification.id}
                 isConfirming={confirmTicket ? confirmingTicketId === confirmTicket.id : false}
+                isDeleting={notificationBusyKey === `delete:${notification.id}`}
                 notification={notification}
                 onConfirm={confirmTicket ? () => void handleQuickConfirm(confirmTicket) : undefined}
+                onDelete={() => void handleDeleteNotification(notification)}
                 onPress={() => onOpenNotification(notification)}
               />
             );
           })}
+          </View>
         </View>
       ) : null}
     </View>
@@ -596,7 +629,11 @@ export function CreateTabView({
     const allowVideo = field === 'heroImage';
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!permission.granted) {
-      Alert.alert('Photos needed', 'Allow photo access so you can upload listing media.');
+      showAppToast({
+        tone: 'info',
+        title: 'Photos needed',
+        message: 'Allow photo access so you can upload listing media.',
+      });
       return;
     }
 
@@ -627,7 +664,11 @@ export function CreateTabView({
 
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!permission.granted) {
-      Alert.alert('Media needed', 'Allow photo access so you can add gallery images and video.');
+      showAppToast({
+        tone: 'info',
+        title: 'Media needed',
+        message: 'Allow photo access so you can add gallery images and video.',
+      });
       return;
     }
 
@@ -750,10 +791,12 @@ export function CreateTabView({
       return;
     }
 
-    Alert.alert(
-      'Large video selected',
-      'Videos over 20MB will upload as-is on this device. Shorter clips keep uploads lighter and home previews smoother.',
-    );
+    showAppToast({
+      tone: 'info',
+      title: 'Large video selected',
+      message: 'Shorter clips keep uploads lighter and home previews smoother.',
+      durationMs: 4200,
+    });
   };
 
   const handleStoryChange = (value: string) => {
@@ -1412,7 +1455,11 @@ export function ProfileTabView({
   const handleAvatarPick = async () => {
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!permission.granted) {
-      Alert.alert('Photos needed', 'Allow photo access so you can update your profile picture.');
+      showAppToast({
+        tone: 'info',
+        title: 'Photos needed',
+        message: 'Allow photo access so you can update your profile picture.',
+      });
       return;
     }
 
@@ -1857,11 +1904,10 @@ export function ProfileTabView({
             </Text>
           </View>
           {tickets.length > 4 ? (
-            <CompactActionButton
+            <PlainTextAction
               icon={showAllMyTickets ? 'chevron-up' : 'chevron-down'}
               label={showAllMyTickets ? 'Less' : 'View all'}
               onPress={() => setShowAllMyTickets((current) => !current)}
-              tone="muted"
             />
           ) : null}
         </View>
@@ -1903,11 +1949,10 @@ export function ProfileTabView({
             <Text style={styles.compactSectionHint}>Host dashboard</Text>
           </View>
           {receivedTickets.length > 5 ? (
-            <CompactActionButton
+            <PlainTextAction
               icon={showAllReceivedTickets ? 'chevron-up' : 'chevron-down'}
               label={showAllReceivedTickets ? 'Less' : 'View all'}
               onPress={() => setShowAllReceivedTickets((current) => !current)}
-              tone="muted"
             />
           ) : null}
         </View>
@@ -1953,11 +1998,10 @@ export function ProfileTabView({
           </View>
           <View style={styles.sectionHeaderActions}>
             {historyEvents.length > 6 ? (
-              <CompactActionButton
+              <PlainTextAction
                 icon={showAllHistory ? 'chevron-up' : 'chevron-down'}
                 label={showAllHistory ? 'Less' : 'View all'}
                 onPress={() => setShowAllHistory((current) => !current)}
-                tone="muted"
               />
             ) : null}
             {historyEvents.length > 0 ? (
@@ -2296,11 +2340,10 @@ function HostedListingsPage({
         </Text>
         <View style={styles.hostedToolbarActions}>
           {totalShownCount > 8 ? (
-            <CompactActionButton
+            <PlainTextAction
               icon={showAll ? 'chevron-up' : 'chevron-down'}
               label={showAll ? 'Less' : 'View all'}
               onPress={onToggleShowAll}
-              tone="muted"
             />
           ) : null}
           {selectionMode ? (
@@ -2384,8 +2427,10 @@ function TicketVerifierModal({
   onVerifyQr: (value: string) => void;
 }) {
   const [permission, requestPermission] = useCameraPermissions();
+  const { height, width } = useWindowDimensions();
   const [scannerActive, setScannerActive] = useState(false);
   const [scannerLocked, setScannerLocked] = useState(false);
+  const scannerHeight = Math.min(Math.max(width * 0.86, 320), height * 0.48);
 
   useEffect(() => {
     if (!listing) {
@@ -2408,7 +2453,7 @@ function TicketVerifierModal({
   return (
     <Modal animationType="slide" transparent visible={Boolean(listing)} onRequestClose={onClose}>
       <View style={styles.verifyBackdrop}>
-        <View style={styles.verifySheet}>
+        <View style={[styles.verifySheet, { maxHeight: height * 0.94 }]}>
           <View style={styles.verifyHeader}>
             <View style={styles.verifyHeaderCopy}>
               <Text style={styles.verifyEyebrow}>Owner verification</Text>
@@ -2417,7 +2462,7 @@ function TicketVerifierModal({
             <CompactActionButton icon="x" label="Close" onPress={onClose} tone="muted" />
           </View>
 
-          <View style={styles.verifyCameraFrame}>
+          <View style={[styles.verifyCameraFrame, { height: scannerHeight }]}>
             {scannerActive && permission?.granted ? (
               <CameraView
                 barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
@@ -2794,29 +2839,51 @@ function HistoryEventRow({
 }
 
 function StatusPill({ status }: { status: AppTicket['status'] }) {
-  if (status === 'confirmed') {
-    return null;
-  }
+  const display = getTicketStatusDisplay(status);
 
   return (
     <View
       style={[
         styles.ticketStatusPill,
-        status === 'used' ? styles.ticketStatusPillUsed : null,
-        status === 'cancelled' ? styles.ticketStatusPillCancelled : null,
+        display.tone === 'review' ? styles.ticketStatusPillReview : null,
+        display.tone === 'used' ? styles.ticketStatusPillUsed : null,
+        display.tone === 'danger' ? styles.ticketStatusPillCancelled : null,
       ]}
     >
       <Text
         style={[
           styles.ticketStatusText,
-          status === 'used' ? styles.ticketStatusTextUsed : null,
-          status === 'cancelled' ? styles.ticketStatusTextCancelled : null,
+          display.tone === 'review' ? styles.ticketStatusTextReview : null,
+          display.tone === 'used' ? styles.ticketStatusTextUsed : null,
+          display.tone === 'danger' ? styles.ticketStatusTextCancelled : null,
         ]}
       >
-        {status}
+        {display.label}
       </Text>
     </View>
   );
+}
+
+function getTicketStatusDisplay(status: AppTicket['status']) {
+  switch (status) {
+    case 'requested':
+      return { label: 'In review', tone: 'review' as const };
+    case 'pending':
+      return { label: 'Payment pending', tone: 'review' as const };
+    case 'confirmed':
+    case 'accepted':
+      return { label: 'Accepted', tone: 'accepted' as const };
+    case 'used':
+      return { label: 'Used', tone: 'used' as const };
+    case 'cancelled':
+      return { label: 'Cancelled', tone: 'danger' as const };
+    case 'failed':
+      return { label: 'Failed', tone: 'danger' as const };
+    case 'expired':
+      return { label: 'Expired', tone: 'danger' as const };
+    default:
+      return { label: status, tone: 'accepted' as const };
+  }
 }
 
 function SettingsModalShell({
@@ -2986,10 +3053,12 @@ function SavedEventCard({
               ))}
             </View>
 
-            <View style={styles.savedRatingPill}>
-              <Feather color="#FBBF24" name={'star' as FeatherName} size={12} />
-              <Text style={styles.savedRatingText}>{event.rating.toFixed(1)}</Text>
-            </View>
+            {(event.ratingCount ?? 0) > 0 ? (
+              <View style={styles.savedRatingPill}>
+                <Feather color="#FBBF24" name={'star' as FeatherName} size={12} />
+                <Text style={styles.savedRatingText}>{formatRatingSummary(event)}</Text>
+              </View>
+            ) : null}
           </View>
         </View>
       </Animated.View>
@@ -2999,19 +3068,32 @@ function SavedEventCard({
 
 function NotificationCard({
   isConfirming,
+  isDeleting,
   notification,
   onConfirm,
+  onDelete,
   onPress,
 }: {
   isConfirming?: boolean;
+  isDeleting?: boolean;
   notification: AppNotification;
   onConfirm?: () => void;
+  onDelete: () => void;
   onPress: () => void;
 }) {
+  const [menuOpen, setMenuOpen] = useState(false);
   const jelly = useJellyPressAnimation({
     pressedScaleX: 1.01,
     pressedScaleY: 0.97,
   });
+  const handleView = () => {
+    setMenuOpen(false);
+    onPress();
+  };
+  const handleDelete = () => {
+    setMenuOpen(false);
+    onDelete();
+  };
 
   return (
     <Pressable onPress={onPress} onPressIn={jelly.onPressIn} onPressOut={jelly.onPressOut}>
@@ -3030,6 +3112,17 @@ function NotificationCard({
               {notification.title}
             </Text>
             {!notification.isRead ? <View style={styles.notificationDot} /> : null}
+            <Pressable
+              accessibilityRole="button"
+              hitSlop={8}
+              onPress={(event) => {
+                event.stopPropagation();
+                setMenuOpen((current) => !current);
+              }}
+              style={styles.notificationMenuButton}
+            >
+              <Feather color={theme.colors.textSoft} name="more-horizontal" size={17} />
+            </Pressable>
           </View>
 
           <Text numberOfLines={2} style={styles.notificationMessage}>
@@ -3053,6 +3146,35 @@ function NotificationCard({
             </Pressable>
           ) : null}
         </View>
+        {menuOpen ? (
+          <View style={styles.notificationMenu}>
+            <Pressable
+              accessibilityRole="button"
+              onPress={(event) => {
+                event.stopPropagation();
+                handleView();
+              }}
+              style={styles.notificationMenuItem}
+            >
+              <Feather color={theme.colors.text} name="eye" size={13} />
+              <Text style={styles.notificationMenuText}>View</Text>
+            </Pressable>
+            <Pressable
+              accessibilityRole="button"
+              disabled={Boolean(isDeleting)}
+              onPress={(event) => {
+                event.stopPropagation();
+                handleDelete();
+              }}
+              style={styles.notificationMenuItem}
+            >
+              <Feather color={theme.colors.accentStrong} name="trash-2" size={13} />
+              <Text style={[styles.notificationMenuText, styles.notificationMenuTextDanger]}>
+                {isDeleting ? 'Deleting...' : 'Delete'}
+              </Text>
+            </Pressable>
+          </View>
+        ) : null}
       </Animated.View>
     </Pressable>
   );
@@ -3151,7 +3273,7 @@ function StreamVideoCard({
   safeTop,
   onOpen,
   onOpenViewer,
-  onToggleSave,
+  onToggleVibe,
 }: {
   active: boolean;
   height: number;
@@ -3159,7 +3281,7 @@ function StreamVideoCard({
   safeTop: number;
   onOpen: () => void;
   onOpenViewer: () => void;
-  onToggleSave: () => void;
+  onToggleVibe: () => void;
 }) {
   const videoRef = useRef<Video>(null);
   const [muted, setMuted] = useState(true);
@@ -3169,6 +3291,10 @@ function StreamVideoCard({
   const jelly = useJellyPressAnimation({
     pressedScaleX: 1.02,
     pressedScaleY: 0.95,
+  });
+  const likeJelly = useJellyPressAnimation({
+    pressedScaleX: 1.12,
+    pressedScaleY: 0.88,
   });
 
   useEffect(() => {
@@ -3238,11 +3364,11 @@ function StreamVideoCard({
       </View>
 
       <View style={styles.streamActions}>
-        <Pressable onPress={onToggleSave} style={styles.streamSideAction}>
-          <View style={[styles.streamRoundAction, item.event.isSaved && styles.streamRoundActionActive]}>
+        <Pressable onPress={onToggleVibe} onPressIn={likeJelly.onPressIn} onPressOut={likeJelly.onPressOut} style={styles.streamSideAction}>
+          <Animated.View style={[styles.streamRoundAction, item.event.isVibing && styles.streamRoundActionActive, likeJelly.animatedStyle]}>
             <Feather color={theme.colors.white} name="heart" size={19} />
-          </View>
-          <Text style={styles.streamActionLabel}>{formatCompactCount(item.event.saveCount)}</Text>
+          </Animated.View>
+          <Text style={styles.streamActionLabel}>{formatCompactCount(item.event.vibeCount ?? 0)}</Text>
         </Pressable>
         <Pressable onPress={onOpen} style={styles.streamSideAction}>
           <View style={styles.streamRoundAction}>
@@ -4065,16 +4191,21 @@ function ProfileIconAction({
 }
 
 function PlainTextAction({
+  icon,
   label,
   disabled = false,
   onPress,
 }: {
+  icon?: FeatherName;
   label: string;
   disabled?: boolean;
   onPress: () => void;
 }) {
   return (
     <Pressable accessibilityRole="button" disabled={disabled} onPress={onPress} style={styles.plainTextAction}>
+      {icon ? (
+        <Feather color={disabled ? theme.colors.textSoft : theme.colors.white} name={icon} size={13} />
+      ) : null}
       <Text style={[styles.plainTextActionLabel, disabled && styles.plainTextActionLabelDisabled]}>{label}</Text>
     </Pressable>
   );
@@ -4509,6 +4640,10 @@ function formatCompactCount(value: number) {
   return `${formatted}${unit.suffix}`;
 }
 
+function formatRatingSummary(event: AppEvent) {
+  return `${event.rating.toFixed(1)}(${event.ratingCount ?? 0})`;
+}
+
 function formatEditWindowHint(event: AppEvent) {
   if (event.ownerCanEdit === false) {
     return 'Edit window closed';
@@ -4842,6 +4977,7 @@ const styles = StyleSheet.create({
     borderTopColor: 'rgba(255,255,255,0.08)',
   },
   notificationCard: {
+    position: 'relative',
     minHeight: 76,
     flexDirection: 'row',
     alignItems: 'flex-start',
@@ -4905,6 +5041,43 @@ const styles = StyleSheet.create({
     height: 8,
     borderRadius: 4,
     backgroundColor: theme.colors.accentStrong,
+  },
+  notificationMenuButton: {
+    width: 28,
+    height: 28,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  notificationMenu: {
+    position: 'absolute',
+    top: 40,
+    right: 8,
+    zIndex: 8,
+    elevation: 8,
+    minWidth: 118,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.1)',
+    backgroundColor: 'rgba(12,15,23,0.98)',
+    overflow: 'hidden',
+    ...shadow,
+  },
+  notificationMenuItem: {
+    minHeight: 42,
+    paddingHorizontal: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 9,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.06)',
+  },
+  notificationMenuText: {
+    color: theme.colors.text,
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  notificationMenuTextDanger: {
+    color: theme.colors.accentStrong,
   },
   notificationMessage: {
     color: theme.colors.textMuted,
@@ -5737,12 +5910,14 @@ const styles = StyleSheet.create({
   },
   plainTextAction: {
     minHeight: 28,
+    flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
+    gap: 4,
     paddingHorizontal: 2,
   },
   plainTextActionLabel: {
-    color: theme.colors.accentStrong,
+    color: theme.colors.white,
     fontSize: 12,
     fontWeight: '800',
   },
@@ -6039,6 +6214,10 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(255,184,77,0.14)',
     borderColor: 'rgba(255,184,77,0.26)',
   },
+  ticketStatusPillReview: {
+    backgroundColor: 'rgba(255,184,77,0.14)',
+    borderColor: 'rgba(255,184,77,0.26)',
+  },
   ticketStatusPillCancelled: {
     backgroundColor: 'rgba(242,34,28,0.14)',
     borderColor: 'rgba(242,34,28,0.26)',
@@ -6051,6 +6230,9 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
   },
   ticketStatusTextUsed: {
+    color: '#FFCF76',
+  },
+  ticketStatusTextReview: {
     color: '#FFCF76',
   },
   ticketStatusTextCancelled: {
@@ -6223,7 +6405,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
   },
   verifyCameraFrame: {
-    height: 240,
+    height: 340,
     overflow: 'hidden',
     borderRadius: 16,
     borderWidth: 1,

@@ -260,10 +260,12 @@ export function CategoryPill({
 export function SectionHeader({
   title,
   actionLabel,
+  actionArrow = false,
   onActionPress,
 }: {
   title: string;
   actionLabel?: string;
+  actionArrow?: boolean;
   onActionPress?: () => void;
 }) {
   return (
@@ -272,6 +274,7 @@ export function SectionHeader({
       {actionLabel ? (
         <Pressable accessibilityRole={onActionPress ? 'button' : undefined} onPress={onActionPress} style={styles.sectionActionPressable}>
           <Text style={styles.sectionAction}>{actionLabel}</Text>
+          {actionArrow ? <Feather color={theme.colors.accentStrong} name="chevron-right" size={15} /> : null}
         </Pressable>
       ) : null}
     </View>
@@ -413,6 +416,9 @@ const styles = StyleSheet.create({
   },
   sectionActionPressable: {
     minHeight: 30,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 2,
     justifyContent: 'center',
     paddingLeft: 12,
   },

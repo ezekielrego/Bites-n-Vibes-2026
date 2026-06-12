@@ -5,6 +5,7 @@ dist/
 coverage/
 web-build/
 backend-code-2026-05-18/
+Bites-n-Vibes-2026/
 bitesnvibes-backend-hosting.zip
 *.log
 *.err.log

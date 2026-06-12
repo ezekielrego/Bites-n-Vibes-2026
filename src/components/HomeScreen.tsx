@@ -6,6 +6,7 @@ import {
   FlatList,
   FlatListProps,
   NativeSyntheticEvent,
+  PanResponder,
   type ViewToken,
   Pressable,
   RefreshControl,
@@ -14,6 +15,7 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  type GestureResponderHandlers,
   NativeScrollEvent,
   useWindowDimensions,
   View,
@@ -94,16 +96,20 @@ export function HomeScreen({
   profile,
   onAcceptTicket,
   onCancelTicket,
+  onClearNotifications,
   onClearHistory,
   onSelectEvent,
   onTabChange,
   onOpenTicket,
   onOpenNearby,
+  onOpenSearch,
   onRemoveHistoryItem,
   onToggleSave,
+  onToggleVibe,
   onOpenNotification,
   onMarkAllRead,
   onMarkTicketUsed,
+  onDeleteNotification,
   onRefresh,
   onCreateEvent,
   onCancelEditListing,
@@ -138,16 +144,20 @@ export function HomeScreen({
   profile: AppUser | null;
   onAcceptTicket: (ticket: AppTicket) => Promise<void>;
   onCancelTicket: (ticket: AppTicket) => Promise<void>;
+  onClearNotifications: () => Promise<void>;
   onClearHistory: () => Promise<void>;
   onSelectEvent: (event: AppEvent) => void;
   onOpenTicket: (ticket: AppTicket) => void;
   onOpenNearby: () => void;
+  onOpenSearch: () => void;
   onRemoveHistoryItem: (event: AppEvent) => Promise<void>;
   onTabChange: (tab: TabId) => void;
   onToggleSave: (event: AppEvent) => void;
+  onToggleVibe: (event: AppEvent) => void;
   onOpenNotification: (notification: AppNotification) => void;
   onMarkAllRead: () => void;
   onMarkTicketUsed: (ticket: AppTicket) => Promise<void>;
+  onDeleteNotification: (notification: AppNotification) => Promise<void>;
   onRefresh: () => Promise<void>;
   onCreateEvent: (input: CreateAppEventInput) => Promise<void>;
   onCancelEditListing: () => void;
@@ -202,6 +212,7 @@ export function HomeScreen({
   const menuOverlayOpacity = useRef(new Animated.Value(0)).current;
   const scrollY = useRef(new Animated.Value(0)).current;
   const autoSearchProgress = useRef(new Animated.Value(0)).current;
+  const categorySwipeX = useRef(new Animated.Value(0)).current;
   const previewEventIdRef = useRef<string | null>(null);
   const [previewEventId, setPreviewEventId] = useState<string | null>(null);
   const viewabilityConfig = useRef({
@@ -238,6 +249,44 @@ export function HomeScreen({
       useNativeDriver: true,
     }).start();
   }, [autoSearchProgress]);
+
+  const loadHomeUserLocation = useCallback(
+    async ({ requestIfUndetermined = false }: { requestIfUndetermined?: boolean } = {}) => {
+      try {
+        let permission = await Location.getForegroundPermissionsAsync();
+
+        if (!permission.granted && requestIfUndetermined && permission.status === Location.PermissionStatus.UNDETERMINED) {
+          permission = await Location.requestForegroundPermissionsAsync();
+        }
+
+        if (!permission.granted) {
+          return null;
+        }
+
+        const position = await Location.getCurrentPositionAsync({
+          accuracy: Location.Accuracy.Balanced,
+        });
+        const nextLocation = {
+          latitude: position.coords.latitude,
+          longitude: position.coords.longitude,
+        };
+
+        setHomeUserLocation(nextLocation);
+        return nextLocation;
+      } catch {
+        setHomeUserLocation(null);
+        return null;
+      }
+    },
+    [],
+  );
+
+  const handleDiscoverRefresh = useCallback(async () => {
+    await Promise.all([
+      onRefresh(),
+      loadHomeUserLocation({ requestIfUndetermined: true }),
+    ]);
+  }, [loadHomeUserLocation, onRefresh]);
 
   useEffect(() => {
     const drawerWidth = Math.min(width * 0.76, 320);
@@ -337,40 +386,8 @@ export function HomeScreen({
       return;
     }
 
-    let cancelled = false;
-
-    const loadHomeUserLocation = async () => {
-      try {
-        const permission = await Location.getForegroundPermissionsAsync();
-        if (!permission.granted) {
-          return;
-        }
-
-        const position = await Location.getCurrentPositionAsync({
-          accuracy: Location.Accuracy.Balanced,
-        });
-
-        if (cancelled) {
-          return;
-        }
-
-        setHomeUserLocation({
-          latitude: position.coords.latitude,
-          longitude: position.coords.longitude,
-        });
-      } catch {
-        if (!cancelled) {
-          setHomeUserLocation(null);
-        }
-      }
-    };
-
-    void loadHomeUserLocation();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [activeTab]);
+    void loadHomeUserLocation({ requestIfUndetermined: true });
+  }, [activeTab, loadHomeUserLocation]);
 
   useEffect(() => {
     if (activeTab !== 'discover' || !isSearchFocused) {
@@ -455,12 +472,8 @@ export function HomeScreen({
   }, []);
 
   const handleDrawerSearchPress = () => {
-    pendingSearchFocus.current = true;
+    onOpenSearch();
     setMenuOpen(false);
-
-    if (activeTab !== 'discover') {
-      onTabChange('discover');
-    }
   };
 
   const handleOpenCategory = (categoryId: CategoryId) => {
@@ -473,6 +486,64 @@ export function HomeScreen({
       onTabChange('discover');
     }
   };
+
+  const categorySwipeResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onMoveShouldSetPanResponder: (_, gesture) =>
+          !menuOpen &&
+          Math.abs(gesture.dx) > 14 &&
+          Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.25,
+        onPanResponderGrant: () => {
+          categorySwipeX.stopAnimation();
+          categorySwipeX.setValue(0);
+        },
+        onPanResponderMove: (_, gesture) => {
+          categorySwipeX.setValue(Math.max(-width, Math.min(width, gesture.dx)));
+        },
+        onPanResponderRelease: (_, gesture) => {
+          const currentIndex = categories.findIndex((category) => category.id === activeCategory);
+          const nextIndex = gesture.dx < 0 ? currentIndex + 1 : currentIndex - 1;
+          const nextCategory = categories[nextIndex];
+          const crossedHalf = Math.abs(gesture.dx) >= width * 0.5;
+
+          if (crossedHalf && nextCategory) {
+            Animated.timing(categorySwipeX, {
+              toValue: gesture.dx < 0 ? -width : width,
+              duration: 170,
+              easing: Easing.out(Easing.cubic),
+              useNativeDriver: false,
+            }).start(({ finished }) => {
+              if (finished) {
+                handleOpenCategory(nextCategory.id);
+                requestAnimationFrame(() => {
+                  categorySwipeX.setValue(0);
+                });
+              }
+            });
+            return;
+          }
+
+          Animated.spring(categorySwipeX, {
+            toValue: 0,
+            stiffness: 260,
+            damping: 24,
+            mass: 0.9,
+            useNativeDriver: false,
+          }).start();
+        },
+        onPanResponderTerminate: () => {
+          Animated.spring(categorySwipeX, {
+            toValue: 0,
+            stiffness: 260,
+            damping: 24,
+            mass: 0.9,
+            useNativeDriver: false,
+          }).start();
+        },
+      }),
+    [activeCategory, categories, categorySwipeX, handleOpenCategory, menuOpen, width],
+  );
 
   const scrollCategoryIntoView = (categoryId: CategoryId) => {
     const layout = categoryLayoutsRef.current[categoryId];
@@ -530,9 +601,9 @@ export function HomeScreen({
             return;
           }
 
-          setFeedEvents(page.events);
+          setFeedEvents((current) => mergeUniqueEvents(page.events, current));
           setFeedNextPage(page.nextPage);
-          setFeedTotalCount(page.totalCount);
+          setFeedTotalCount(Math.max(page.totalCount, page.events.length));
         })
         .catch(() => {
           if (feedRequestKeyRef.current !== requestKey) {
@@ -627,6 +698,10 @@ export function HomeScreen({
     [activeCategory, deferredSearchQuery, events, feedEvents],
   );
   const activeCategoryDetails = categories.find((category) => category.id === activeCategory);
+  const activeCategoryIndex = categories.findIndex((category) => category.id === activeCategory);
+  const previousCategory = activeCategoryIndex > 0 ? categories[activeCategoryIndex - 1] : null;
+  const nextCategory =
+    activeCategoryIndex >= 0 && activeCategoryIndex < categories.length - 1 ? categories[activeCategoryIndex + 1] : null;
   const categoryFeedTitle =
     activeCategory === 'all' ? 'All categories' : activeCategoryDetails?.name ?? 'Category';
 
@@ -757,6 +832,7 @@ export function HomeScreen({
         notifications={notifications}
         onAcceptTicket={onAcceptTicket}
         onCancelTicket={onCancelTicket}
+        onClearNotifications={onClearNotifications}
         onClearHistory={onClearHistory}
         tickets={tickets}
         receivedTickets={receivedTickets}
@@ -766,6 +842,7 @@ export function HomeScreen({
         onCreateEvent={onCreateEvent}
         onMarkAllRead={onMarkAllRead}
         onMarkTicketUsed={onMarkTicketUsed}
+        onDeleteNotification={onDeleteNotification}
         onOpenNotification={onOpenNotification}
         onOpenTicket={onOpenTicket}
         onOpenCategory={handleOpenCategory}
@@ -778,6 +855,7 @@ export function HomeScreen({
         onToggleEmailNotifications={onToggleEmailNotifications}
         onTogglePushNotifications={onTogglePushNotifications}
         onToggleSave={onToggleSave}
+        onToggleVibe={onToggleVibe}
         onUpdateProfile={onUpdateProfile}
         profile={profile}
         refreshing={refreshing}
@@ -788,7 +866,6 @@ export function HomeScreen({
       />
     ) : (
       <AnimatedFlatList
-        key={`discover-${activeCategory}`}
         data={filteredEvents}
         keyExtractor={(item) => item.id}
         contentContainerStyle={discoverContentPadding}
@@ -816,7 +893,7 @@ export function HomeScreen({
             progressBackgroundColor={theme.colors.surfaceStrong}
             refreshing={refreshing}
             tintColor={theme.colors.accentStrong}
-            onRefresh={() => void onRefresh()}
+            onRefresh={() => void handleDiscoverRefresh()}
           />
         }
         ItemSeparatorComponent={() => <View style={styles.separator} />}
@@ -836,9 +913,6 @@ export function HomeScreen({
                 </View>
                 <View style={styles.categoryFeedCopy}>
                   <Text style={styles.categoryFeedTitle}>{categoryFeedTitle}</Text>
-                  <Text style={styles.categoryFeedHint}>
-                    {feedTotalCount} listing{feedTotalCount === 1 ? '' : 's'} in this category
-                  </Text>
                 </View>
               </View>
             ) : null}
@@ -909,6 +983,7 @@ export function HomeScreen({
             <SectionHeader
               title={activeCategory === 'all' ? 'Mixed Vibes' : `${categoryFeedTitle} feed`}
               actionLabel="Find nearby"
+              actionArrow
               onActionPress={onOpenNearby}
             />
           </>
@@ -928,7 +1003,46 @@ export function HomeScreen({
   return (
     <View style={styles.root}>
       <ScreenTransition key={activeTab} direction={tabDirection} distance={42}>
-        {content}
+        {activeTab === 'discover' ? (
+          <Animated.View
+            {...categorySwipeResponder.panHandlers}
+            style={[styles.categorySwipeSurface, { transform: [{ translateX: categorySwipeX }] }]}
+          >
+            {content}
+            {previousCategory ? (
+              <CategorySwipePreview
+                category={previousCategory}
+                left={-width}
+                paddingTop={
+                  insets.top +
+                  FLOATING_HEADER_TOP_PADDING +
+                  FLOATING_HEADER_HEIGHT +
+                  FLOATING_CATEGORY_RAIL_HEIGHT +
+                  FLOATING_HEADER_GAP +
+                  12
+                }
+                width={width}
+              />
+            ) : null}
+            {nextCategory ? (
+              <CategorySwipePreview
+                category={nextCategory}
+                left={width}
+                paddingTop={
+                  insets.top +
+                  FLOATING_HEADER_TOP_PADDING +
+                  FLOATING_HEADER_HEIGHT +
+                  FLOATING_CATEGORY_RAIL_HEIGHT +
+                  FLOATING_HEADER_GAP +
+                  12
+                }
+                width={width}
+              />
+            ) : null}
+          </Animated.View>
+        ) : (
+          content
+        )}
       </ScreenTransition>
 
       {activeTab === 'discover' ? (
@@ -937,6 +1051,7 @@ export function HomeScreen({
         categories={categories}
         categoryLayoutsRef={categoryLayoutsRef}
         categoryRailRef={categoryRailRef}
+        categorySwipeX={categorySwipeX}
         floatingSearchProgress={floatingSearchRevealProgress}
         floatingSearchVisible={floatingSearchVisible}
         inputRef={floatingSearchInputRef}
@@ -945,10 +1060,12 @@ export function HomeScreen({
         onCloseSearch={handleCloseSearch}
         onOpenCategory={handleOpenCategory}
         onOpenNearby={onOpenNearby}
+        onOpenSearch={onOpenSearch}
         onSearchSuggestionPress={handleSearchSuggestionPress}
         profile={profile}
         query={searchQuery}
         safeTop={insets.top}
+        screenWidth={width}
         searchSuggestions={searchSuggestions}
         onBlur={() => setIsSearchFocused(false)}
         onChangeText={setSearchQuery}
@@ -964,6 +1081,8 @@ export function HomeScreen({
           categories={categories}
           categoryLayoutsRef={categoryLayoutsRef}
           categoryRailRef={categoryRailRef}
+          categorySwipeResponder={categorySwipeResponder.panHandlers}
+          categorySwipeX={categorySwipeX}
           headerMode={activeTab === 'inbox' ? 'inbox' : activeTab === 'profile' && profileHeaderMode === 'tickets' ? 'tickets' : 'default'}
           inboxInputRef={activeTab === 'profile' && profileHeaderMode === 'tickets' ? ticketSearchInputRef : inboxSearchInputRef}
           inboxIsFocused={activeTab === 'profile' && profileHeaderMode === 'tickets' ? isTicketSearchFocused : isInboxSearchFocused}
@@ -976,6 +1095,7 @@ export function HomeScreen({
           onOpenNearby={onOpenNearby}
           profile={profile}
           safeTop={insets.top}
+          screenWidth={width}
           onToggleMenu={() => setMenuOpen((current) => !current)}
           showMenuTapCue={showMenuTapCue}
         />
@@ -1092,6 +1212,49 @@ function SearchShell({
         </View>
       ) : null}
     </View>
+  );
+}
+
+function SearchLaunchShell({
+  hints = SEARCH_HINTS,
+  leadingIcon = 'search',
+  leadingIconAccessibilityLabel = 'Search action',
+  leadingIconColor = theme.colors.textMuted,
+  onLeadingIconPress,
+  onPress,
+  style,
+}: {
+  hints?: string[];
+  leadingIcon?: FeatherName;
+  leadingIconAccessibilityLabel?: string;
+  leadingIconColor?: string;
+  onLeadingIconPress?: () => void;
+  onPress: () => void;
+  style?: StyleProp<ViewStyle>;
+}) {
+  const leadingIconNode = <Feather color={leadingIconColor} name={leadingIcon} size={18} />;
+
+  return (
+    <Pressable accessibilityRole="button" onPress={onPress} style={[styles.searchShell, style]}>
+      {onLeadingIconPress ? (
+        <Pressable
+          accessibilityLabel={leadingIconAccessibilityLabel}
+          accessibilityRole="button"
+          hitSlop={8}
+          onPress={onLeadingIconPress}
+          style={styles.searchLeadingIconButton}
+        >
+          {leadingIconNode}
+        </Pressable>
+      ) : (
+        <View style={styles.searchLeadingIconStatic}>{leadingIconNode}</View>
+      )}
+      <View style={styles.searchInputWrap} pointerEvents="none">
+        <JellySearchPlaceholder phrases={hints} />
+      </View>
+      <View style={styles.searchDivider} />
+      <Feather color={theme.colors.textMuted} name={'sliders' as FeatherName} size={16} />
+    </Pressable>
   );
 }
 
@@ -1220,6 +1383,7 @@ function SecondaryTabContent({
   notifications,
   onAcceptTicket,
   onCancelTicket,
+  onClearNotifications,
   onClearHistory,
   tickets,
   receivedTickets,
@@ -1229,6 +1393,7 @@ function SecondaryTabContent({
   onCreateEvent,
   onMarkAllRead,
   onMarkTicketUsed,
+  onDeleteNotification,
   onOpenNotification,
   onOpenTicket,
   onOpenCategory,
@@ -1242,6 +1407,7 @@ function SecondaryTabContent({
   onToggleEmailNotifications,
   onTogglePushNotifications,
   onToggleSave,
+  onToggleVibe,
   onUpdateProfile,
   profile,
   refreshing,
@@ -1264,6 +1430,7 @@ function SecondaryTabContent({
   notifications: AppNotification[];
   onAcceptTicket: (ticket: AppTicket) => Promise<void>;
   onCancelTicket: (ticket: AppTicket) => Promise<void>;
+  onClearNotifications: () => Promise<void>;
   onClearHistory: () => Promise<void>;
   tickets: AppTicket[];
   receivedTickets: AppTicket[];
@@ -1273,6 +1440,7 @@ function SecondaryTabContent({
   onCreateEvent: (input: CreateAppEventInput) => Promise<void>;
   onMarkAllRead: () => void;
   onMarkTicketUsed: (ticket: AppTicket) => Promise<void>;
+  onDeleteNotification: (notification: AppNotification) => Promise<void>;
   onOpenNotification: (notification: AppNotification) => void;
   onOpenTicket: (ticket: AppTicket) => void;
   onOpenCategory: (categoryId: CategoryId) => void;
@@ -1286,6 +1454,7 @@ function SecondaryTabContent({
   onToggleEmailNotifications: (enabled: boolean) => Promise<AppUser>;
   onTogglePushNotifications: (enabled: boolean) => Promise<AppUser>;
   onToggleSave: (event: AppEvent) => void;
+  onToggleVibe: (event: AppEvent) => void;
   onUpdateProfile: (input: UpdateProfileInput) => Promise<AppUser>;
   profile: AppUser | null;
   refreshing: boolean;
@@ -1299,7 +1468,7 @@ function SecondaryTabContent({
         events={events}
         onRefresh={onRefresh}
         onSelectEvent={onSelectEvent}
-        onToggleSave={onToggleSave}
+        onToggleVibe={onToggleVibe}
         refreshing={refreshing}
       />
     );
@@ -1340,6 +1509,8 @@ function SecondaryTabContent({
           tickets={tickets}
           searchQuery={inboxSearchQuery}
           onAcceptTicket={onAcceptTicket}
+          onClearNotifications={onClearNotifications}
+          onDeleteNotification={onDeleteNotification}
           onOpenNotification={onOpenNotification}
           onOpenTicket={onOpenTicket}
         />
@@ -1410,15 +1581,18 @@ function DiscoverFloatingHeaderLayer({
   categories,
   categoryLayoutsRef,
   categoryRailRef,
+  categorySwipeX,
   floatingSearchProgress,
   floatingSearchVisible,
   inputRef,
   isFocused,
   menuOpen,
   onOpenNearby,
+  onOpenSearch,
   profile,
   query,
   safeTop,
+  screenWidth,
   onBlur,
   onChangeText,
   onCloseSearch,
@@ -1433,15 +1607,18 @@ function DiscoverFloatingHeaderLayer({
   categories: AppCategory[];
   categoryLayoutsRef: React.MutableRefObject<Partial<Record<CategoryId, { width: number; x: number }>>>;
   categoryRailRef: React.RefObject<ScrollView | null>;
+  categorySwipeX: Animated.Value;
   floatingSearchProgress: Animated.AnimatedInterpolation<string | number>;
   floatingSearchVisible: boolean;
   inputRef: React.RefObject<TextInput | null>;
   isFocused: boolean;
   menuOpen: boolean;
   onOpenNearby: () => void;
+  onOpenSearch: () => void;
   profile?: AppUser | null;
   query: string;
   safeTop: number;
+  screenWidth: number;
   onBlur: () => void;
   onChangeText: (value: string) => void;
   onCloseSearch: () => void;
@@ -1454,6 +1631,27 @@ function DiscoverFloatingHeaderLayer({
 }) {
   const avatarSource = profile?.avatar ? profile.avatar : APP_LOGO;
   const hasSearchQuery = query.trim().length > 0;
+  const currentIndex = categories.findIndex((category) => category.id === activeCategory);
+  const currentLayout = categoryLayoutsRef.current[activeCategory];
+  const previousLayout = currentIndex > 0 ? categoryLayoutsRef.current[categories[currentIndex - 1]?.id] : currentLayout;
+  const nextLayout =
+    currentIndex >= 0 && currentIndex < categories.length - 1
+      ? categoryLayoutsRef.current[categories[currentIndex + 1]?.id]
+      : currentLayout;
+  const indicatorX = categorySwipeX.interpolate({
+    inputRange: [-Math.max(1, screenWidth), 0, Math.max(1, screenWidth)],
+    outputRange: [nextLayout?.x ?? currentLayout?.x ?? 0, currentLayout?.x ?? 0, previousLayout?.x ?? currentLayout?.x ?? 0],
+    extrapolate: 'clamp',
+  });
+  const indicatorWidth = categorySwipeX.interpolate({
+    inputRange: [-Math.max(1, screenWidth), 0, Math.max(1, screenWidth)],
+    outputRange: [
+      nextLayout?.width ?? currentLayout?.width ?? 0,
+      currentLayout?.width ?? 0,
+      previousLayout?.width ?? currentLayout?.width ?? 0,
+    ],
+    extrapolate: 'clamp',
+  });
 
   return (
     <View pointerEvents="box-none" style={[styles.floatingHeaderWrap, { paddingTop: safeTop + FLOATING_HEADER_TOP_PADDING }]}>
@@ -1546,27 +1744,13 @@ function DiscoverFloatingHeaderLayer({
                 },
               ]}
             >
-              <SearchShell
-                inputRef={inputRef}
-                isFocused={isFocused}
+              <SearchLaunchShell
                 leadingIcon={(hasSearchQuery ? 'chevron-left' : 'map-pin') as FeatherName}
                 leadingIconAccessibilityLabel={hasSearchQuery ? 'Clear search' : 'Explore nearby'}
                 leadingIconColor={theme.colors.accentStrong}
                 onLeadingIconPress={hasSearchQuery ? onCloseSearch : onOpenNearby}
-                query={query}
-                onBlur={onBlur}
-                onChangeText={onChangeText}
-                onFocus={onFocus}
-                onSubmitSearch={(submittedQuery) => {
-                  void recordSearchQuery({
-                    categoryId: activeCategory,
-                    query: submittedQuery,
-                  }).catch(() => undefined);
-                }}
-                onSuggestionPress={onSearchSuggestionPress}
-                showSuggestions={isFocused}
+                onPress={onOpenSearch}
                 style={styles.floatingSearchShell}
-                suggestions={searchSuggestions}
               />
             </Animated.View>
           </View>
@@ -1582,6 +1766,18 @@ function DiscoverFloatingHeaderLayer({
           showsHorizontalScrollIndicator={false}
           contentContainerStyle={styles.floatingCategoryRow}
         >
+          {currentLayout ? (
+            <Animated.View
+              pointerEvents="none"
+              style={[
+                styles.headerCategoryMovingUnderline,
+                {
+                  width: indicatorWidth,
+                  transform: [{ translateX: indicatorX }],
+                },
+              ]}
+            />
+          ) : null}
           {categories.map((category) => (
             <View
               key={category.id}
@@ -1593,6 +1789,7 @@ function DiscoverFloatingHeaderLayer({
                 active={category.id === activeCategory}
                 label={category.name}
                 onPress={() => onOpenCategory(category.id)}
+                showUnderline={false}
               />
             </View>
           ))}
@@ -1607,6 +1804,8 @@ function FixedAppHeaderLayer({
   categories,
   categoryLayoutsRef,
   categoryRailRef,
+  categorySwipeResponder,
+  categorySwipeX,
   headerMode,
   inboxInputRef,
   inboxIsFocused,
@@ -1619,6 +1818,7 @@ function FixedAppHeaderLayer({
   onOpenNearby,
   profile,
   safeTop,
+  screenWidth,
   onToggleMenu,
   showMenuTapCue,
 }: {
@@ -1626,6 +1826,8 @@ function FixedAppHeaderLayer({
   categories: AppCategory[];
   categoryLayoutsRef: React.MutableRefObject<Partial<Record<CategoryId, { width: number; x: number }>>>;
   categoryRailRef: React.RefObject<ScrollView | null>;
+  categorySwipeResponder: GestureResponderHandlers;
+  categorySwipeX: Animated.Value;
   headerMode: 'default' | 'inbox' | 'tickets';
   inboxInputRef: React.RefObject<TextInput | null>;
   inboxIsFocused: boolean;
@@ -1638,10 +1840,32 @@ function FixedAppHeaderLayer({
   onOpenNearby: () => void;
   profile?: AppUser | null;
   safeTop: number;
+  screenWidth: number;
   onToggleMenu: () => void;
   showMenuTapCue: boolean;
 }) {
   const avatarSource = profile?.avatar ? profile.avatar : APP_LOGO;
+  const currentIndex = categories.findIndex((category) => category.id === activeCategory);
+  const currentLayout = categoryLayoutsRef.current[activeCategory];
+  const previousLayout = currentIndex > 0 ? categoryLayoutsRef.current[categories[currentIndex - 1]?.id] : currentLayout;
+  const nextLayout =
+    currentIndex >= 0 && currentIndex < categories.length - 1
+      ? categoryLayoutsRef.current[categories[currentIndex + 1]?.id]
+      : currentLayout;
+  const indicatorX = categorySwipeX.interpolate({
+    inputRange: [-Math.max(1, screenWidth), 0, Math.max(1, screenWidth)],
+    outputRange: [nextLayout?.x ?? currentLayout?.x ?? 0, currentLayout?.x ?? 0, previousLayout?.x ?? currentLayout?.x ?? 0],
+    extrapolate: 'clamp',
+  });
+  const indicatorWidth = categorySwipeX.interpolate({
+    inputRange: [-Math.max(1, screenWidth), 0, Math.max(1, screenWidth)],
+    outputRange: [
+      nextLayout?.width ?? currentLayout?.width ?? 0,
+      currentLayout?.width ?? 0,
+      previousLayout?.width ?? currentLayout?.width ?? 0,
+    ],
+    extrapolate: 'clamp',
+  });
 
   return (
     <View pointerEvents="box-none" style={[styles.floatingHeaderWrap, { paddingTop: safeTop + FLOATING_HEADER_TOP_PADDING }]}>
@@ -1681,11 +1905,24 @@ function FixedAppHeaderLayer({
         </View>
 
         <ScrollView
+          {...categorySwipeResponder}
           ref={categoryRailRef}
           horizontal
           showsHorizontalScrollIndicator={false}
           contentContainerStyle={styles.floatingCategoryRow}
         >
+          {currentLayout ? (
+            <Animated.View
+              pointerEvents="none"
+              style={[
+                styles.headerCategoryMovingUnderline,
+                {
+                  width: indicatorWidth,
+                  transform: [{ translateX: indicatorX }],
+                },
+              ]}
+            />
+          ) : null}
           {categories.map((category) => (
             <View
               key={category.id}
@@ -1697,6 +1934,7 @@ function FixedAppHeaderLayer({
                 active={category.id === activeCategory}
                 label={category.name}
                 onPress={() => onOpenCategory(category.id)}
+                showUnderline={false}
               />
             </View>
           ))}
@@ -1710,10 +1948,12 @@ function HeaderCategoryTab({
   active,
   label,
   onPress,
+  showUnderline = true,
 }: {
   active: boolean;
   label: string;
   onPress: () => void;
+  showUnderline?: boolean;
 }) {
   const jelly = useJellyPressAnimation({
     pressedScaleX: 1.025,
@@ -1726,7 +1966,7 @@ function HeaderCategoryTab({
         <Text numberOfLines={1} style={[styles.headerCategoryText, active && styles.headerCategoryTextActive]}>
           {label}
         </Text>
-        <View style={[styles.headerCategoryUnderline, active && styles.headerCategoryUnderlineActive]} />
+        {showUnderline ? <View style={[styles.headerCategoryUnderline, active && styles.headerCategoryUnderlineActive]} /> : null}
       </Animated.View>
     </Pressable>
   );
@@ -1981,6 +2221,80 @@ function FeedFooterSkeleton() {
   );
 }
 
+function CategorySwipePreview({
+  category,
+  left,
+  paddingTop,
+  width,
+}: {
+  category: AppCategory;
+  left: number;
+  paddingTop: number;
+  width: number;
+}) {
+  const breathe = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(breathe, {
+          toValue: 1,
+          duration: 1250,
+          easing: Easing.inOut(Easing.quad),
+          useNativeDriver: true,
+        }),
+        Animated.timing(breathe, {
+          toValue: 0,
+          duration: 1250,
+          easing: Easing.inOut(Easing.quad),
+          useNativeDriver: true,
+        }),
+      ]),
+    );
+
+    loop.start();
+    return () => loop.stop();
+  }, [breathe]);
+
+  const animatedStyle = {
+    opacity: breathe.interpolate({
+      inputRange: [0, 1],
+      outputRange: [0.36, 0.78],
+    }),
+  };
+
+  return (
+    <View
+      pointerEvents="none"
+      style={[
+        styles.categorySwipePreview,
+        {
+          left,
+          paddingTop,
+          width,
+        },
+      ]}
+    >
+      <View style={styles.categorySwipePreviewBanner}>
+        <View style={styles.categorySwipePreviewIcon}>
+          <Feather color={theme.colors.accentStrong} name={(category.icon as FeatherName) ?? 'grid'} size={15} />
+        </View>
+        <View style={styles.categorySwipePreviewCopy}>
+          <Text style={styles.categorySwipePreviewTitle}>{category.name}</Text>
+          <Animated.View style={[styles.categorySwipePreviewLine, { width: '54%' }, animatedStyle]} />
+        </View>
+      </View>
+      <Animated.View style={[styles.categorySwipeSpotlightSkeleton, animatedStyle]} />
+      <View style={styles.categorySwipeSectionRow}>
+        <Animated.View style={[styles.categorySwipeHeadingSkeleton, animatedStyle]} />
+        <Animated.View style={[styles.categorySwipeActionSkeleton, animatedStyle]} />
+      </View>
+      <Animated.View style={[styles.categorySwipeCardSkeleton, animatedStyle]} />
+      <Animated.View style={[styles.categorySwipeCardSkeleton, animatedStyle]} />
+    </View>
+  );
+}
+
 function EventCard({
   event,
   isPreviewActive,
@@ -2127,10 +2441,12 @@ function EventCard({
             <Text style={styles.dateMonth}>{event.month}</Text>
           </View>
 
-          <View style={styles.ratingChip}>
-            <Feather color="#FBBF24" name={'star' as FeatherName} size={12} />
-            <Text style={styles.ratingText}>{event.rating.toFixed(1)}</Text>
-          </View>
+          {(event.ratingCount ?? 0) > 0 ? (
+            <View style={styles.ratingChip}>
+              <Feather color="#FBBF24" name={'star' as FeatherName} size={12} />
+              <Text style={styles.ratingText}>{formatRatingSummary(event)}</Text>
+            </View>
+          ) : null}
 
           <View style={styles.saveChip}>
             <MiniSaveAction saved={event.isSaved} onPress={onToggleSave} />
@@ -2431,6 +2747,10 @@ function getHomeDistanceLabel(distanceKm: number) {
   return `${distance} away`;
 }
 
+function formatRatingSummary(event: AppEvent) {
+  return `${event.rating.toFixed(1)}(${event.ratingCount ?? 0})`;
+}
+
 function formatHomeDistance(distanceKm: number) {
   if (distanceKm < 1) {
     return `${Math.max(100, Math.round(distanceKm * 1000))} m`;
@@ -2598,6 +2918,18 @@ function seededSpotlightNoise(value: string, seed: number) {
 const styles = StyleSheet.create({
   root: {
     flex: 1,
+    overflow: 'hidden',
+  },
+  categorySwipeSurface: {
+    flex: 1,
+  },
+  categorySwipePreview: {
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    paddingHorizontal: 4,
+    paddingBottom: 120,
+    backgroundColor: 'transparent',
   },
   content: {
     paddingHorizontal: 4,
@@ -2818,10 +3150,19 @@ const styles = StyleSheet.create({
     paddingBottom: 10,
   },
   floatingCategoryRow: {
+    position: 'relative',
     minHeight: FLOATING_CATEGORY_RAIL_HEIGHT,
     alignItems: 'center',
     paddingRight: 16,
     gap: 18,
+  },
+  headerCategoryMovingUnderline: {
+    position: 'absolute',
+    left: 0,
+    bottom: 0,
+    height: 2,
+    borderRadius: 999,
+    backgroundColor: theme.colors.accentStrong,
   },
   headerCategoryTab: {
     minHeight: FLOATING_CATEGORY_RAIL_HEIGHT,
@@ -2881,6 +3222,69 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     textTransform: 'uppercase',
     letterSpacing: 0.5,
+  },
+  categorySwipePreviewBanner: {
+    minHeight: 60,
+    marginBottom: 10,
+    borderTopWidth: 1,
+    borderBottomWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    paddingVertical: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 11,
+  },
+  categorySwipePreviewIcon: {
+    width: 24,
+    height: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  categorySwipePreviewCopy: {
+    flex: 1,
+    gap: 7,
+  },
+  categorySwipePreviewTitle: {
+    color: theme.colors.text,
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  categorySwipePreviewLine: {
+    height: 11,
+    borderRadius: 6,
+    backgroundColor: 'rgba(255,255,255,0.1)',
+  },
+  categorySwipeSpotlightSkeleton: {
+    height: 224,
+    marginTop: 4,
+    marginBottom: 14,
+    borderRadius: 11,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+  },
+  categorySwipeSectionRow: {
+    marginBottom: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  categorySwipeHeadingSkeleton: {
+    width: 132,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: 'rgba(255,255,255,0.1)',
+  },
+  categorySwipeActionSkeleton: {
+    width: 86,
+    height: 14,
+    borderRadius: 7,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+  },
+  categorySwipeCardSkeleton: {
+    height: 318,
+    marginBottom: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: 'rgba(255,255,255,0.07)',
   },
   spotlightCard: {
     marginTop: 4,
@@ -3069,10 +3473,6 @@ const styles = StyleSheet.create({
     left: 18,
     right: 18,
     bottom: 20,
-    flexDirection: 'row',
-    alignItems: 'flex-end',
-    justifyContent: 'space-between',
-    gap: 12,
   },
   cardTextBlock: {
     flex: 1,
@@ -3083,7 +3483,6 @@ const styles = StyleSheet.create({
     minWidth: 0,
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
     gap: 12,
   },
   cardTitle: {
@@ -3096,6 +3495,7 @@ const styles = StyleSheet.create({
     letterSpacing: 0.2,
   },
   cardTitleBadgeGroup: {
+    marginLeft: 'auto',
     flexShrink: 0,
     flexDirection: 'row',
     alignItems: 'center',
@@ -3138,12 +3538,16 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   cardAbout: {
+    paddingRight: 92,
     color: 'rgba(245,247,252,0.78)',
     fontSize: 12,
     lineHeight: 18,
     fontWeight: '500',
   },
   priceChip: {
+    position: 'absolute',
+    right: 0,
+    bottom: 0,
     minHeight: 38,
     paddingHorizontal: 14,
     borderRadius: theme.radius.pill,

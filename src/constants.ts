@@ -13,4 +13,4 @@ export const BARCODE_PATTERN = [
   84, 89, 73, 95, 81, 98, 75, 90, 86, 94, 72, 96,
 ];
 
-export const APP_VERSION = '1.1.0';
+export const APP_VERSION = '1.1.2';

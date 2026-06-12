@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Animated,
+  KeyboardAvoidingView,
   Linking,
   Modal,
   NativeScrollEvent,
@@ -16,7 +17,6 @@ import {
   View,
   useWindowDimensions,
 } from 'react-native';
-import Constants from 'expo-constants';
 import { Feather, FontAwesome6, MaterialCommunityIcons } from '@expo/vector-icons';
 import { ResizeMode, type AVPlaybackStatus, Video } from 'expo-av';
 import { Image } from 'expo-image';
@@ -116,12 +116,11 @@ export function DetailsScreen({
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
   const heroHeight = Math.min(width * 1.08, 420);
-  const [selectedRating, setSelectedRating] = useState(() => Math.round(event.rating));
+  const [selectedRating, setSelectedRating] = useState(() => getInitialUserRating(event));
   const [ratingOpen, setRatingOpen] = useState(false);
   const [ratingPending, setRatingPending] = useState(false);
   const [commentsOpen, setCommentsOpen] = useState(false);
   const [commentCount, setCommentCount] = useState(event.commentCount ?? 0);
-  const [mapExpanded, setMapExpanded] = useState(false);
   const [activeMediaIndex, setActiveMediaIndex] = useState(0);
   const [fullscreenVideo, setFullscreenVideo] = useState<AppEventMedia | null>(null);
   const [checkoutOpen, setCheckoutOpen] = useState(false);
@@ -138,22 +137,16 @@ export function DetailsScreen({
     () => (event.city ? `${event.venue} - ${event.city}` : event.venue),
     [event.city, event.venue],
   );
-  const actionBarInset = insets.bottom + 96;
   const bookingAction = useMemo(() => getBookingAction(event), [event]);
   const ctaLabel = event.hasTicket ? `View ${bookingAction.noun}` : bookingAction.cta;
-  const canRenderNativeMap = canRenderNativeMapForLocation(event.location);
   const ratingBarProgress = useRef(new Animated.Value(0)).current;
   const heroPagerRef = useRef<ScrollView>(null);
   const autoplayHoldUntil = useRef(0);
-  const mapPreviewJelly = useJellyPressAnimation({
-    pressedScaleX: 1.01,
-    pressedScaleY: 0.984,
-  });
 
   useEffect(() => {
-    setSelectedRating(Math.round(event.rating));
+    setSelectedRating(getInitialUserRating(event));
     setRatingOpen(false);
-  }, [event.id, event.rating]);
+  }, [event.id, event.rating, event.userRating]);
 
   useEffect(() => {
     setCommentsOpen(false);
@@ -391,55 +384,17 @@ export function DetailsScreen({
           <Text style={styles.eventTitle}>{event.title}</Text>
           <Text style={styles.eventBlurb}>{event.blurb}</Text>
 
-          <View style={styles.metricRow}>
-            <MetricCard icon="calendar" label="Date" value={event.dateLabel} />
-            <MetricCard icon="clock" label="Starts" value={event.time} />
-          </View>
-
-          <View style={styles.metricRow}>
-            <MetricCard icon="map-pin" label="Venue" value={event.venue} />
-            <MetricCard icon="star" label="Rating" value={event.rating.toFixed(1)} />
-          </View>
-
-          <View style={styles.section}>
-            <Text style={styles.sectionTitle}>Location</Text>
-            <View style={styles.mapCard}>
-              {canRenderNativeMap ? (
-                <Pressable
-                  onPress={() => setMapExpanded(true)}
-                  onPressIn={mapPreviewJelly.onPressIn}
-                  onPressOut={mapPreviewJelly.onPressOut}
-                  style={styles.mapPreviewPressable}
-                >
-                  <Animated.View style={[styles.mapFrame, mapPreviewJelly.animatedStyle]}>
-                    <NativeMapPreview event={event} />
-                    <View pointerEvents="none" style={styles.mapBadge}>
-                      <Feather color={theme.colors.accentStrong} name="map-pin" size={13} />
-                      <Text style={styles.mapBadgeText}>{event.location.label}</Text>
-                    </View>
-                    <View pointerEvents="none" style={styles.mapExpandHint}>
-                      <Feather color={theme.colors.text} name="maximize-2" size={12} />
-                      <Text style={styles.mapExpandHintText}>Open map</Text>
-                    </View>
-                  </Animated.View>
-                </Pressable>
-              ) : (
-                <View style={styles.mapFallbackFrame}>
-                  <View style={styles.mapFallbackIcon}>
-                    <Feather color={theme.colors.accentStrong} name="map-pin" size={22} />
-                  </View>
-                  <Text style={styles.mapFallbackTitle}>{event.location.label}</Text>
-                  <Text style={styles.mapFallbackAddress}>{event.location.address}</Text>
-                  <MapDirectionsButton onPress={() => void handleOpenDirections()} />
-                </View>
-              )}
-
-              <View style={styles.mapMeta}>
-                <Text style={styles.mapAddress}>{event.location.address}</Text>
-                <Text style={styles.mapNote}>{event.location.note}</Text>
-              </View>
-            </View>
-          </View>
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            style={styles.detailsMetaScroller}
+            contentContainerStyle={styles.detailsMetaRow}
+          >
+            <DetailMetaItem icon="calendar" value={event.dateLabel} />
+            <DetailMetaItem icon="clock" value={event.time} />
+            <DetailMetaItem icon="map-pin" value={event.venue} wide onPress={() => void handleOpenDirections()} />
+            <DetailMetaItem icon="star" value={formatRatingSummary(event)} />
+          </ScrollView>
 
           <View style={styles.section}>
             <Text style={styles.sectionTitle}>About the night</Text>
@@ -463,6 +418,7 @@ export function DetailsScreen({
           <View style={styles.section}>
             <Text style={styles.sectionTitle}>Connect</Text>
             <View style={styles.contactRow}>
+              <ContactButton icon="navigation" label="Directions" onPress={() => void handleOpenDirections()} />
               {event.contacts.map((contact) => (
                 <ContactButton key={contact.id} icon={contact.icon} label={contact.label} onPress={() => openLink(contact.url)} />
               ))}
@@ -488,7 +444,7 @@ export function DetailsScreen({
 
       {ratingOpen ? <Pressable onPress={() => setRatingOpen(false)} style={styles.ratingDismissLayer} /> : null}
 
-      <View style={[styles.bottomBar, { paddingBottom: insets.bottom + 12 }]}>
+      <View style={[styles.bottomBar, { paddingBottom: insets.bottom + 8 }]}>
         <View style={styles.bottomBarInner}>
           <ReserveActionButton label={ctaLabel} motion={ratingBarProgress} onPress={handlePrimaryAction} width={width} />
           <RatingDock
@@ -536,28 +492,6 @@ export function DetailsScreen({
         }}
         onConfirm={handleConfirmCheckout}
       />
-
-      {mapExpanded && canRenderNativeMap ? (
-        <View pointerEvents="box-none" style={StyleSheet.absoluteFillObject}>
-          <View style={[styles.mapExpandedOverlay, { bottom: actionBarInset, paddingTop: insets.top + 8 }]}>
-            <View style={styles.mapExpandedHeader}>
-              <View style={styles.mapExpandedHeaderCopy}>
-                <Text style={styles.mapModalTitle}>{event.venue}</Text>
-                <Text style={styles.mapModalSubtitle}>{event.location.address}</Text>
-              </View>
-              <IconButton icon="x" onPress={() => setMapExpanded(false)} accessibilityLabel="Close map" />
-            </View>
-
-            <View style={styles.mapExpandedFrame}>
-              <NativeMapPreview event={event} expanded />
-
-              <View pointerEvents="box-none" style={styles.mapExpandedFloatingAction}>
-                <MapDirectionsButton onPress={() => void handleOpenDirections()} />
-              </View>
-            </View>
-          </View>
-        </View>
-      ) : null}
 
       <Modal
         animationType="fade"
@@ -629,99 +563,109 @@ function BookingCheckoutSheet({
     <Modal animationType="slide" transparent visible={visible} onRequestClose={onClose}>
       <View style={styles.checkoutBackdrop}>
         <Pressable style={StyleSheet.absoluteFillObject} onPress={onClose} />
-        <View style={[styles.checkoutSheet, { paddingBottom: insets.bottom + 18 }]}>
-          <View style={styles.checkoutHandle} />
-          <View style={styles.checkoutHeader}>
-            <View>
-              <Text style={styles.checkoutEyebrow}>In-app payment</Text>
-              <Text style={styles.checkoutTitle}>Complete {actionLabel}</Text>
-            </View>
-            <IconButton icon="x" onPress={onClose} accessibilityLabel="Close checkout" />
-          </View>
-
-          <View style={styles.checkoutSummary}>
-            <Text style={styles.checkoutListing} numberOfLines={1}>{event.title}</Text>
-            <Text style={styles.checkoutAmount}>{event.price}</Text>
-          </View>
-
-          <Text style={styles.checkoutLabel}>Quantity</Text>
-          <View style={styles.checkoutInputLine}>
-            <Feather color={theme.colors.textMuted} name="hash" size={16} />
-            <TextInput
-              keyboardType="number-pad"
-              onChangeText={(value) => onChangeQuantity(value.replace(/[^\d]/g, '').slice(0, 2))}
-              placeholder="1"
-              placeholderTextColor={theme.colors.textMuted}
-              style={styles.checkoutInput}
-              value={quantity}
-            />
-          </View>
-
-          <Text style={styles.checkoutLabel}>Message to the host</Text>
-          <View style={[styles.checkoutInputLine, styles.checkoutNoteLine]}>
-            <Feather color={theme.colors.textMuted} name="message-square" size={16} />
-            <TextInput
-              multiline
-              onChangeText={onChangeRequestNote}
-              placeholder="Tell them your preferred time, quantity, table size, or anything they should review."
-              placeholderTextColor={theme.colors.textMuted}
-              style={[styles.checkoutInput, styles.checkoutNoteInput]}
-              textAlignVertical="top"
-              value={requestNote}
-            />
-          </View>
-
-          {needsPayment ? (
-            <>
-              <Text style={styles.checkoutLabel}>Pay with</Text>
-              <View style={styles.paymentMethodGrid}>
-                {PAYMENT_METHODS.map((item) => (
-                  <PaymentMethodChip
-                    key={item.id}
-                    active={item.id === method}
-                    label={item.label}
-                    onPress={() => onChangeMethod(item.id)}
-                  />
-                ))}
+        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
+          <View style={[styles.checkoutSheet, { paddingBottom: insets.bottom + 18 }]}>
+            <ScrollView
+              bounces={false}
+              contentContainerStyle={styles.checkoutScrollContent}
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false}
+            >
+              <View style={styles.checkoutHandle} />
+              <View style={styles.checkoutHeader}>
+                <View>
+                  <Text style={styles.checkoutEyebrow}>In-app payment</Text>
+                  <Text style={styles.checkoutTitle}>Complete {actionLabel}</Text>
+                </View>
+                <IconButton icon="x" onPress={onClose} accessibilityLabel="Close checkout" />
               </View>
 
-              <Text style={styles.checkoutLabel}>Wallet phone number</Text>
+              <View style={styles.checkoutSummary}>
+                <Text style={styles.checkoutListing} numberOfLines={1}>{event.title}</Text>
+                <Text style={styles.checkoutAmount}>{event.price}</Text>
+              </View>
+
+              <Text style={styles.checkoutLabel}>Quantity</Text>
               <View style={styles.checkoutInputLine}>
-                <Feather color={theme.colors.textMuted} name="phone" size={16} />
+                <Feather color={theme.colors.textMuted} name="hash" size={16} />
                 <TextInput
-                  keyboardType="phone-pad"
-                  onChangeText={onChangePhone}
-                  placeholder="e.g. 0771234567"
+                  keyboardType="number-pad"
+                  onChangeText={(value) => onChangeQuantity(value.replace(/[^\d]/g, '').slice(0, 2))}
+                  placeholder="1"
                   placeholderTextColor={theme.colors.textMuted}
                   style={styles.checkoutInput}
-                  value={phone}
+                  value={quantity}
                 />
               </View>
 
-              <Text style={styles.checkoutHelp}>
-                Wait for the payment merchant prompt to show on your phone, then confirm by entering your PIN.
-              </Text>
-            </>
-          ) : (
-            <Text style={styles.checkoutHelp}>The host will review your request and confirm it in the app.</Text>
-          )}
+              <Text style={styles.checkoutLabel}>Message to the host</Text>
+              <View style={[styles.checkoutInputLine, styles.checkoutNoteLine]}>
+                <Feather color={theme.colors.textMuted} name="message-square" size={16} />
+                <TextInput
+                  multiline
+                  onChangeText={onChangeRequestNote}
+                  placeholder="Tell them your preferred time, quantity, table size, or anything they should review."
+                  placeholderTextColor={theme.colors.textMuted}
+                  scrollEnabled
+                  style={[styles.checkoutInput, styles.checkoutNoteInput]}
+                  textAlignVertical="top"
+                  value={requestNote}
+                />
+              </View>
 
-          <Pressable
-            accessibilityRole="button"
-            disabled={!canSubmit}
-            onPress={onConfirm}
-            style={[styles.checkoutSubmit, !canSubmit && styles.checkoutSubmitDisabled]}
-          >
-            <LinearGradient
-              colors={['#E7392F', theme.colors.accentStrong, theme.colors.accent]}
-              start={{ x: 0, y: 0 }}
-              end={{ x: 1, y: 1 }}
-              style={styles.checkoutSubmitGradient}
-            >
-              <Text style={styles.checkoutSubmitText}>{pending ? 'Sending...' : needsPayment ? `Pay ${event.price}` : 'Send request'}</Text>
-            </LinearGradient>
-          </Pressable>
-        </View>
+              {needsPayment ? (
+                <>
+                  <Text style={styles.checkoutLabel}>Pay with</Text>
+                  <View style={styles.paymentMethodGrid}>
+                    {PAYMENT_METHODS.map((item) => (
+                      <PaymentMethodChip
+                        key={item.id}
+                        active={item.id === method}
+                        label={item.label}
+                        onPress={() => onChangeMethod(item.id)}
+                      />
+                    ))}
+                  </View>
+
+                  <Text style={styles.checkoutLabel}>Wallet phone number</Text>
+                  <View style={styles.checkoutInputLine}>
+                    <Feather color={theme.colors.textMuted} name="phone" size={16} />
+                    <TextInput
+                      keyboardType="phone-pad"
+                      onChangeText={onChangePhone}
+                      placeholder="e.g. 0771234567"
+                      placeholderTextColor={theme.colors.textMuted}
+                      style={styles.checkoutInput}
+                      value={phone}
+                    />
+                  </View>
+
+                  <Text style={styles.checkoutHelp}>
+                    Wait for the payment merchant prompt to show on your phone, then confirm by entering your PIN.
+                  </Text>
+                </>
+              ) : (
+                <Text style={styles.checkoutHelp}>The host will review your request and confirm it in the app.</Text>
+              )}
+
+              <Pressable
+                accessibilityRole="button"
+                disabled={!canSubmit}
+                onPress={onConfirm}
+                style={[styles.checkoutSubmit, !canSubmit && styles.checkoutSubmitDisabled]}
+              >
+                <LinearGradient
+                  colors={['#E7392F', theme.colors.accentStrong, theme.colors.accent]}
+                  start={{ x: 0, y: 0 }}
+                  end={{ x: 1, y: 1 }}
+                  style={styles.checkoutSubmitGradient}
+                >
+                  <Text style={styles.checkoutSubmitText}>{pending ? 'Sending...' : needsPayment ? `Pay ${event.price}` : 'Send request'}</Text>
+                </LinearGradient>
+              </Pressable>
+            </ScrollView>
+          </View>
+        </KeyboardAvoidingView>
       </View>
     </Modal>
   );
@@ -766,26 +710,6 @@ function SaveHeroButton({
     <Pressable onPress={onPress} onPressIn={jelly.onPressIn} onPressOut={jelly.onPressOut} style={styles.heroSavePressable}>
       <Animated.View style={[styles.heroSaveButton, saved && styles.heroSaveButtonActive, jelly.animatedStyle]}>
         <Feather color={saved ? theme.colors.white : theme.colors.accentStrong} name="heart" size={17} />
-      </Animated.View>
-    </Pressable>
-  );
-}
-
-function MapDirectionsButton({
-  onPress,
-}: {
-  onPress: () => void;
-}) {
-  const jelly = useJellyPressAnimation({
-    pressedScaleX: 1.02,
-    pressedScaleY: 0.95,
-  });
-
-  return (
-    <Pressable onPress={onPress} onPressIn={jelly.onPressIn} onPressOut={jelly.onPressOut} style={styles.mapDirectionsPressable}>
-      <Animated.View style={[styles.mapDirectionsButton, jelly.animatedStyle]}>
-        <Feather color={theme.colors.white} name="navigation" size={15} />
-        <Text style={styles.mapDirectionsText}>Directions</Text>
       </Animated.View>
     </Pressable>
   );
@@ -928,60 +852,36 @@ function HeroPaginationDots({
   );
 }
 
-function NativeMapPreview({ event, expanded = false }: { event: AppEvent; expanded?: boolean }) {
-  const { default: MapView, Marker } = require('react-native-maps') as typeof import('react-native-maps');
-  const location = event.location;
-
-  return (
-    <MapView
-      key={expanded ? `${event.id}-expanded` : event.id}
-      initialRegion={{
-        latitude: location.latitude,
-        longitude: location.longitude,
-        latitudeDelta: location.latitudeDelta,
-        longitudeDelta: location.longitudeDelta,
-      }}
-      loadingEnabled
-      pitchEnabled={expanded}
-      rotateEnabled={expanded}
-      scrollEnabled={expanded}
-      showsCompass={expanded}
-      showsScale={expanded}
-      style={expanded ? styles.mapExpandedMap : styles.map}
-      toolbarEnabled={expanded}
-      zoomEnabled={expanded}
-    >
-      <Marker
-        coordinate={{
-          latitude: location.latitude,
-          longitude: location.longitude,
-        }}
-        description={location.address}
-        title={event.venue}
-      />
-    </MapView>
-  );
-}
-
-function MetricCard({
+function DetailMetaItem({
   icon,
-  label,
   value,
+  wide = false,
+  onPress,
 }: {
   icon: FeatherName;
-  label: string;
   value: string;
+  wide?: boolean;
+  onPress?: () => void;
 }) {
-  return (
-    <View style={styles.metricCard}>
-      <View style={styles.metricIcon}>
-        <Feather color={theme.colors.accentStrong} name={icon} size={15} />
-      </View>
-      <Text style={styles.metricLabel}>{label}</Text>
-      <Text numberOfLines={2} style={styles.metricValue}>
+  const content = (
+    <View style={[styles.detailsMetaItem, wide && styles.detailsMetaItemWide, onPress && styles.detailsMetaItemPressable]}>
+      <Feather color={theme.colors.accentStrong} name={icon} size={14} />
+      <Text numberOfLines={1} ellipsizeMode="tail" style={styles.detailsMetaValue}>
         {value}
       </Text>
     </View>
+  );
+
+  if (onPress) {
+    return (
+      <Pressable accessibilityRole="button" accessibilityLabel={`Open directions to ${value}`} onPress={onPress}>
+        {content}
+      </Pressable>
+    );
+  }
+
+  return (
+    content
   );
 }
 
@@ -990,7 +890,7 @@ function ContactButton({
   label,
   onPress,
 }: {
-  icon: ContactIconName;
+  icon: ContactIconName | FeatherName;
   label: string;
   onPress: () => void;
 }) {
@@ -1364,23 +1264,12 @@ function eventNeedsPayment(event: AppEvent) {
   return event.acceptsInternalPayments && /\d/.test(event.price) && !/free|tba|soon/i.test(event.price);
 }
 
-function canRenderNativeMapForLocation(location: EventLocation) {
-  if (!hasMappableCoordinates(location)) {
-    return false;
-  }
-
-  if (Platform.OS === 'android') {
-    return hasAndroidGoogleMapsApiKey();
-  }
-
-  return Platform.OS !== 'web';
+function getInitialUserRating(event: AppEvent) {
+  return event.userRating ?? Math.round(event.rating);
 }
 
-function hasAndroidGoogleMapsApiKey() {
-  const androidConfig = Constants.expoConfig?.android as
-    | { config?: { googleMaps?: { apiKey?: string | null } } }
-    | undefined;
-  return typeof androidConfig?.config?.googleMaps?.apiKey === 'string' && androidConfig.config.googleMaps.apiKey.trim().length > 0;
+function formatRatingSummary(event: AppEvent) {
+  return `${event.rating.toFixed(1)}(${event.ratingCount ?? 0})`;
 }
 
 function hasMappableCoordinates(location: EventLocation) {
@@ -1405,6 +1294,7 @@ function getDirectionsDestination(location: EventLocation) {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
+    backgroundColor: '#05070C',
   },
   hero: {
     overflow: 'hidden',
@@ -1574,40 +1464,31 @@ const styles = StyleSheet.create({
     fontSize: 14,
     lineHeight: 21,
   },
-  metricRow: {
-    flexDirection: 'row',
-    gap: 12,
+  detailsMetaScroller: {
+    marginTop: -4,
   },
-  metricCard: {
-    flex: 1,
-    minHeight: 108,
-    borderRadius: theme.radius.md,
-    backgroundColor: theme.colors.surfaceMuted,
-    borderWidth: 1,
-    borderColor: theme.colors.border,
-    padding: 14,
-    gap: 8,
-  },
-  metricIcon: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: theme.colors.accentSoft,
+  detailsMetaRow: {
     alignItems: 'center',
-    justifyContent: 'center',
+    gap: 14,
+    paddingRight: 6,
   },
-  metricLabel: {
-    color: theme.colors.textSoft,
-    fontSize: 11,
-    fontWeight: '800',
-    textTransform: 'uppercase',
-    letterSpacing: 0.8,
+  detailsMetaItem: {
+    maxWidth: 142,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
   },
-  metricValue: {
+  detailsMetaItemWide: {
+    maxWidth: 190,
+  },
+  detailsMetaItemPressable: {
+    paddingVertical: 3,
+  },
+  detailsMetaValue: {
     color: theme.colors.text,
-    fontSize: 15,
+    fontSize: 13,
     fontWeight: '700',
-    lineHeight: 20,
+    lineHeight: 17,
   },
   section: {
     gap: 12,
@@ -1621,155 +1502,6 @@ const styles = StyleSheet.create({
     color: theme.colors.textMuted,
     fontSize: 14,
     lineHeight: 22,
-  },
-  mapCard: {
-    gap: 12,
-  },
-  mapPreviewPressable: {
-    alignSelf: 'stretch',
-  },
-  mapFrame: {
-    overflow: 'hidden',
-    borderRadius: theme.radius.md,
-    borderWidth: 1,
-    borderColor: theme.colors.border,
-    backgroundColor: theme.colors.surfaceStrong,
-  },
-  map: {
-    width: '100%',
-    height: 184,
-  },
-  mapBadge: {
-    position: 'absolute',
-    left: 12,
-    top: 12,
-    paddingHorizontal: 10,
-    paddingVertical: 7,
-    borderRadius: theme.radius.pill,
-    backgroundColor: 'rgba(10,13,19,0.88)',
-    borderWidth: 1,
-    borderColor: 'rgba(242,34,28,0.22)',
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  mapBadgeText: {
-    color: theme.colors.text,
-    fontSize: 11,
-    fontWeight: '700',
-  },
-  mapExpandHint: {
-    position: 'absolute',
-    right: 12,
-    bottom: 12,
-    paddingHorizontal: 10,
-    paddingVertical: 7,
-    borderRadius: theme.radius.pill,
-    backgroundColor: 'rgba(10,13,19,0.88)',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.12)',
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  mapExpandHintText: {
-    color: theme.colors.text,
-    fontSize: 11,
-    fontWeight: '700',
-  },
-  mapFallbackFrame: {
-    minHeight: 184,
-    borderRadius: theme.radius.md,
-    borderWidth: 1,
-    borderColor: theme.colors.border,
-    backgroundColor: theme.colors.surfaceStrong,
-    padding: 18,
-    alignItems: 'flex-start',
-    justifyContent: 'center',
-    gap: 10,
-  },
-  mapFallbackIcon: {
-    width: 46,
-    height: 46,
-    borderRadius: 23,
-    backgroundColor: theme.colors.accentSoft,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  mapFallbackTitle: {
-    color: theme.colors.text,
-    fontSize: 16,
-    fontWeight: '800',
-  },
-  mapFallbackAddress: {
-    color: theme.colors.textMuted,
-    fontSize: 13,
-    lineHeight: 19,
-  },
-  mapMeta: {
-    gap: 6,
-  },
-  mapExpandedOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(6,8,12,0.78)',
-    paddingHorizontal: 12,
-    gap: 12,
-  },
-  mapExpandedHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 12,
-  },
-  mapExpandedHeaderCopy: {
-    flex: 1,
-    gap: 4,
-  },
-  mapModalTitle: {
-    color: theme.colors.text,
-    fontSize: 18,
-    fontWeight: '800',
-  },
-  mapModalSubtitle: {
-    color: theme.colors.textMuted,
-    fontSize: 12,
-    lineHeight: 18,
-  },
-  mapExpandedFrame: {
-    flex: 1,
-    overflow: 'hidden',
-    borderRadius: 24,
-    borderWidth: 1,
-    borderColor: theme.colors.border,
-    backgroundColor: theme.colors.surfaceStrong,
-    ...shadow,
-  },
-  mapExpandedMap: {
-    width: '100%',
-    height: '100%',
-  },
-  mapExpandedFloatingAction: {
-    position: 'absolute',
-    right: 16,
-    bottom: 16,
-  },
-  mapDirectionsPressable: {
-    alignSelf: 'flex-end',
-  },
-  mapDirectionsButton: {
-    minHeight: 48,
-    paddingHorizontal: 16,
-    borderRadius: 999,
-    backgroundColor: theme.colors.accentStrong,
-    alignItems: 'center',
-    justifyContent: 'center',
-    flexDirection: 'row',
-    gap: 8,
-  },
-  mapDirectionsText: {
-    color: theme.colors.white,
-    fontSize: 13,
-    fontWeight: '800',
   },
   fullscreenVideoRoot: {
     flex: 1,
@@ -1799,17 +1531,6 @@ const styles = StyleSheet.create({
   fullscreenVideoPlayer: {
     flex: 1,
     backgroundColor: '#05070C',
-  },
-  mapAddress: {
-    color: theme.colors.text,
-    fontSize: 15,
-    fontWeight: '700',
-    lineHeight: 20,
-  },
-  mapNote: {
-    color: theme.colors.textMuted,
-    fontSize: 13,
-    lineHeight: 20,
   },
   highlightList: {
     gap: 12,
@@ -1895,6 +1616,7 @@ const styles = StyleSheet.create({
     justifyContent: 'flex-end',
   },
   checkoutSheet: {
+    maxHeight: '88%',
     borderTopLeftRadius: 24,
     borderTopRightRadius: 24,
     backgroundColor: 'rgba(12,15,23,0.98)',
@@ -1904,6 +1626,9 @@ const styles = StyleSheet.create({
     paddingTop: 10,
     gap: 14,
     ...shadow,
+  },
+  checkoutScrollContent: {
+    gap: 14,
   },
   checkoutHandle: {
     alignSelf: 'center',
@@ -1998,7 +1723,7 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   checkoutNoteLine: {
-    minHeight: 92,
+    minHeight: 106,
     alignItems: 'flex-start',
     paddingTop: 12,
   },
@@ -2010,7 +1735,8 @@ const styles = StyleSheet.create({
     paddingVertical: 0,
   },
   checkoutNoteInput: {
-    minHeight: 76,
+    minHeight: 88,
+    maxHeight: 148,
     lineHeight: 19,
   },
   checkoutHelp: {
@@ -2045,9 +1771,9 @@ const styles = StyleSheet.create({
     right: 0,
     bottom: 0,
     zIndex: 3,
-    paddingTop: 24,
-    paddingHorizontal: 16,
-    backgroundColor: 'rgba(10,13,19,0.82)',
+    paddingTop: 10,
+    paddingHorizontal: 14,
+    backgroundColor: 'rgba(10,13,19,0.74)',
   },
   bottomBarInner: {
     flexDirection: 'row',
@@ -2058,13 +1784,13 @@ const styles = StyleSheet.create({
     alignSelf: 'flex-end',
   },
   reserveActionSizer: {
-    minHeight: 48,
+    minHeight: 44,
   },
   reserveActionButton: {
     width: '100%',
-    minHeight: 48,
-    borderRadius: 24,
-    paddingHorizontal: 17,
+    minHeight: 44,
+    borderRadius: 22,
+    paddingHorizontal: 15,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
@@ -2084,7 +1810,7 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   ratingRail: {
-    height: 48,
+    height: 44,
     backgroundColor: 'transparent',
     flexDirection: 'row',
     alignItems: 'center',
@@ -2099,8 +1825,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   ratingStar: {
-    width: 40,
-    height: 44,
+    width: 38,
+    height: 42,
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: 'transparent',
@@ -2122,9 +1848,9 @@ const styles = StyleSheet.create({
     alignSelf: 'flex-end',
   },
   ratingTrigger: {
-    width: 52,
-    minHeight: 48,
-    borderRadius: 24,
+    width: 48,
+    minHeight: 44,
+    borderRadius: 22,
     backgroundColor: theme.colors.surfaceStrong,
     borderWidth: 1,
     borderColor: 'rgba(242,34,28,0.18)',
@@ -2135,9 +1861,9 @@ const styles = StyleSheet.create({
     alignSelf: 'flex-end',
   },
   commentTrigger: {
-    width: 52,
-    minHeight: 48,
-    borderRadius: 24,
+    width: 48,
+    minHeight: 44,
+    borderRadius: 22,
     backgroundColor: theme.colors.surfaceStrong,
     borderWidth: 1,
     borderColor: 'rgba(242,34,28,0.18)',

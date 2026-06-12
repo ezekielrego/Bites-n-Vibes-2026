@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Comment, CommentAttachment
+from .models import Comment, CommentAttachment, CommentFeedback
 from accounts.serializers import UserSerializer
 
 
@@ -45,13 +45,16 @@ class CommentSerializer(serializers.ModelSerializer):
     reply_count = serializers.ReadOnlyField()
     parent_id = serializers.SerializerMethodField()
     parent_author = serializers.SerializerMethodField()
+    useful_count = serializers.SerializerMethodField()
+    not_useful_count = serializers.SerializerMethodField()
+    user_feedback = serializers.SerializerMethodField()
     
     class Meta:
         model = Comment
         fields = [
             'id', 'listing', 'user', 'user_id', 'parent', 'parent_id', 'parent_author', 'message', 'role',
             'replies', 'attachments', 'is_edited', 'is_deleted', 'is_pinned',
-            'depth', 'reply_count', 'created_at', 'updated_at'
+            'depth', 'reply_count', 'useful_count', 'not_useful_count', 'user_feedback', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'is_edited', 'is_deleted', 'is_pinned', 'created_at', 'updated_at']
         extra_kwargs = {
@@ -69,12 +72,38 @@ class CommentSerializer(serializers.ModelSerializer):
     def get_replies(self, obj):
         """Get nested replies for this comment."""
         if self.context.get('include_replies', True):
-            replies = obj.replies.filter(is_deleted=False).select_related('user', 'parent__user').prefetch_related('attachments')
+            replies = obj.replies.filter(is_deleted=False).select_related('user', 'parent__user').prefetch_related('attachments', 'feedbacks')
             reply_preview_limit = self.context.get('reply_preview_limit')
             if isinstance(reply_preview_limit, int) and reply_preview_limit >= 0:
                 replies = replies[:reply_preview_limit]
             return CommentSerializer(replies, many=True, context=self.context).data
         return []
+
+    def get_useful_count(self, obj):
+        annotated = getattr(obj, 'useful_count', None)
+        if annotated is not None:
+            return annotated
+        return obj.feedbacks.filter(vote=CommentFeedback.VOTE_USEFUL).count()
+
+    def get_not_useful_count(self, obj):
+        annotated = getattr(obj, 'not_useful_count', None)
+        if annotated is not None:
+            return annotated
+        return obj.feedbacks.filter(vote=CommentFeedback.VOTE_NOT_USEFUL).count()
+
+    def get_user_feedback(self, obj):
+        request = self.context.get('request')
+        if not request or not request.user or not request.user.is_authenticated:
+            return None
+
+        prefetched = getattr(obj, '_prefetched_objects_cache', {}).get('feedbacks')
+        if prefetched is not None:
+            for feedback in prefetched:
+                if feedback.user_id == request.user.id:
+                    return feedback.vote
+
+        feedback = obj.feedbacks.filter(user=request.user).first()
+        return feedback.vote if feedback else None
     
     def create(self, validated_data):
         """Create comment with user from request."""

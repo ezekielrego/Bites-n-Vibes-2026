@@ -1,6 +1,6 @@
 import type { ImageSourcePropType } from 'react-native';
 
-export type Screen = 'home' | 'details' | 'ticket' | 'nearby';
+export type Screen = 'home' | 'details' | 'ticket' | 'nearby' | 'search';
 export type TabId = 'discover' | 'stream' | 'create' | 'inbox' | 'profile';
 export type CategoryId = string;
 export type ContactIconName = 'phone-call' | 'mail' | 'globe';
@@ -108,6 +108,9 @@ export interface AppEvent {
   socials: EventSocialLink[];
   isSaved: boolean;
   saveCount: number;
+  isVibing?: boolean | null;
+  vibeCount?: number;
+  userRating?: number | null;
   hasTicket: boolean;
   acceptsInternalPayments: boolean;
   ownerName?: string | null;
@@ -196,6 +199,9 @@ export interface AppComment {
   isPinned: boolean;
   depth: number;
   replyCount: number;
+  usefulCount: number;
+  notUsefulCount: number;
+  userFeedback?: 'useful' | 'not_useful' | null;
   createdAt: string;
   updatedAt: string;
 }

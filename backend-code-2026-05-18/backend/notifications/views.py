@@ -15,6 +15,12 @@ class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         """Get notifications for current user."""
         return Notification.objects.filter(user=self.request.user)
+
+    def destroy(self, request, *args, **kwargs):
+        """Delete a single notification owned by the current user."""
+        notification = self.get_object()
+        notification.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
     
     @action(detail=True, methods=['post'])
     def mark_read(self, request, pk=None):
@@ -37,6 +43,12 @@ class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
             is_read=False
         ).update(is_read=True, read_at=timezone.now())
         return Response({'message': f'{count} notifications marked as read'})
+
+    @action(detail=False, methods=['post'])
+    def clear(self, request):
+        """Delete all notifications for the current user."""
+        count, _ = Notification.objects.filter(user=request.user).delete()
+        return Response({'message': f'{count} notifications cleared', 'deleted_count': count})
     
     @action(detail=False, methods=['get'])
     def unread_count(self, request):

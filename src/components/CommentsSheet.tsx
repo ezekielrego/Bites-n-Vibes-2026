@@ -21,7 +21,7 @@ import * as ImagePicker from 'expo-image-picker';
 import { Feather, MaterialCommunityIcons } from '@expo/vector-icons';
 import { Image } from 'expo-image';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { createListingComment, fetchListingComments } from '../api';
+import { createListingComment, fetchListingComments, toggleCommentFeedback } from '../api';
 import { shadow, theme } from '../theme';
 import { AppComment, AppUser, CreateAppCommentInput, LocalUploadImage } from '../types';
 import { IconButton, useJellyPressAnimation } from './Primitives';
@@ -296,6 +296,20 @@ export function CommentsSheet({
     }
   }, [commentCount, composerAttachments, composerText, eventId, onCountChange, replyTarget, sendingComment]);
 
+  const handleCommentFeedback = useCallback(async (comment: AppComment, vote: NonNullable<AppComment['userFeedback']>) => {
+    setComposerError(null);
+    try {
+      const result = await toggleCommentFeedback(comment.id, vote);
+      setComments((current) => updateCommentFeedbackInThread(current, result.commentId, {
+        usefulCount: result.usefulCount,
+        notUsefulCount: result.notUsefulCount,
+        userFeedback: result.userFeedback,
+      }));
+    } catch (error) {
+      setComposerError(error instanceof Error ? error.message : 'Feedback could not be saved right now.');
+    }
+  }, []);
+
   const commentRows = useMemo(() => buildCommentRows(comments, replyLoadingMap), [comments, replyLoadingMap]);
   const avatarSource = profile?.avatar ? profile.avatar : APP_LOGO;
   const isInitialLoading = commentsLoading && !commentsLoaded;
@@ -420,6 +434,7 @@ export function CommentsSheet({
                         void openExternal(url);
                       }}
                       onReply={openReplyTarget}
+                      onFeedback={handleCommentFeedback}
                     />
                   );
                 }}
@@ -523,12 +538,14 @@ function SwipeReplyCommentCard({
   continuesThreadBelow,
   level,
   onOpenAttachment,
+  onFeedback,
   onReply,
 }: {
   comment: AppComment;
   continuesThreadBelow: boolean;
   level: number;
   onOpenAttachment: (url: string) => void;
+  onFeedback: (comment: AppComment, vote: NonNullable<AppComment['userFeedback']>) => void;
   onReply: (comment: AppComment) => void;
 }) {
   const translateX = useRef(new Animated.Value(0)).current;
@@ -646,6 +663,22 @@ function SwipeReplyCommentCard({
 
           <View style={styles.commentFooter}>
             <ActionTextButton label="Reply" onPress={() => onReply(comment)} />
+            <View style={styles.commentFeedbackGroup}>
+              <CommentFeedbackButton
+                active={comment.userFeedback === 'useful'}
+                count={comment.usefulCount}
+                icon="thumbs-up"
+                label="Useful"
+                onPress={() => onFeedback(comment, 'useful')}
+              />
+              <CommentFeedbackButton
+                active={comment.userFeedback === 'not_useful'}
+                count={comment.notUsefulCount}
+                icon="thumbs-down"
+                label="Not useful"
+                onPress={() => onFeedback(comment, 'not_useful')}
+              />
+            </View>
           </View>
         </View>
       </Animated.View>
@@ -888,6 +921,39 @@ function ActionTextButton({
   );
 }
 
+function CommentFeedbackButton({
+  active,
+  count,
+  icon,
+  label,
+  onPress,
+}: {
+  active: boolean;
+  count: number;
+  icon: FeatherName;
+  label: string;
+  onPress: () => void;
+}) {
+  const jelly = useJellyPressAnimation({
+    pressedScaleX: 1.08,
+    pressedScaleY: 0.9,
+  });
+  const hasCount = count > 0;
+
+  return (
+    <Pressable accessibilityRole="button" accessibilityLabel={label} onPress={onPress} onPressIn={jelly.onPressIn} onPressOut={jelly.onPressOut}>
+      <Animated.View style={[styles.commentFeedbackButton, active && styles.commentFeedbackButtonActive, jelly.animatedStyle]}>
+        <Feather color={active ? theme.colors.accentStrong : theme.colors.textSoft} name={icon} size={13} />
+        {hasCount ? (
+          <Text style={[styles.commentFeedbackCount, active && styles.commentFeedbackCountActive]}>
+            {formatCompactCount(count)}
+          </Text>
+        ) : null}
+      </Animated.View>
+    </Pressable>
+  );
+}
+
 function ActionIconButton({
   icon,
   onPress,
@@ -1009,6 +1075,24 @@ function insertReplyIntoThread(comments: AppComment[], parentId: string, reply: 
     return {
       ...comment,
       replies: insertReplyIntoThread(comment.replies, parentId, reply),
+    };
+  });
+}
+
+function updateCommentFeedbackInThread(
+  comments: AppComment[],
+  commentId: string,
+  patch: Pick<AppComment, 'usefulCount' | 'notUsefulCount' | 'userFeedback'>,
+): AppComment[] {
+  return comments.map((comment) => {
+    const nextComment = comment.id === commentId ? { ...comment, ...patch } : comment;
+    if (nextComment.replies.length === 0) {
+      return nextComment;
+    }
+
+    return {
+      ...nextComment,
+      replies: updateCommentFeedbackInThread(nextComment.replies, commentId, patch),
     };
   });
 }
@@ -1511,7 +1595,40 @@ const styles = StyleSheet.create({
   commentFooter: {
     paddingTop: 4,
     flexDirection: 'row',
-    justifyContent: 'flex-start',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  commentFeedbackGroup: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    gap: 6,
+  },
+  commentFeedbackButton: {
+    minWidth: 28,
+    height: 24,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.11)',
+    paddingHorizontal: 7,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
+    backgroundColor: 'transparent',
+  },
+  commentFeedbackButtonActive: {
+    borderColor: 'rgba(242,34,28,0.35)',
+    backgroundColor: 'rgba(242,34,28,0.04)',
+  },
+  commentFeedbackCount: {
+    color: theme.colors.textSoft,
+    fontSize: 10,
+    fontWeight: '800',
+  },
+  commentFeedbackCountActive: {
+    color: theme.colors.accentStrong,
   },
   commentAttachmentPressable: {
     alignSelf: 'flex-start',

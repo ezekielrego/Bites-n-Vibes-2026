@@ -2,6 +2,7 @@ from rest_framework import generics, status, permissions
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
+from django.contrib.auth import authenticate
 from django.contrib.auth import get_user_model
 from django.utils.crypto import get_random_string
 from django.utils import timezone
@@ -12,6 +13,11 @@ from django.conf import settings
 from django.http import HttpResponseRedirect
 from django.utils.html import strip_tags
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+import base64
+import json
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from .models import PasswordResetToken, EmailLoginToken, PushDevice
 from .serializers import (
     UserSerializer, UserRegistrationSerializer,
@@ -20,6 +26,7 @@ from .serializers import (
 )
 
 User = get_user_model()
+LOGIN_CODE_ALLOWED_CHARS = '0123456789'
 
 
 class AppSafeRedirect(HttpResponseRedirect):
@@ -53,6 +60,131 @@ def _redirect_to_auth_target(url):
     return AppSafeRedirect(url)
 
 
+def _create_email_login_code(user, request):
+    EmailLoginToken.objects.filter(
+        user=user,
+        used=False,
+        expires_at__gt=timezone.now(),
+    ).update(used=True)
+
+    for _ in range(8):
+        code = get_random_string(length=6, allowed_chars=LOGIN_CODE_ALLOWED_CHARS)
+        if not EmailLoginToken.objects.filter(token=code, used=False, expires_at__gt=timezone.now()).exists():
+            break
+    else:
+        code = get_random_string(length=8, allowed_chars=LOGIN_CODE_ALLOWED_CHARS)
+
+    ip_address = request.META.get('REMOTE_ADDR')
+    user_agent = request.META.get('HTTP_USER_AGENT', '')[:255]
+    EmailLoginToken.objects.create(
+        user=user,
+        token=code,
+        expires_at=timezone.now() + timedelta(minutes=10),
+        ip_address=ip_address,
+        user_agent=user_agent,
+    )
+    return code
+
+
+def _issue_auth_response(user, request, message='Logged in successfully'):
+    if not user.has_usable_password():
+        import string
+        default_password = get_random_string(
+            length=12,
+            allowed_chars=string.ascii_letters + string.digits + '!@#$%^&*',
+        )
+        user.set_password(default_password)
+        user.save()
+
+    refresh = RefreshToken.for_user(user)
+    return Response({
+        'user': UserSerializer(user, context={'request': request}).data,
+        'tokens': {
+            'refresh': str(refresh),
+            'access': str(refresh.access_token),
+        },
+        'message': message,
+    })
+
+
+def _load_auth_private_key():
+    private_key_pem = getattr(settings, 'AUTH_ENCRYPTION_PRIVATE_KEY', '')
+    if not private_key_pem:
+        return None
+    return serialization.load_pem_private_key(
+        private_key_pem.encode('utf-8'),
+        password=None,
+    )
+
+
+def _auth_public_key_response():
+    private_key = _load_auth_private_key()
+    if not private_key:
+        return None
+    public_pem = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode('utf-8')
+    return {
+        'key_id': getattr(settings, 'AUTH_ENCRYPTION_KEY_ID', 'auth-rsa-v1'),
+        'algorithm': 'RSA-OAEP-256/AES-256-GCM',
+        'public_key': public_pem,
+    }
+
+
+def _decrypt_auth_payload(request):
+    encrypted_key = (request.data.get('encrypted_key') or '').strip()
+    iv = (request.data.get('iv') or '').strip()
+    ciphertext = (request.data.get('ciphertext') or '').strip()
+    tag = (request.data.get('tag') or '').strip()
+    encrypted_payload = (request.data.get('encrypted_payload') or '').strip()
+
+    if not encrypted_payload and not (encrypted_key and iv and ciphertext and tag):
+        return None
+
+    request_key_id = (request.data.get('key_id') or '').strip()
+    expected_key_id = getattr(settings, 'AUTH_ENCRYPTION_KEY_ID', 'auth-rsa-v1')
+    if request_key_id and request_key_id != expected_key_id:
+        raise ValueError('Unsupported encryption key')
+
+    private_key = _load_auth_private_key()
+    if not private_key:
+        raise ValueError('Login encryption is not configured')
+
+    if encrypted_key:
+        aes_key = private_key.decrypt(
+            base64.b64decode(encrypted_key),
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            ),
+        )
+        decrypted = AESGCM(aes_key).decrypt(
+            base64.b64decode(iv),
+            base64.b64decode(ciphertext) + base64.b64decode(tag),
+            None,
+        )
+    else:
+        decrypted = private_key.decrypt(
+            base64.b64decode(encrypted_payload),
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            ),
+        )
+    payload = json.loads(decrypted.decode('utf-8'))
+    if not isinstance(payload, dict):
+        raise ValueError('Invalid encrypted login payload')
+    return payload
+
+
+def _auth_request_data(request):
+    payload = _decrypt_auth_payload(request)
+    return payload if payload is not None else request.data
+
+
 class UserRegistrationView(generics.CreateAPIView):
     """Register a new user."""
     queryset = User.objects.all()
@@ -75,6 +207,54 @@ class UserRegistrationView(generics.CreateAPIView):
             },
             'message': 'User registered successfully'
         }, status=status.HTTP_201_CREATED)
+
+
+@api_view(['GET'])
+@permission_classes([permissions.AllowAny])
+def auth_encryption_key(request):
+    """Return the public key used by the app to encrypt login payloads."""
+    payload = _auth_public_key_response()
+    if not payload:
+        return Response(
+            {'detail': 'Login encryption is not configured.'},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    return Response(payload, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([permissions.AllowAny])
+def encrypted_password_login(request):
+    """Decrypt and process email/password login."""
+    try:
+        payload = _decrypt_auth_payload(request)
+    except Exception:
+        return Response(
+            {'detail': 'Encrypted login payload could not be read.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    email = (payload or {}).get('email', '').strip().lower()
+    password = (payload or {}).get('password', '')
+    if not email or not password:
+        return Response(
+            {'detail': 'Email and password are required.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    user = authenticate(request, username=email, password=password)
+    if not user:
+        return Response(
+            {'detail': 'Email or password is incorrect.'},
+            status=status.HTTP_401_UNAUTHORIZED,
+        )
+    if not user.is_active:
+        return Response(
+            {'detail': 'This account is disabled.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    return _issue_auth_response(user, request)
 
 
 @api_view(['POST'])
@@ -638,9 +818,17 @@ def google_login(request):
 @api_view(['POST'])
 @permission_classes([permissions.AllowAny])
 def email_login_request(request):
-    """Request email login magic link."""
-    email = request.data.get('email', '').strip().lower()
-    redirect_to = _resolve_auth_redirect(request.data.get('redirect_to'), '/auth/login')
+    """Request email login code."""
+    try:
+        payload = _auth_request_data(request)
+    except Exception:
+        return Response(
+            {'detail': 'Encrypted login payload could not be read.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    email = payload.get('email', '').strip().lower()
+    redirect_to = _resolve_auth_redirect(payload.get('redirect_to'), '/auth/login')
     
     if not email:
         return Response(
@@ -658,34 +846,38 @@ def email_login_request(request):
             is_active=True
         )
     
-    # Generate login token
-    token = get_random_string(length=64)
-    expires_at = timezone.now() + timedelta(minutes=15)  # 15 minute expiry
-    
-    # Get client info for security
-    ip_address = request.META.get('REMOTE_ADDR')
-    user_agent = request.META.get('HTTP_USER_AGENT', '')[:255]
-    
-    EmailLoginToken.objects.create(
-        user=user,
-        token=token,
-        expires_at=expires_at,
-        ip_address=ip_address,
-        user_agent=user_agent
+    code = _create_email_login_code(user, request)
+    login_link = _append_query_params(redirect_to, {'code': code, 'email': email})
+
+    subject = 'Your Bites n Vibes login code'
+    html_message = f"""
+        <html>
+          <body style="font-family: Arial, sans-serif; background: #0b0f17; color: #f7f8fb; padding: 24px;">
+            <div style="max-width: 520px; margin: 0 auto; background: #111827; border-radius: 18px; padding: 28px; border: 1px solid rgba(255,255,255,0.08);">
+              <p style="margin: 0 0 16px; color: #a7b0c2;">Bites &amp; Vibes</p>
+              <h1 style="margin: 0 0 12px; font-size: 24px; color: #ffffff;">Your login code</h1>
+              <p style="margin: 0 0 18px; line-height: 1.6; color: #d7dce7;">
+                Enter this code in the app to sign in. It expires in 10 minutes.
+              </p>
+              <p style="margin: 24px 0; font-size: 34px; letter-spacing: 8px; font-weight: 800; color: #ffffff;">
+                {code}
+              </p>
+              <p style="margin: 0 0 18px; line-height: 1.6; color: #a7b0c2;">
+                If the app also opens this link, you can continue there: <a href="{login_link}" style="color: #ff6b3d;">Open Bites &amp; Vibes</a>
+              </p>
+              <p style="margin: 0; line-height: 1.6; color: #a7b0c2;">
+                If you did not request this, you can ignore this email.
+              </p>
+            </div>
+          </body>
+        </html>
+    """
+    text_message = (
+        f'Your Bites & Vibes login code is {code}.\n'
+        'Enter it in the app within 10 minutes.\n\n'
+        f'App link: {login_link}\n\n'
+        'If you did not request this, you can ignore this email.'
     )
-    
-    # Create login link
-    login_link = _append_query_params(redirect_to, {'token': token})
-    
-    # Send email with HTML template
-    subject = 'Your Bites n Vibes Login Link'
-    html_message = render_to_string('accounts/email_login.html', {
-        'user': user,
-        'login_link': login_link,
-        'expires_minutes': 15,
-        'frontend_url': settings.FRONTEND_URL,
-    })
-    text_message = strip_tags(html_message)
     
     email_msg = EmailMultiAlternatives(
         subject=subject,
@@ -697,10 +889,54 @@ def email_login_request(request):
     email_msg.attach_alternative(html_message, "text/html")
     email_msg.send(fail_silently=False)
     
-    # Don't reveal if user exists
     return Response({
-        'message': 'If the email exists, a login link has been sent to your email'
+        'message': 'Enter the 6-digit code sent to your email.'
     })
+
+
+@api_view(['POST'])
+@permission_classes([permissions.AllowAny])
+def email_login_verify_code(request):
+    """Verify email login code and return JWT tokens."""
+    try:
+        payload = _auth_request_data(request)
+    except Exception:
+        return Response(
+            {'detail': 'Encrypted login payload could not be read.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    email = payload.get('email', '').strip().lower()
+    code = ''.join(char for char in payload.get('code', '').strip() if char.isdigit())
+
+    if not email:
+        return Response(
+            {'email': 'Email is required'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    if len(code) < 6:
+        return Response(
+            {'code': 'Enter the 6-digit code'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    try:
+        login_token = EmailLoginToken.objects.select_related('user').get(
+            user__email=email,
+            token=code,
+            used=False,
+            expires_at__gt=timezone.now()
+        )
+
+        login_token.used = True
+        login_token.save(update_fields=['used'])
+        return _issue_auth_response(login_token.user, request)
+    except EmailLoginToken.DoesNotExist:
+        return Response(
+            {'code': 'Invalid or expired login code'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
 
 
 @api_view(['POST'])
@@ -771,31 +1007,8 @@ def email_login_verify(request):
         
         # Mark token as used
         login_token.used = True
-        login_token.save()
-        
-        # Set a default password if user doesn't have one
-        # This allows them to use email/password login next time
-        if not user.has_usable_password():
-            # Generate a secure random password (12 characters with letters, digits, and special chars)
-            import string
-            default_password = get_random_string(
-                length=12,
-                allowed_chars=string.ascii_letters + string.digits + '!@#$%^&*'
-            )
-            user.set_password(default_password)
-            user.save()
-        
-        # Generate JWT tokens
-        refresh = RefreshToken.for_user(user)
-        
-        return Response({
-            'user': UserSerializer(user, context={'request': request}).data,
-            'tokens': {
-                'refresh': str(refresh),
-                'access': str(refresh.access_token),
-            },
-            'message': 'Logged in successfully'
-        })
+        login_token.save(update_fields=['used'])
+        return _issue_auth_response(user, request)
     except EmailLoginToken.DoesNotExist:
         return Response(
             {'token': 'Invalid or expired login link'},

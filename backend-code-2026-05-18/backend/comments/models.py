@@ -75,6 +75,33 @@ class Comment(models.Model):
         return self.replies.filter(is_deleted=False).count()
 
 
+class CommentFeedback(models.Model):
+    """Useful / not useful feedback for comments."""
+    VOTE_USEFUL = 'useful'
+    VOTE_NOT_USEFUL = 'not_useful'
+    VOTE_CHOICES = [
+        (VOTE_USEFUL, 'Useful'),
+        (VOTE_NOT_USEFUL, 'Not useful'),
+    ]
+
+    comment = models.ForeignKey(Comment, on_delete=models.CASCADE, related_name='feedbacks')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='comment_feedbacks')
+    vote = models.CharField(max_length=16, choices=VOTE_CHOICES)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'comment_feedbacks'
+        unique_together = ('comment', 'user')
+        indexes = [
+            models.Index(fields=['comment', 'vote']),
+            models.Index(fields=['user', 'updated_at']),
+        ]
+
+    def __str__(self):
+        return f"{self.user_id} {self.vote} comment {self.comment_id}"
+
+
 # File size validator for comment attachments (20MB max)
 def validate_comment_file_size(value):
     max_size = 20 * 1024 * 1024  # 20MB

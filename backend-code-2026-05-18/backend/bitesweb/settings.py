@@ -11,6 +11,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = config('SECRET_KEY', default='django-insecure-change-this-in-production-2024')
+AUTH_ENCRYPTION_PRIVATE_KEY = config('AUTH_ENCRYPTION_PRIVATE_KEY', default='').replace('\\n', '\n').strip()
+AUTH_ENCRYPTION_KEY_ID = config('AUTH_ENCRYPTION_KEY_ID', default='auth-rsa-v1')
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = config('DEBUG', default=True, cast=bool)

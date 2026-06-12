@@ -1,6 +1,6 @@
 {
   "name": "bitesapp26",
-  "version": "1.0.0",
+  "version": "1.1.2",
   "private": true,
   "main": "index.ts",
   "scripts": {
@@ -10,18 +10,21 @@
     "web": "expo start --web",
     "typecheck": "tsc --noEmit",
     "build:apk": "eas build --platform android --profile preview",
-    "build:aab": "eas build --platform android --profile production"
+    "build:aab": "eas build --platform android --profile production",
+    "build:aas": "eas build --platform android --profile production"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",
     "@lottiefiles/dotlottie-react": "^0.13.5",
     "@react-native-community/datetimepicker": "8.4.4",
+    "@types/node-forge": "^1.3.14",
     "@urql/core": "^5.2.0",
     "@urql/exchange-retry": "^1.3.2",
     "expo": "~54.0.33",
     "expo-av": "~16.0.8",
     "expo-camera": "~17.0.10",
     "expo-constants": "~18.0.13",
+    "expo-crypto": "~15.0.9",
     "expo-dev-client": "~6.0.21",
     "expo-device": "~8.0.10",
     "expo-file-system": "~19.0.22",
@@ -38,6 +41,7 @@
     "expo-video-thumbnails": "~10.0.8",
     "expo-web-browser": "~15.0.11",
     "lottie-react-native": "~7.3.1",
+    "node-forge": "^1.4.0",
     "react": "19.1.0",
     "react-dom": "^19.1.0",
     "react-native": "0.81.5",

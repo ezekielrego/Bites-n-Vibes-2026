@@ -849,6 +849,7 @@ class ListingViewSet(viewsets.ModelViewSet):
                         'rating': RatingSerializer(rating).data,
                         'average_rating': listing.average_rating,
                         'rating_count': listing.rating_count,
+                        'user_rating': rating.rating,
                     },
                     status=status.HTTP_201_CREATED,
                 )
@@ -947,6 +948,7 @@ class ListingViewSet(viewsets.ModelViewSet):
         
         serializer = VibeSerializer(vibe)
         return Response({
+            'listing_id': listing.id,
             'vibe': serializer.data,
             'vibe_percentage': vibe_percentage,
             'vibe_count': total_vibes,

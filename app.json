@@ -1,13 +1,13 @@
 {
   "expo": {
-    "name": "bites n vibes",
+    "name": "Bites n Vibes",
     "slug": "bitesapp26",
     "scheme": "bitesnvibes",
-    "version": "1.0.0",
+    "version": "1.1.2",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "newArchEnabled": true,
-    "icon": "./logo.png",
+    "icon": "./app-icon.png",
     "splash": {
       "image": "./logo.png",
       "resizeMode": "contain",
@@ -15,17 +15,17 @@
     },
     "ios": {
       "supportsTablet": false,
-      "buildNumber": "1",
+      "buildNumber": "4",
       "bundleIdentifier": "zw.co.bitesnvibes.app"
     },
     "android": {
       "package": "zw.co.bitesnvibes.app",
-      "versionCode": 1,
+      "versionCode": 4,
       "googleServicesFile": "./google-services.json",
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
       "adaptiveIcon": {
-        "foregroundImage": "./logo.png",
+        "foregroundImage": "./app-icon.png",
         "backgroundColor": "#0A0D13"
       }
     },
@@ -46,6 +46,12 @@
         {
           "photosPermission": "Allow Bites & Vibes to access your photos so ticket images can be saved.",
           "savePhotosPermission": "Allow Bites & Vibes to save ticket images to your phone."
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Allow Bites & Vibes to use your location to show nearby listings and distances."
         }
       ],
       "expo-web-browser"

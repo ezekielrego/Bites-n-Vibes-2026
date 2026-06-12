@@ -26,6 +26,7 @@ import {
   UpdateProfileInput,
 } from './types';
 import { API_ROOT, BACKEND_ORIGIN } from './config';
+import { encryptAuthPayload } from './authEncryption';
 import {
   clearStoredSessionTokens,
   readStoredSessionTokens,
@@ -93,6 +94,9 @@ type BackendListing = {
   is_featured?: boolean;
   is_verified?: boolean;
   vibe_percentage?: number;
+  vibe_count?: number;
+  user_is_vibing?: boolean | null;
+  user_rating?: number | null;
   created_at?: string;
   user_has_saved?: boolean;
   saved_count?: number;
@@ -161,8 +165,18 @@ type BackendComment = {
   is_pinned: boolean;
   depth: number;
   reply_count: number;
+  useful_count?: number;
+  not_useful_count?: number;
+  user_feedback?: AppComment['userFeedback'];
   created_at: string;
   updated_at: string;
+};
+
+type CommentFeedbackResponse = {
+  comment_id: number | string;
+  useful_count: number;
+  not_useful_count: number;
+  user_feedback?: AppComment['userFeedback'];
 };
 
 type BackendPaginatedResponse<T> = {
@@ -264,12 +278,25 @@ type ToggleSaveResponse = {
 type RatingResponse = {
   average_rating: number;
   rating_count: number;
+  user_rating?: number | null;
+  rating?: {
+    rating?: number | null;
+  };
+};
+
+type VibeResponse = {
+  listing_id?: number;
+  vibe_percentage: number;
+  vibe_count: number;
+  is_vibing: boolean;
 };
 
 let accessToken = '';
 let refreshToken = '';
 
-export async function restoreStoredSession() {
+class SessionExpiredError extends Error {}
+
+export async function restoreStoredSession(): Promise<AppUser | { stored: true } | null> {
   const stored = await readStoredSessionTokens();
   if (!stored) {
     return null;
@@ -281,14 +308,17 @@ export async function restoreStoredSession() {
   try {
     return await fetchUserProfile();
   } catch (error) {
-    await signOut();
-    return null;
+    return accessToken && refreshToken ? { stored: true } : null;
   }
 }
 
-export async function signInWithStoredTokens(tokens: { access: string; refresh: string }) {
+export async function signInWithStoredTokens(tokens: { access: string; refresh: string }): Promise<AppUser | { stored: true } | null> {
   await persistSessionTokens(tokens);
-  return fetchUserProfile();
+  try {
+    return await fetchUserProfile();
+  } catch (error) {
+    return accessToken && refreshToken ? { stored: true } : null;
+  }
 }
 
 export async function initializeAppSession() {
@@ -298,10 +328,19 @@ export async function initializeAppSession() {
 }
 
 export async function requestEmailMagicLink(email: string, redirectTo: string) {
-  return postJson<MessageResponse>('/auth/email-login/', {
+  return encryptedPostJson<MessageResponse>('/auth/email-login/', {
     email,
     redirect_to: redirectTo,
   });
+}
+
+export async function verifyEmailLoginCode(email: string, code: string) {
+  const session = await encryptedPostJson<AuthResponse>('/auth/email-login/verify-code/', {
+    email,
+    code,
+  });
+  await persistSessionTokens(session.tokens);
+  return session.user ? mapUser(session.user) : fetchUserProfile();
 }
 
 export async function requestPasswordReset(email: string, redirectTo: string) {
@@ -320,19 +359,12 @@ export async function confirmPasswordReset(token: string, password: string, pass
 }
 
 export async function signInWithPassword(email: string, password: string) {
-  const response = await fetch(`${API_ROOT}/auth/token/`, {
-    method: 'POST',
-    headers: buildHeaders(undefined, { includeJsonContentType: true, includeAuth: false }),
-    body: JSON.stringify({ email, password }),
+  const session = await encryptedPostJson<AuthResponse>('/auth/encrypted-login/', {
+    email,
+    password,
   });
-
-  if (!response.ok) {
-    throw new Error('Email or password is incorrect. You can also use a login link.');
-  }
-
-  const tokens = (await response.json()) as TokenPairResponse;
-  await persistSessionTokens(tokens);
-  return fetchUserProfile();
+  await persistSessionTokens(session.tokens);
+  return session.user ? mapUser(session.user) : fetchUserProfile();
 }
 
 export async function verifyEmailMagicLink(token: string) {
@@ -599,6 +631,20 @@ export async function toggleSavedListing(eventId: string) {
   };
 }
 
+export async function toggleEventVibe(eventId: string, nextIsVibing: boolean) {
+  const response = await apiFetchJson<VibeResponse>(`/listings/${eventId}/toggle_vibe/`, {
+    method: 'POST',
+    body: JSON.stringify({ is_vibing: nextIsVibing }),
+  });
+
+  return {
+    eventId: String(response.listing_id ?? eventId),
+    isVibing: response.is_vibing,
+    vibeCount: response.vibe_count,
+    vibePercentage: response.vibe_percentage,
+  };
+}
+
 export async function submitEventRating(eventId: string, rating: number) {
   const response = await apiFetchJson<RatingResponse>(`/listings/${eventId}/ratings/`, {
     method: 'POST',
@@ -608,6 +654,7 @@ export async function submitEventRating(eventId: string, rating: number) {
   return {
     averageRating: response.average_rating,
     ratingCount: response.rating_count,
+    userRating: response.user_rating ?? response.rating?.rating ?? rating,
   };
 }
 
@@ -699,6 +746,20 @@ export async function createListingComment(input: CreateAppCommentInput) {
   }
 }
 
+export async function toggleCommentFeedback(commentId: string, vote: NonNullable<AppComment['userFeedback']>) {
+  const payload = await apiFetchJson<CommentFeedbackResponse>(`/comments/${commentId}/feedback/`, {
+    method: 'POST',
+    body: JSON.stringify({ vote }),
+  });
+
+  return {
+    commentId: String(payload.comment_id),
+    usefulCount: payload.useful_count ?? 0,
+    notUsefulCount: payload.not_useful_count ?? 0,
+    userFeedback: payload.user_feedback ?? null,
+  };
+}
+
 export async function markNotificationRead(notificationId: string) {
   await apiFetchJson(`/notifications/${notificationId}/mark_read/`, {
     method: 'POST',
@@ -707,6 +768,18 @@ export async function markNotificationRead(notificationId: string) {
 
 export async function markAllNotificationsRead() {
   await apiFetchJson('/notifications/mark_all_read/', {
+    method: 'POST',
+  });
+}
+
+export async function deleteNotification(notificationId: string) {
+  await apiFetch(`/notifications/${notificationId}/`, {
+    method: 'DELETE',
+  });
+}
+
+export async function clearNotifications() {
+  return apiFetchJson<{ message: string; deleted_count: number }>('/notifications/clear/', {
     method: 'POST',
   });
 }
@@ -1037,6 +1110,21 @@ async function postJson<T>(path: string, body: Record<string, unknown>) {
   return (await response.json()) as T;
 }
 
+async function encryptedPostJson<T>(path: string, body: Record<string, unknown>) {
+  const encryptedBody = await encryptAuthPayload(body);
+  const response = await fetch(`${API_ROOT}${path}`, {
+    method: 'POST',
+    headers: buildHeaders(undefined, { includeJsonContentType: true, includeAuth: false }),
+    body: JSON.stringify(encryptedBody),
+  });
+
+  if (!response.ok) {
+    throw new Error(await readApiErrorMessage(response));
+  }
+
+  return (await response.json()) as T;
+}
+
 async function apiFetch(path: string, init: RequestInit = {}) {
   const isFormData = typeof FormData !== 'undefined' && init.body instanceof FormData;
   const response = await fetch(`${API_ROOT}${path}`, {
@@ -1051,16 +1139,7 @@ async function apiFetch(path: string, init: RequestInit = {}) {
     return response;
   }
 
-  try {
-    const refreshed = await postJson<RefreshResponse>('/auth/token/refresh/', { refresh: refreshToken });
-    await persistSessionTokens({
-      access: refreshed.access ?? '',
-      refresh: refreshed.refresh ?? refreshToken,
-    });
-  } catch (error) {
-    await signOut();
-    throw error;
-  }
+  await refreshSessionTokens();
 
   const retry = await fetch(`${API_ROOT}${path}`, {
     ...init,
@@ -1072,6 +1151,36 @@ async function apiFetch(path: string, init: RequestInit = {}) {
   }
 
   return retry;
+}
+
+async function refreshSessionTokens() {
+  try {
+    const response = await fetch(`${API_ROOT}/auth/token/refresh/`, {
+      method: 'POST',
+      headers: buildHeaders(undefined, { includeJsonContentType: true, includeAuth: false }),
+      body: JSON.stringify({ refresh: refreshToken }),
+    });
+
+    if (!response.ok) {
+      const message = await readApiErrorMessage(response);
+      if (response.status === 400 || response.status === 401 || response.status === 403) {
+        await signOut();
+        throw new SessionExpiredError(message);
+      }
+      throw new Error(message);
+    }
+
+    const refreshed = (await response.json()) as RefreshResponse;
+    await persistSessionTokens({
+      access: refreshed.access ?? '',
+      refresh: refreshed.refresh ?? refreshToken,
+    });
+  } catch (error) {
+    if (error instanceof SessionExpiredError) {
+      throw error;
+    }
+    throw error instanceof Error ? error : new Error('Unable to refresh your session.');
+  }
 }
 
 async function persistSessionTokens(tokens: { access: string; refresh: string }) {
@@ -1432,6 +1541,9 @@ function mapListingToEvent(listing: BackendListing, categoryLookup: Map<string, 
     socials,
     isSaved: Boolean(listing.user_has_saved),
     saveCount: listing.saved_count ?? 0,
+    isVibing: listing.user_is_vibing ?? null,
+    vibeCount: listing.vibe_count ?? 0,
+    userRating: listing.user_rating ?? null,
     hasTicket: Boolean((listing as BackendListing & { user_has_ticket?: boolean }).user_has_ticket),
     acceptsInternalPayments: listing.accepts_internal_payments !== false,
     ownerName: listing.owner_name ?? null,
@@ -1538,6 +1650,9 @@ function mapComment(comment: BackendComment): AppComment {
     isPinned: comment.is_pinned,
     depth: comment.depth ?? 0,
     replyCount: comment.reply_count ?? 0,
+    usefulCount: comment.useful_count ?? 0,
+    notUsefulCount: comment.not_useful_count ?? 0,
+    userFeedback: comment.user_feedback ?? null,
     createdAt: comment.created_at,
     updatedAt: comment.updated_at,
   };

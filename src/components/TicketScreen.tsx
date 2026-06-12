@@ -1,5 +1,6 @@
 import React, { useMemo, useRef, useState } from 'react';
-import { Alert, Modal, Platform, RefreshControl, ScrollView, Share, StyleSheet, Text, View } from 'react-native';
+import { Modal, Platform, Pressable, RefreshControl, ScrollView, Share, StyleSheet, Text, View } from 'react-native';
+import { Feather } from '@expo/vector-icons';
 import { Image } from 'expo-image';
 import * as MediaLibrary from 'expo-media-library';
 import QRCode from 'react-native-qrcode-svg';
@@ -8,6 +9,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { BARCODE_PATTERN } from '../constants';
 import { theme, shadow } from '../theme';
 import { AppEvent, AppTicket } from '../types';
+import { showAppToast } from '../toast';
 import { IconButton, PrimaryButton, SecondaryButton } from './Primitives';
 
 export function TicketScreen({
@@ -32,9 +34,11 @@ export function TicketScreen({
   const [saving, setSaving] = useState(false);
   const [accepting, setAccepting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
+  const [requestOpen, setRequestOpen] = useState(false);
   const ticketCaptureRef = useRef<View>(null);
   const ticketCode = ticket?.referenceCode ?? `BNV-${event.id}`;
   const qrValue = ticket?.qrValue ?? `BNV:${ticketCode}:${event.id}`;
+  const requestNote = ticket?.requestNote?.trim() || 'None';
   const shareMessage = useMemo(
     () =>
       `${event.title}\n${event.venue} • ${event.dateLabel} • ${event.time}\nReference: ${ticketCode}\nQR: ${qrValue}`,
@@ -54,6 +58,11 @@ export function TicketScreen({
     try {
       if (Platform.OS === 'web') {
         await handleShare();
+        showAppToast({
+          tone: 'info',
+          title: 'Ticket shared',
+          message: 'Use the shared ticket details as your saved copy.',
+        });
         return;
       }
 
@@ -73,9 +82,17 @@ export function TicketScreen({
       });
       await MediaLibrary.saveToLibraryAsync(capturedUri);
 
-      Alert.alert('Saved', 'The ticket image with its QR code is now in your library.');
+      showAppToast({
+        tone: 'success',
+        title: 'Image saved',
+        message: 'The ticket image with its QR code is in your library.',
+      });
     } catch (error) {
-      Alert.alert('Save failed', error instanceof Error ? error.message : 'The ticket image could not be saved right now.');
+      showAppToast({
+        tone: 'error',
+        title: 'Save failed',
+        message: error instanceof Error ? error.message : 'The ticket image could not be saved right now.',
+      });
     } finally {
       setSaving(false);
     }
@@ -90,7 +107,11 @@ export function TicketScreen({
     try {
       await onCancelTicket(ticket);
     } catch (error) {
-      Alert.alert('Cancellation failed', error instanceof Error ? error.message : 'The ticket could not be cancelled right now.');
+      showAppToast({
+        tone: 'error',
+        title: 'Cancellation failed',
+        message: error instanceof Error ? error.message : 'The ticket could not be cancelled right now.',
+      });
     } finally {
       setCancelling(false);
     }
@@ -105,15 +126,20 @@ export function TicketScreen({
     try {
       await onAcceptTicket(ticket);
     } catch (error) {
-      Alert.alert('Accept failed', error instanceof Error ? error.message : 'The booking could not be accepted right now.');
+      showAppToast({
+        tone: 'error',
+        title: 'Confirm failed',
+        message: error instanceof Error ? error.message : 'The booking could not be confirmed right now.',
+      });
     } finally {
       setAccepting(false);
     }
   };
 
   return (
-    <>
+    <View style={styles.container}>
       <ScrollView
+        style={styles.scroll}
         contentContainerStyle={[
           styles.content,
           { paddingTop: insets.top + 8, paddingBottom: insets.bottom + 28 },
@@ -130,7 +156,7 @@ export function TicketScreen({
         showsVerticalScrollIndicator={false}
       >
         <View style={styles.header}>
-          <IconButton icon="chevron-left" onPress={onBack} accessibilityLabel="Go back" />
+          <IconButton icon="x" onPress={onBack} accessibilityLabel="Close ticket" />
           <Text style={styles.headerTitle}>Ticket</Text>
           <IconButton icon="share-2" onPress={() => void handleShare()} accessibilityLabel="Share ticket" />
         </View>
@@ -160,9 +186,14 @@ export function TicketScreen({
                 <TicketField label="Paid" value={ticket ? `${ticket.currency} ${ticket.totalAmount}` : event.price} />
                 <TicketField label="Payment" value={ticket?.paymentStatus ?? 'not_required'} rightAligned />
                 <TicketField label="Quantity" value={String(ticket?.quantity ?? 1)} />
-                <TicketField label="Request" value={ticket?.requestNote || 'None'} rightAligned />
+                <TicketField
+                  label="Request"
+                  value={requestNote}
+                  rightAligned
+                  onPress={requestNote !== 'None' ? () => setRequestOpen(true) : undefined}
+                />
                 <TicketField label="Reference" value={ticketCode} />
-                <TicketField label="Status" value={ticket?.status ?? 'confirmed'} rightAligned />
+                <TicketField label="Status" value={formatTicketStatus(ticket?.status)} rightAligned />
               </View>
 
               <View style={styles.dashedLine} />
@@ -216,11 +247,17 @@ export function TicketScreen({
                 onPress={() => void handleAccept()}
               />
             ) : null}
-            <SecondaryButton
-              label={cancelling ? 'Cancelling...' : 'Cancel ticket'}
-              icon="x"
+            <Pressable
+              accessibilityRole="button"
+              disabled={cancelling}
               onPress={() => void handleCancel()}
-            />
+              style={styles.cancelTextAction}
+            >
+              <Feather color={theme.colors.accentStrong} name="x" size={14} />
+              <Text style={[styles.cancelTextActionLabel, cancelling && styles.cancelTextActionLabelDisabled]}>
+                {cancelling ? 'Cancelling...' : 'Cancel ticket'}
+              </Text>
+            </Pressable>
           </View>
         ) : null}
       </ScrollView>
@@ -242,7 +279,24 @@ export function TicketScreen({
           </View>
         </View>
       </Modal>
-    </>
+
+      <Modal animationType="fade" transparent visible={requestOpen} onRequestClose={() => setRequestOpen(false)}>
+        <Pressable style={styles.requestModalScrim} onPress={() => setRequestOpen(false)}>
+          <Pressable style={[styles.requestModalCard, { marginTop: insets.top + 24, marginBottom: insets.bottom + 24 }]}>
+            <View style={styles.requestModalHeader}>
+              <View>
+                <Text style={styles.requestModalEyebrow}>Customer request</Text>
+                <Text style={styles.requestModalTitle}>Message to host</Text>
+              </View>
+              <IconButton icon="x" onPress={() => setRequestOpen(false)} accessibilityLabel="Close request message" />
+            </View>
+            <ScrollView showsVerticalScrollIndicator={false}>
+              <Text style={styles.requestModalText}>{requestNote}</Text>
+            </ScrollView>
+          </Pressable>
+        </Pressable>
+      </Modal>
+    </View>
   );
 }
 
@@ -259,26 +313,72 @@ function formatTicketAction(action?: AppTicket['actionType']) {
   return 'Pass';
 }
 
+function formatTicketStatus(status?: AppTicket['status']) {
+  switch (status) {
+    case 'requested':
+      return 'In review';
+    case 'pending':
+      return 'Payment pending';
+    case 'confirmed':
+    case 'accepted':
+      return 'Accepted';
+    case 'used':
+      return 'Used';
+    case 'cancelled':
+      return 'Cancelled';
+    case 'failed':
+      return 'Failed';
+    case 'expired':
+      return 'Expired';
+    default:
+      return 'Accepted';
+  }
+}
+
 function TicketField({
   label,
+  onPress,
   value,
   rightAligned = false,
 }: {
   label: string;
+  onPress?: () => void;
   value: string;
   rightAligned?: boolean;
 }) {
-  return (
-    <View style={[styles.field, rightAligned && styles.fieldRight]}>
+  const content = (
+    <>
       <Text style={styles.fieldLabel}>{label}</Text>
-      <Text numberOfLines={2} style={styles.fieldValue}>
+      <Text numberOfLines={2} style={[styles.fieldValue, onPress && styles.fieldValuePressable]}>
         {value}
       </Text>
+    </>
+  );
+
+  if (onPress) {
+    return (
+      <Pressable accessibilityRole="button" onPress={onPress} style={[styles.field, rightAligned && styles.fieldRight]}>
+        {content}
+      </Pressable>
+    );
+  }
+
+  return (
+    <View style={[styles.field, rightAligned && styles.fieldRight]}>
+      {content}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: theme.colors.background,
+  },
+  scroll: {
+    flex: 1,
+    backgroundColor: theme.colors.background,
+  },
   content: {
     paddingHorizontal: 4,
   },
@@ -381,6 +481,10 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '700',
   },
+  fieldValuePressable: {
+    textDecorationLine: 'underline',
+    textDecorationColor: 'rgba(27,23,20,0.32)',
+  },
   barcodeWrap: {
     height: 74,
     flexDirection: 'row',
@@ -433,8 +537,24 @@ const styles = StyleSheet.create({
     gap: 12,
   },
   cancelWrap: {
-    marginTop: 12,
+    marginTop: 22,
     gap: 12,
+    alignItems: 'center',
+  },
+  cancelTextAction: {
+    minHeight: 34,
+    paddingHorizontal: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+  },
+  cancelTextActionLabel: {
+    color: theme.colors.accentStrong,
+    fontSize: 13,
+    fontWeight: '900',
+  },
+  cancelTextActionLabelDisabled: {
+    color: theme.colors.textSoft,
   },
   modalScrim: {
     flex: 1,
@@ -477,5 +597,45 @@ const styles = StyleSheet.create({
     color: theme.colors.textMuted,
     fontSize: 12,
     textAlign: 'center',
+  },
+  requestModalScrim: {
+    flex: 1,
+    backgroundColor: 'rgba(4,7,13,0.72)',
+    justifyContent: 'center',
+    paddingHorizontal: 18,
+  },
+  requestModalCard: {
+    maxHeight: '76%',
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.1)',
+    backgroundColor: 'rgba(12,15,23,0.98)',
+    padding: 16,
+    gap: 14,
+    ...shadow,
+  },
+  requestModalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  requestModalEyebrow: {
+    color: theme.colors.accentStrong,
+    fontSize: 11,
+    fontWeight: '900',
+    textTransform: 'uppercase',
+    letterSpacing: 0.7,
+  },
+  requestModalTitle: {
+    color: theme.colors.text,
+    fontSize: 18,
+    fontWeight: '900',
+  },
+  requestModalText: {
+    color: theme.colors.text,
+    fontSize: 15,
+    lineHeight: 22,
+    fontWeight: '600',
   },
 });

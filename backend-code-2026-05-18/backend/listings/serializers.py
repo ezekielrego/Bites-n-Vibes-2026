@@ -97,6 +97,7 @@ class ListingSerializer(serializers.ModelSerializer):
     vibe_percentage = serializers.SerializerMethodField()
     vibe_count = serializers.SerializerMethodField()
     user_is_vibing = serializers.SerializerMethodField()
+    user_rating = serializers.SerializerMethodField()
     user_has_saved = serializers.SerializerMethodField()
     user_has_ticket = serializers.SerializerMethodField()
     owner_can_edit = serializers.SerializerMethodField()
@@ -142,14 +143,14 @@ class ListingSerializer(serializers.ModelSerializer):
             'tags', 'tags_display', 'images', 'primary_image', 'ticket_image', 'owner', 'owner_name',
             'average_rating', 'rating_count', 'comment_count',
             'vibe_percentage', 'vibe_count', 'user_is_vibing', 'user_has_saved', 'saved_count',
-            'user_has_ticket', 'owner_can_edit', 'owner_edit_expires_at',
+            'user_rating', 'user_has_ticket', 'owner_can_edit', 'owner_edit_expires_at',
             'owner_sold_count', 'owner_revenue_total',
             'tag_names', 'images_payload',
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at', 'average_rating', 'rating_count', 'comment_count',
                           'vibe_percentage', 'vibe_count', 'user_is_vibing', 'user_has_saved', 'saved_count',
-                          'user_has_ticket', 'owner_can_edit', 'owner_edit_expires_at',
+                          'user_rating', 'user_has_ticket', 'owner_can_edit', 'owner_edit_expires_at',
                           'owner_sold_count', 'owner_revenue_total',
                           'images', 'primary_image', 'ticket_image', 'tags_display']
         extra_kwargs = {
@@ -253,6 +254,14 @@ class ListingSerializer(serializers.ModelSerializer):
         if request and request.user.is_authenticated:
             vibe = obj.vibes.filter(user=request.user).first()
             return vibe.is_vibing if vibe else None
+        return None
+
+    def get_user_rating(self, obj):
+        """Return the current user's existing rating for this listing."""
+        request = self.context.get('request')
+        if request and request.user.is_authenticated:
+            rating = obj.ratings.filter(user=request.user).first()
+            return rating.rating if rating else None
         return None
 
     def get_user_has_saved(self, obj):
@@ -415,6 +424,9 @@ class ListingListSerializer(serializers.ModelSerializer):
     comment_count = serializers.SerializerMethodField()
     tags = TagSerializer(many=True, read_only=True)
     vibe_percentage = serializers.SerializerMethodField()
+    vibe_count = serializers.SerializerMethodField()
+    user_is_vibing = serializers.SerializerMethodField()
+    user_rating = serializers.SerializerMethodField()
     user_has_saved = serializers.SerializerMethodField()
     user_has_ticket = serializers.SerializerMethodField()
     owner_can_edit = serializers.SerializerMethodField()
@@ -427,7 +439,7 @@ class ListingListSerializer(serializers.ModelSerializer):
             'id', 'name', 'listing_kind', 'category_name', 'category_slug', 'category_icon',
             'address', 'phone', 'price_range', 'display_price', 'app_data',
             'primary_image', 'ticket_image', 'average_rating', 'rating_count', 'comment_count', 'is_trending', 'is_verified', 'accepts_internal_payments',
-            'tags', 'vibe_percentage', 'user_has_saved', 'user_has_ticket', 'owner_can_edit', 'owner_edit_expires_at', 'saved_count',
+            'tags', 'vibe_percentage', 'vibe_count', 'user_is_vibing', 'user_rating', 'user_has_saved', 'user_has_ticket', 'owner_can_edit', 'owner_edit_expires_at', 'saved_count',
             'owner', 'owner_name', 'created_at', 'latitude', 'longitude'
         ]
     
@@ -482,6 +494,23 @@ class ListingListSerializer(serializers.ModelSerializer):
             return 25  # Default percentage when no vibes yet
         vibing_count = obj.vibes.filter(is_vibing=True).count()
         return round((vibing_count / total_vibes) * 100)
+
+    def get_vibe_count(self, obj):
+        return obj.vibes.count()
+
+    def get_user_is_vibing(self, obj):
+        request = self.context.get('request')
+        if request and request.user.is_authenticated:
+            vibe = obj.vibes.filter(user=request.user).first()
+            return vibe.is_vibing if vibe else None
+        return None
+
+    def get_user_rating(self, obj):
+        request = self.context.get('request')
+        if request and request.user.is_authenticated:
+            rating = obj.ratings.filter(user=request.user).first()
+            return rating.rating if rating else None
+        return None
 
     def get_user_has_saved(self, obj):
         request = self.context.get('request')

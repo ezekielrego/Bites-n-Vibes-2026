@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Comment, CommentAttachment
+from .models import Comment, CommentAttachment, CommentFeedback
 
 
 class CommentAttachmentInline(admin.TabularInline):
@@ -47,4 +47,13 @@ class CommentAttachmentAdmin(admin.ModelAdmin):
     list_filter = ['attachment_type', 'created_at']
     search_fields = ['comment__message']
     raw_id_fields = ['comment']
+
+
+@admin.register(CommentFeedback)
+class CommentFeedbackAdmin(admin.ModelAdmin):
+    """Admin configuration for comment useful/not useful feedback."""
+    list_display = ['comment', 'user', 'vote', 'created_at', 'updated_at']
+    list_filter = ['vote', 'created_at']
+    search_fields = ['comment__message', 'user__email', 'user__name']
+    raw_id_fields = ['comment', 'user']
 

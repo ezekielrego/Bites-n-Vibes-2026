@@ -16,7 +16,9 @@ import {
   clearHistory,
   confirmPasswordReset,
   createEventListing,
+  clearNotifications,
   deleteEventListing,
+  deleteNotification,
   fetchAppBootstrap,
   fetchAppUpdatePolicy,
   fetchEventListing,
@@ -35,13 +37,16 @@ import {
   signInWithStoredTokens,
   signOut,
   submitEventRating,
+  toggleEventVibe,
   toggleSavedListing,
   unregisterPushDevice,
   updateEventListing,
   updateUserProfile,
+  verifyEmailLoginCode,
   verifyEmailMagicLink,
 } from './api';
 import { APP_VERSION, TAB_ITEMS } from './constants';
+import { AppToastHost } from './components/AppToast';
 import { AuthScreen } from './components/AuthScreen';
 import { BottomNav } from './components/BottomNav';
 import { OnboardingOverlay, OnboardingStage } from './components/OnboardingOverlay';
@@ -62,11 +67,13 @@ import {
   TabId,
   UpdateProfileInput,
 } from './types';
+import { showAppToast } from './toast';
 
 WebBrowser.maybeCompleteAuthSession();
 void configureNotificationHandlingAsync();
 const APP_LOGO = require('../logo.png');
 const ONBOARDING_COMPLETE_KEY = 'bites_onboarding_complete_v1';
+const PUSH_AUTO_PROMPT_KEY_PREFIX = 'bites_push_auto_prompt_v1:';
 const SHOW_ONBOARDING_EVERY_LOGIN_FOR_TESTING = false;
 
 const HomeScreen = lazy(async () => {
@@ -89,6 +96,11 @@ const NearbyScreen = lazy(async () => {
   return { default: module.NearbyScreen };
 });
 
+const SearchScreen = lazy(async () => {
+  const module = await import('./components/SearchScreen');
+  return { default: module.SearchScreen };
+});
+
 function AppContent() {
   const [authState, setAuthState] = useState<'checking' | 'signedOut' | 'signedIn'>('checking');
   const [authBusyProvider, setAuthBusyProvider] = useState<'google' | 'email' | 'password' | 'reset' | null>(null);
@@ -105,6 +117,7 @@ function AppContent() {
   const [profile, setProfile] = useState<AppUser | null>(null);
   const [unreadNotificationCount, setUnreadNotificationCount] = useState(0);
   const [currentScreen, setCurrentScreen] = useState<Screen>('home');
+  const [detailsReturnScreen, setDetailsReturnScreen] = useState<Extract<Screen, 'home' | 'nearby' | 'search'>>('home');
   const [selectedEvent, setSelectedEvent] = useState<AppEvent | null>(null);
   const [selectedTicket, setSelectedTicket] = useState<AppTicket | null>(null);
   const [activeTab, setActiveTab] = useState<TabId>('discover');
@@ -244,6 +257,7 @@ function AppContent() {
     setSelectedEvent(null);
     setSelectedTicket(null);
     setCurrentScreen('home');
+    setDetailsReturnScreen('home');
     setActiveTab('discover');
     setEditingListing(null);
     setPasswordResetToken(null);
@@ -269,13 +283,15 @@ function AppContent() {
       const queryParams = parsed.queryParams ?? {};
       const path = parsed.path ?? '';
       const token = firstStringParam(queryParams.token);
+      const code = firstStringParam(queryParams.code);
+      const email = firstStringParam(queryParams.email);
       const access = firstStringParam(queryParams.access);
       const refresh = firstStringParam(queryParams.refresh);
       const errorCode = firstStringParam(queryParams.error);
       const errorDetail = firstStringParam(queryParams.detail);
       const isResetFlow = path.includes('auth/reset');
 
-      if (!token && !(access && refresh) && !errorCode) {
+      if (!token && !(code && email) && !(access && refresh) && !errorCode) {
         return false;
       }
 
@@ -299,14 +315,21 @@ function AppContent() {
           return true;
         }
 
-        if (token) {
+        if (code && email) {
+          setAuthBusyProvider('email');
+          setAuthMessage('Finishing email sign in...');
+          await verifyEmailLoginCode(email, code);
+        } else if (token) {
           setAuthBusyProvider('email');
           setAuthMessage('Finishing email sign in...');
           await verifyEmailMagicLink(token);
         } else if (access && refresh) {
           setAuthBusyProvider('google');
           setAuthMessage('Finishing Google sign in...');
-          await signInWithStoredTokens({ access, refresh });
+          const session = await signInWithStoredTokens({ access, refresh });
+          if (!session) {
+            throw new Error('Google sign in could not keep the session. Please try again.');
+          }
         } else {
           return false;
         }
@@ -376,13 +399,22 @@ function AppContent() {
   }, [consumeAuthUrl, loadApp]);
 
   useEffect(() => {
-    if (authState !== 'signedIn' || !profile?.pushNotificationsEnabled) {
+    if (authState !== 'signedIn' || !profile) {
       return;
     }
 
     let cancelled = false;
 
     const syncPush = async () => {
+      const autoPromptKey = `${PUSH_AUTO_PROMPT_KEY_PREFIX}${profile.id}`;
+      if (!profile.pushNotificationsEnabled) {
+        const promptState = await SecureStore.getItemAsync(autoPromptKey).catch(() => null);
+        if (promptState === 'prompted' || promptState === 'disabled') {
+          return;
+        }
+        await SecureStore.setItemAsync(autoPromptKey, 'prompted').catch(() => undefined);
+      }
+
       const registration = await registerForPushNotificationsAsync();
       if (cancelled || !registration.token) {
         return;
@@ -390,6 +422,19 @@ function AppContent() {
 
       pushTokenRef.current = registration.token;
       await registerPushDevice(registration.token, registration.platform, registration.provider).catch(() => undefined);
+
+      if (!profile.pushNotificationsEnabled) {
+        const updated = await updateUserProfile({
+          name: profile.name,
+          phone: profile.phone ?? '',
+          emailNotificationsEnabled: profile.emailNotificationsEnabled,
+          pushNotificationsEnabled: true,
+        }).catch(() => null);
+        if (!cancelled && updated) {
+          await SecureStore.deleteItemAsync(autoPromptKey).catch(() => undefined);
+          setProfile(updated);
+        }
+      }
     };
 
     void syncPush();
@@ -397,7 +442,7 @@ function AppContent() {
     return () => {
       cancelled = true;
     };
-  }, [authState, profile?.id, profile?.pushNotificationsEnabled]);
+  }, [authState, profile]);
 
   const handleGoogleLogin = useCallback(async () => {
     setAuthBusyProvider('google');
@@ -426,13 +471,29 @@ function AppContent() {
     try {
       const redirectTo = ExpoLinking.createURL('auth/login');
       const response = await requestEmailMagicLink(email, redirectTo);
-      setAuthMessage(response.message ?? 'Check your email for the sign-in link.');
+      setAuthMessage(response.message ?? 'Enter the 6-digit code sent to your email.');
     } catch (error) {
-      setAuthError(error instanceof Error ? error.message : 'Unable to send your login link.');
+      setAuthError(error instanceof Error ? error.message : 'Unable to send your login code.');
     } finally {
       setAuthBusyProvider(null);
     }
   }, []);
+
+  const handleEmailCodeLogin = useCallback(async (email: string, code: string) => {
+    setAuthBusyProvider('email');
+    setAuthError(null);
+
+    try {
+      await verifyEmailLoginCode(email, code);
+      setAuthState('signedIn');
+      setAuthMessage(null);
+      await loadApp();
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'Unable to verify your login code.');
+    } finally {
+      setAuthBusyProvider(null);
+    }
+  }, [loadApp]);
 
   const handleForgotPassword = useCallback(async (email: string) => {
     setAuthBusyProvider('reset');
@@ -502,6 +563,19 @@ function AppContent() {
           : ticket,
       ),
     );
+    setReceivedTickets((current) =>
+      current.map((ticket) =>
+        ticket.eventId === eventId
+          ? {
+              ...ticket,
+              event: {
+                ...ticket.event,
+                ...patch,
+              },
+            }
+          : ticket,
+      ),
+    );
     setSelectedEvent((current) => (current?.id === eventId ? { ...current, ...patch } : current));
   }, []);
 
@@ -519,6 +593,19 @@ function AppContent() {
     setMyListings(applyUpsert);
     setHistoryEvents((current) => current.map((event) => (event.id === nextEvent.id ? nextEvent : event)));
     setTickets((current) =>
+      current.map((ticket) =>
+        ticket.eventId === nextEvent.id
+          ? {
+              ...ticket,
+              event: {
+                ...ticket.event,
+                ...nextEvent,
+              },
+            }
+          : ticket,
+      ),
+    );
+    setReceivedTickets((current) =>
       current.map((ticket) =>
         ticket.eventId === nextEvent.id
           ? {
@@ -571,6 +658,7 @@ function AppContent() {
     void recordListingView(event.id).catch(() => undefined);
     startTransition(() => {
       setSelectedEvent(event);
+      setDetailsReturnScreen(currentScreen === 'search' || currentScreen === 'nearby' ? currentScreen : 'home');
       setDirection(1);
       setCurrentScreen('details');
     });
@@ -627,16 +715,32 @@ function AppContent() {
           setCurrentScreen('ticket');
         });
         if (ticket.status === 'requested') {
-          Alert.alert('Request sent', 'The host will review your request and confirm it in the app.');
+          showAppToast({
+            tone: 'success',
+            title: 'Request sent',
+            message: 'The host will review it and confirm in the app.',
+          });
         }
       } else if (ticket.status === 'pending') {
-        Alert.alert('Payment pending', 'Approve the payment on your phone. We will keep checking and update your booking.');
+        showAppToast({
+          tone: 'info',
+          title: 'Payment pending',
+          message: 'Approve it on your phone. We will keep checking.',
+        });
       } else {
-        Alert.alert('Payment not completed', 'The payment was not completed. Please try again.');
+        showAppToast({
+          tone: 'error',
+          title: 'Payment not completed',
+          message: 'Please try again.',
+        });
       }
       return ticket;
     } catch (error) {
-      Alert.alert('Ticket not ready', error instanceof Error ? error.message : 'Unable to prepare your ticket right now.');
+      showAppToast({
+        tone: 'error',
+        title: 'Ticket not ready',
+        message: error instanceof Error ? error.message : 'Unable to prepare your ticket right now.',
+      });
       return null;
     }
   };
@@ -654,6 +758,13 @@ function AppContent() {
     startTransition(() => {
       setDirection(1);
       setCurrentScreen('nearby');
+    });
+  }, []);
+
+  const handleOpenSearch = useCallback(() => {
+    startTransition(() => {
+      setDirection(1);
+      setCurrentScreen('search');
     });
   }, []);
 
@@ -700,7 +811,11 @@ function AppContent() {
                   }
                 }
 
-                Alert.alert('Ticket updated', response.message);
+                showAppToast({
+                  tone: 'success',
+                  title: 'Ticket updated',
+                  message: response.message,
+                });
                 resolve();
               } catch (error) {
                 reject(error);
@@ -740,7 +855,11 @@ function AppContent() {
       }
     }
 
-    Alert.alert('Ticket updated', response.message);
+    showAppToast({
+      tone: 'success',
+      title: 'Ticket updated',
+      message: response.message,
+    });
   }, [categories, receivedTickets, selectedEvent?.id, tickets, updateEventState]);
 
   const handleAcceptTicket = useCallback(async (ticket: AppTicket) => {
@@ -758,13 +877,25 @@ function AppContent() {
       updateEventState(response.ticket.eventId, { hasTicket: hasConfirmed });
     }
 
-    Alert.alert('Booking confirmed', response.message);
+    showAppToast({
+      tone: 'success',
+      title: 'Booking confirmed',
+      message: response.message,
+    });
   }, [categories, receivedTickets, tickets, updateEventState]);
 
   const handleBack = () => {
     startTransition(() => {
       setDirection(-1);
-      setCurrentScreen((screen) => (screen === 'ticket' ? 'details' : 'home'));
+      setCurrentScreen((screen) => {
+        if (screen === 'ticket') {
+          return 'details';
+        }
+        if (screen === 'details') {
+          return detailsReturnScreen;
+        }
+        return 'home';
+      });
     });
   };
 
@@ -791,6 +922,37 @@ function AppContent() {
     updateEventState(result.eventId, { isSaved: result.isSaved, saveCount: result.saveCount });
   };
 
+  const handleToggleVibe = async (event: AppEvent) => {
+    const previousIsVibing = Boolean(event.isVibing);
+    const previousVibeCount = Math.max(0, event.vibeCount ?? 0);
+    const nextIsVibing = !previousIsVibing;
+    const nextVibeCount = Math.max(0, previousVibeCount + (nextIsVibing ? 1 : -1));
+
+    updateEventState(event.id, {
+      isVibing: nextIsVibing,
+      vibeCount: nextVibeCount,
+    });
+
+    try {
+      const result = await toggleEventVibe(event.id, nextIsVibing);
+      updateEventState(result.eventId, {
+        isVibing: result.isVibing,
+        vibeCount: result.vibeCount,
+        vibePercentage: result.vibePercentage,
+      });
+    } catch (error) {
+      updateEventState(event.id, {
+        isVibing: previousIsVibing,
+        vibeCount: previousVibeCount,
+      });
+      showAppToast({
+        tone: 'error',
+        title: 'Like not saved',
+        message: error instanceof Error ? error.message : 'Try again in a moment.',
+      });
+    }
+  };
+
   const handleRateEvent = async (value: number) => {
     if (!selectedEvent) {
       return;
@@ -800,6 +962,7 @@ function AppContent() {
     updateEventState(selectedEvent.id, {
       rating: result.averageRating,
       ratingCount: result.ratingCount,
+      userRating: result.userRating,
     });
   };
 
@@ -852,6 +1015,29 @@ function AppContent() {
     setNotifications((current) => current.map((notification) => ({ ...notification, isRead: true })));
     setUnreadNotificationCount(0);
   };
+
+  const handleDeleteNotification = useCallback(async (notification: AppNotification) => {
+    await deleteNotification(notification.id);
+    setNotifications((current) => current.filter((item) => item.id !== notification.id));
+    if (!notification.isRead) {
+      setUnreadNotificationCount((current) => Math.max(0, current - 1));
+    }
+    showAppToast({
+      tone: 'success',
+      title: 'Notification deleted',
+    });
+  }, []);
+
+  const handleClearNotifications = useCallback(async () => {
+    const result = await clearNotifications();
+    setNotifications([]);
+    setUnreadNotificationCount(0);
+    showAppToast({
+      tone: 'success',
+      title: 'Notifications cleared',
+      message: result.message,
+    });
+  }, []);
 
   const handleSubmitListing = async (input: CreateAppEventInput) => {
     setCreatePending(true);
@@ -921,10 +1107,11 @@ function AppContent() {
 
   const handleStartEditListing = useCallback((event: AppEvent) => {
     if (event.ownerCanEdit === false) {
-      Alert.alert(
-        'Edit window closed',
-        'Listings can only be edited within the first 48 hours after posting.',
-      );
+      showAppToast({
+        tone: 'info',
+        title: 'Edit window closed',
+        message: 'Listings can only be edited within the first 48 hours after posting.',
+      });
       return;
     }
 
@@ -983,12 +1170,15 @@ function AppContent() {
       throw new Error('Your profile is not ready yet.');
     }
 
+    const autoPromptKey = `${PUSH_AUTO_PROMPT_KEY_PREFIX}${profile.id}`;
+
     if (!enabled) {
       if (pushTokenRef.current) {
         await unregisterPushDevice(pushTokenRef.current).catch(() => undefined);
       } else {
         await unregisterPushDevice().catch(() => undefined);
       }
+      await SecureStore.setItemAsync(autoPromptKey, 'disabled').catch(() => undefined);
 
       const updated = await updateUserProfile({
         name: profile.name,
@@ -1008,6 +1198,7 @@ function AppContent() {
 
     await registerPushDevice(registration.token, registration.platform, registration.provider);
     pushTokenRef.current = registration.token;
+    await SecureStore.deleteItemAsync(autoPromptKey).catch(() => undefined);
 
     const updated = await updateUserProfile({
       name: profile.name,
@@ -1032,12 +1223,12 @@ function AppContent() {
       if (currentScreen === 'details') {
         startTransition(() => {
           setDirection(-1);
-          setCurrentScreen('home');
+          setCurrentScreen(detailsReturnScreen);
         });
         return true;
       }
 
-      if (currentScreen === 'nearby') {
+      if (currentScreen === 'nearby' || currentScreen === 'search') {
         startTransition(() => {
           setDirection(-1);
           setCurrentScreen('home');
@@ -1060,7 +1251,7 @@ function AppContent() {
     });
 
     return () => subscription.remove();
-  }, [activeTab, currentScreen]);
+  }, [activeTab, currentScreen, detailsReturnScreen]);
 
   const showStartupState = useMemo(
     () =>
@@ -1068,6 +1259,20 @@ function AppContent() {
       (authState === 'signedIn' && (isBootstrapping || (bootstrapError && events.length === 0 && myListings.length === 0))),
     [authState, bootstrapError, events.length, isBootstrapping, myListings.length],
   );
+  const showSignedInApp = authState === 'signedIn' && !showStartupState;
+  const showHomeLayer =
+    showSignedInApp &&
+    (currentScreen === 'home' ||
+      ((currentScreen === 'details' || currentScreen === 'ticket') && detailsReturnScreen === 'home'));
+  const showNearbyLayer =
+    showSignedInApp &&
+    (currentScreen === 'nearby' ||
+      ((currentScreen === 'details' || currentScreen === 'ticket') && detailsReturnScreen === 'nearby'));
+  const showSearchLayer =
+    showSignedInApp &&
+    (currentScreen === 'search' ||
+      ((currentScreen === 'details' || currentScreen === 'ticket') && detailsReturnScreen === 'search'));
+  const showDetailsLayer = showSignedInApp && selectedEvent && (currentScreen === 'details' || currentScreen === 'ticket');
 
   const handleOnboardingNext = useCallback(() => {
     setOnboardingStage('scroll');
@@ -1102,6 +1307,7 @@ function AppContent() {
             authError={authError}
             authMessage={authMessage}
             busyProvider={authBusyProvider}
+            onEmailCodeLogin={handleEmailCodeLogin}
             onEmailLogin={handleEmailLogin}
             onForgotPassword={handleForgotPassword}
             onGoogleLogin={handleGoogleLogin}
@@ -1120,8 +1326,9 @@ function AppContent() {
           )
         ) : null}
 
-        {authState === 'signedIn' && !showStartupState && currentScreen === 'home' ? (
-          <ScreenTransition key="home" direction={direction}>
+        {showHomeLayer ? (
+          <View pointerEvents={currentScreen === 'home' ? 'auto' : 'none'} style={[styles.screenLayer, styles.homeLayer]}>
+            <ScreenTransition key="home" direction={direction}>
             <Suspense fallback={<HomeScreenSkeleton activeTab={activeTab} />}>
               <HomeScreen
                 activeTab={activeTab}
@@ -1145,8 +1352,11 @@ function AppContent() {
                 onDeleteListings={handleDeleteListings}
                 onMarkAllRead={handleMarkAllRead}
                 onMarkTicketUsed={handleMarkTicketUsed}
+                onClearNotifications={handleClearNotifications}
+                onDeleteNotification={handleDeleteNotification}
                 onOpenNotification={handleOpenNotification}
                 onOpenNearby={handleOpenNearby}
+                onOpenSearch={handleOpenSearch}
                 onOpenTicket={handleOpenTicket}
                 onRemoveHistoryItem={handleRemoveHistoryItem}
                 onStartEditListing={handleStartEditListing}
@@ -1156,6 +1366,7 @@ function AppContent() {
                 onToggleEmailNotifications={handleToggleEmailNotifications}
                 onTogglePushNotifications={handleTogglePushNotifications}
                 onToggleSave={handleToggleSave}
+                onToggleVibe={handleToggleVibe}
                 onUpdateProfile={handleUpdateProfile}
                 onRefresh={handleRefreshApp}
                 onDiscoverScroll={handleOnboardingDiscoverScroll}
@@ -1169,11 +1380,45 @@ function AppContent() {
                 unreadNotificationCount={unreadNotificationCount}
               />
             </Suspense>
-          </ScreenTransition>
+            </ScreenTransition>
+          </View>
         ) : null}
 
-        {authState === 'signedIn' && !showStartupState && currentScreen === 'details' && selectedEvent ? (
-          <ScreenTransition key="details" direction={direction}>
+        {showNearbyLayer ? (
+          <View pointerEvents={currentScreen === 'nearby' ? 'auto' : 'none'} style={[styles.screenLayer, styles.baseScreenLayer]}>
+            <ScreenTransition key="nearby" direction={direction}>
+              <Suspense fallback={<HomeScreenSkeleton activeTab={activeTab} />}>
+                <NearbyScreen
+                  events={events}
+                  onBack={handleBack}
+                  onRefresh={handleRefreshApp}
+                  onOpenEvent={handleSelectEvent}
+                  profile={profile}
+                  refreshing={isRefreshing}
+                />
+              </Suspense>
+            </ScreenTransition>
+          </View>
+        ) : null}
+
+        {showSearchLayer ? (
+          <View pointerEvents={currentScreen === 'search' ? 'auto' : 'none'} style={[styles.screenLayer, styles.baseScreenLayer]}>
+            <ScreenTransition key="search" direction={direction}>
+              <Suspense fallback={<HomeScreenSkeleton activeTab={activeTab} />}>
+                <SearchScreen
+                  categories={categories}
+                  onBack={handleBack}
+                  onOpenEvent={handleSelectEvent}
+                  profile={profile}
+                />
+              </Suspense>
+            </ScreenTransition>
+          </View>
+        ) : null}
+
+        {showDetailsLayer && selectedEvent ? (
+          <View pointerEvents={currentScreen === 'details' ? 'auto' : 'none'} style={[styles.screenLayer, styles.detailsLayer]}>
+            <ScreenTransition key="details" direction={direction}>
             <Suspense fallback={<DetailsScreenSkeleton />}>
               <DetailsScreen
                 event={selectedEvent}
@@ -1192,26 +1437,13 @@ function AppContent() {
                 onToggleSave={() => void handleToggleSave(selectedEvent)}
               />
             </Suspense>
-          </ScreenTransition>
+            </ScreenTransition>
+          </View>
         ) : null}
 
-        {authState === 'signedIn' && !showStartupState && currentScreen === 'nearby' ? (
-          <ScreenTransition key="nearby" direction={direction}>
-            <Suspense fallback={<HomeScreenSkeleton activeTab={activeTab} />}>
-              <NearbyScreen
-                events={events}
-                onBack={handleBack}
-                onRefresh={handleRefreshApp}
-                onOpenEvent={handleSelectEvent}
-                profile={profile}
-                refreshing={isRefreshing}
-              />
-            </Suspense>
-          </ScreenTransition>
-        ) : null}
-
-        {authState === 'signedIn' && !showStartupState && currentScreen === 'ticket' && selectedEvent ? (
-          <ScreenTransition key="ticket" direction={direction}>
+        {showSignedInApp && currentScreen === 'ticket' && selectedEvent ? (
+          <View style={[styles.screenLayer, styles.ticketLayer]}>
+            <ScreenTransition key="ticket" direction={direction}>
             <Suspense fallback={<TicketScreenSkeleton />}>
               <TicketScreen
                 event={selectedEvent}
@@ -1223,7 +1455,8 @@ function AppContent() {
                 refreshing={isRefreshing}
               />
             </Suspense>
-          </ScreenTransition>
+            </ScreenTransition>
+          </View>
         ) : null}
 
         {authState === 'signedIn' && !showStartupState && currentScreen === 'home' && !homeDrawerOpen ? (
@@ -1253,6 +1486,8 @@ function AppContent() {
             onFinish={handleOnboardingFinish}
           />
         ) : null}
+
+        <AppToastHost />
       </View>
     </AppBackground>
   );
@@ -1452,6 +1687,24 @@ export default function App() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
+  },
+  screenLayer: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  homeLayer: {
+    zIndex: 0,
+  },
+  baseScreenLayer: {
+    zIndex: 1,
+    backgroundColor: '#0A0D13',
+  },
+  detailsLayer: {
+    zIndex: 2,
+    backgroundColor: '#05070C',
+  },
+  ticketLayer: {
+    zIndex: 3,
+    backgroundColor: '#0A0D13',
   },
   startupState: {
     flex: 1,

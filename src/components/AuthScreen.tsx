@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { Animated, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import React, { useEffect, useState } from 'react';
+import { Animated, KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { Image } from 'expo-image';
 import { SvgXml } from 'react-native-svg';
@@ -21,6 +21,7 @@ export function AuthScreen({
   authError,
   authMessage,
   busyProvider,
+  onEmailCodeLogin,
   onEmailLogin,
   onForgotPassword,
   onGoogleLogin,
@@ -32,6 +33,7 @@ export function AuthScreen({
   authError: string | null;
   authMessage: string | null;
   busyProvider: 'google' | 'email' | 'password' | 'reset' | null;
+  onEmailCodeLogin: (email: string, code: string) => Promise<void>;
   onEmailLogin: (email: string) => Promise<void>;
   onForgotPassword: (email: string) => Promise<void>;
   onGoogleLogin: () => Promise<void>;
@@ -43,7 +45,23 @@ export function AuthScreen({
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [loginCode, setLoginCode] = useState('');
+  const [codeSentEmail, setCodeSentEmail] = useState<string | null>(null);
+  const [sendCodeCooldown, setSendCodeCooldown] = useState(0);
+  const [passwordVisible, setPasswordVisible] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (sendCodeCooldown <= 0) {
+      return undefined;
+    }
+
+    const timer = setInterval(() => {
+      setSendCodeCooldown((seconds) => Math.max(0, seconds - 1));
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [sendCodeCooldown]);
 
   const validateEmail = () => {
     const trimmed = email.trim().toLowerCase();
@@ -57,12 +75,35 @@ export function AuthScreen({
   };
 
   const handleEmailLogin = async () => {
+    if (sendCodeCooldown > 0) {
+      return;
+    }
+
     const trimmed = validateEmail();
     if (!trimmed) {
       return;
     }
 
     await onEmailLogin(trimmed);
+    setCodeSentEmail(trimmed);
+    setLoginCode('');
+    setSendCodeCooldown(20);
+  };
+
+  const handleCodeLogin = async () => {
+    const trimmed = validateEmail();
+    if (!trimmed) {
+      return;
+    }
+
+    const code = loginCode.replace(/\D/g, '').slice(0, 6);
+    if (code.length !== 6) {
+      setLocalError('Enter the 6-digit code from your email.');
+      return;
+    }
+
+    setLocalError(null);
+    await onEmailCodeLogin(trimmed, code);
   };
 
   const handlePasswordLogin = async () => {
@@ -105,146 +146,188 @@ export function AuthScreen({
   };
 
   return (
-    <ScrollView
-      bounces={false}
-      contentContainerStyle={styles.root}
-      keyboardShouldPersistTaps="handled"
-      showsVerticalScrollIndicator={false}
+    <KeyboardAvoidingView
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      keyboardVerticalOffset={Platform.OS === 'ios' ? 12 : 0}
+      style={styles.keyboardRoot}
     >
-      <View style={styles.logoWrap}>
-        <Image source={APP_LOGO} contentFit="contain" style={styles.logo} transition={0} />
-      </View>
-
-      {passwordResetToken ? (
-        <View style={styles.copyWrap}>
-          <Text style={styles.title}>Reset password</Text>
+      <ScrollView
+        bounces
+        contentContainerStyle={styles.root}
+        keyboardShouldPersistTaps="handled"
+        showsVerticalScrollIndicator={false}
+      >
+        <View style={styles.logoWrap}>
+          <Image source={APP_LOGO} contentFit="contain" style={styles.logo} transition={0} />
         </View>
-      ) : null}
 
-      <View style={styles.authCard}>
         {passwordResetToken ? (
-          <>
-            <View style={styles.fieldGroup}>
-              <Text style={styles.fieldLabel}>New password</Text>
-              <TextInput
-                autoCapitalize="none"
-                autoCorrect={false}
-                placeholder="Choose a new password"
-                placeholderTextColor={theme.colors.textSoft}
-                secureTextEntry
-                style={styles.input}
-                value={password}
-                onChangeText={setPassword}
-              />
-            </View>
+          <View style={styles.copyWrap}>
+            <Text style={styles.title}>Reset password</Text>
+          </View>
+        ) : null}
 
-            <View style={styles.fieldGroup}>
-              <Text style={styles.fieldLabel}>Confirm password</Text>
-              <TextInput
-                autoCapitalize="none"
-                autoCorrect={false}
-                placeholder="Repeat the password"
-                placeholderTextColor={theme.colors.textSoft}
-                secureTextEntry
-                style={styles.input}
-                value={confirmPassword}
-                onChangeText={setConfirmPassword}
-              />
-            </View>
-
-            <AuthButton
-              disabled={busyProvider !== null}
-              icon="lock"
-              label={busyProvider === 'reset' ? 'Updating...' : 'Update password'}
-              onPress={() => void handleResetPassword()}
-              tone="accent"
-            />
-
-            <AuthButton
-              disabled={busyProvider !== null}
-              icon="chevron-left"
-              label="Back to sign in"
-              onPress={onCancelReset}
-              tone="paper"
-            />
-          </>
-        ) : (
-          <>
-            <AuthButton
-              disabled={busyProvider !== null}
-              googleIcon
-              icon="chrome"
-              label={busyProvider === 'google' ? 'Opening Google...' : 'Continue with Google'}
-              onPress={() => void onGoogleLogin()}
-              outlined
-              tone="paper"
-            />
-
-            <View style={styles.dividerRow}>
-              <View style={styles.divider} />
-              <Text style={styles.dividerText}>or</Text>
-              <View style={styles.divider} />
-            </View>
-
-            <View style={styles.fieldGroup}>
-              <Text style={styles.fieldLabel}>Email</Text>
-              <TextInput
-                autoCapitalize="none"
-                autoCorrect={false}
-                keyboardType="email-address"
-                placeholder="you@example.com"
-                placeholderTextColor={theme.colors.textSoft}
-                style={styles.input}
-                value={email}
-                onChangeText={setEmail}
-              />
-            </View>
-
-            <View style={styles.fieldGroup}>
-              <View style={styles.fieldLabelRow}>
-                <Text style={styles.fieldLabel}>Password</Text>
-                <Pressable onPress={() => void handleForgotPassword()}>
-                  <Text style={styles.inlineLink}>Forgot password?</Text>
-                </Pressable>
+        <View style={styles.authCard}>
+          {passwordResetToken ? (
+            <>
+              <View style={styles.fieldGroup}>
+                <Text style={styles.fieldLabel}>New password</Text>
+                <PasswordInput
+                  placeholder="Choose a new password"
+                  value={password}
+                  visible={passwordVisible}
+                  onChangeText={setPassword}
+                  onToggleVisible={() => setPasswordVisible((visible) => !visible)}
+                />
               </View>
-              <TextInput
-                autoCapitalize="none"
-                autoCorrect={false}
-                placeholder="Enter your password"
-                placeholderTextColor={theme.colors.textSoft}
-                secureTextEntry
-                style={styles.input}
-                value={password}
-                onChangeText={setPassword}
+
+              <View style={styles.fieldGroup}>
+                <Text style={styles.fieldLabel}>Confirm password</Text>
+                <PasswordInput
+                  placeholder="Repeat the password"
+                  value={confirmPassword}
+                  visible={passwordVisible}
+                  onChangeText={setConfirmPassword}
+                  onToggleVisible={() => setPasswordVisible((visible) => !visible)}
+                />
+              </View>
+
+              <AuthButton
+                disabled={busyProvider !== null}
+                icon="lock"
+                label={busyProvider === 'reset' ? 'Updating...' : 'Update password'}
+                onPress={() => void handleResetPassword()}
+                tone="accent"
               />
-            </View>
+
+              <AuthButton
+                disabled={busyProvider !== null}
+                icon="chevron-left"
+                label="Back to sign in"
+                onPress={onCancelReset}
+                tone="paper"
+              />
+            </>
+          ) : (
+            <>
+              <AuthButton
+                disabled={busyProvider !== null}
+                googleIcon
+                icon="chrome"
+                label={busyProvider === 'google' ? 'Opening Google...' : 'Continue with Google'}
+                onPress={() => void onGoogleLogin()}
+                outlined
+                tone="paper"
+              />
+
+              <View style={styles.dividerRow}>
+                <View style={styles.divider} />
+                <Text style={styles.dividerText}>or</Text>
+                <View style={styles.divider} />
+              </View>
+
+              <View style={styles.fieldGroup}>
+                <Text style={styles.fieldLabel}>Email</Text>
+                <TextInput
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  keyboardType="email-address"
+                  placeholder="you@example.com"
+                  placeholderTextColor={theme.colors.textSoft}
+                  returnKeyType="next"
+                  style={styles.input}
+                  textContentType="emailAddress"
+                  value={email}
+                  onChangeText={(value) => {
+                    setEmail(value);
+                    if (codeSentEmail && value.trim().toLowerCase() !== codeSentEmail) {
+                      setCodeSentEmail(null);
+                      setLoginCode('');
+                    }
+                  }}
+                />
+              </View>
+
+              {codeSentEmail ? (
+                <View style={styles.fieldGroup}>
+                  <View style={styles.fieldLabelRow}>
+                    <Text style={styles.fieldLabel}>Login code</Text>
+                    <Pressable disabled={busyProvider !== null || sendCodeCooldown > 0} onPress={() => void handleEmailLogin()}>
+                      <Text style={[styles.inlineLink, sendCodeCooldown > 0 && styles.inlineLinkMuted]}>
+                        {sendCodeCooldown > 0 ? `Resend in ${sendCodeCooldown}s` : 'Resend code'}
+                      </Text>
+                    </Pressable>
+                  </View>
+                  <TextInput
+                    keyboardType="number-pad"
+                    maxLength={6}
+                    placeholder="123456"
+                    placeholderTextColor={theme.colors.textSoft}
+                    returnKeyType="done"
+                    style={[styles.input, styles.codeInput]}
+                    value={loginCode}
+                    onChangeText={(value) => setLoginCode(value.replace(/\D/g, '').slice(0, 6))}
+                    onSubmitEditing={() => void handleCodeLogin()}
+                  />
+                  <AuthButton
+                    disabled={busyProvider !== null}
+                    icon="check"
+                    label={busyProvider === 'email' ? 'Checking...' : 'Verify code'}
+                    onPress={() => void handleCodeLogin()}
+                    outlined
+                    tone="accent"
+                  />
+                </View>
+              ) : null}
+
+              <View style={styles.fieldGroup}>
+                <View style={styles.fieldLabelRow}>
+                  <Text style={styles.fieldLabel}>Password</Text>
+                  <Pressable onPress={() => void handleForgotPassword()}>
+                    <Text style={styles.inlineLink}>Forgot password?</Text>
+                  </Pressable>
+                </View>
+                <PasswordInput
+                  placeholder="Enter your password"
+                  returnKeyType="done"
+                  value={password}
+                  visible={passwordVisible}
+                  onChangeText={setPassword}
+                  onSubmitEditing={() => void handlePasswordLogin()}
+                  onToggleVisible={() => setPasswordVisible((visible) => !visible)}
+                />
+              </View>
+
+              <AuthButton
+                disabled={busyProvider !== null}
+                icon="lock"
+                label={busyProvider === 'password' ? 'Signing in...' : 'Sign in'}
+                onPress={() => void handlePasswordLogin()}
+                outlined
+                tone="accent"
+              />
 
             <AuthButton
-              disabled={busyProvider !== null}
-              icon="lock"
-              label={busyProvider === 'password' ? 'Signing in...' : 'Sign in'}
-              onPress={() => void handlePasswordLogin()}
-              outlined
-              tone="accent"
-            />
-
-            <AuthButton
-              disabled={busyProvider !== null}
+              disabled={busyProvider !== null || sendCodeCooldown > 0}
               icon="mail"
-              label={busyProvider === 'email' ? 'Sending link...' : 'Send login link'}
+              label={busyProvider === 'email' ? 'Sending code...' : codeSentEmail ? 'Send code again' : 'Send login code'}
               onPress={() => void handleEmailLogin()}
               tone="paper"
             />
-          </>
-        )}
+            {sendCodeCooldown > 0 ? (
+              <Text style={styles.cooldownText}>Another code can be sent in {sendCodeCooldown}s</Text>
+            ) : null}
+            </>
+          )}
 
-        {localError || authError ? (
-          <StatusCard icon="info" message={localError ?? authError ?? ''} tone="error" />
-        ) : null}
+          {localError || authError ? (
+            <StatusCard icon="info" message={localError ?? authError ?? ''} tone="error" />
+          ) : null}
 
-        {authMessage ? <StatusCard icon="check-circle" message={authMessage} tone="success" /> : null}
-      </View>
-    </ScrollView>
+          {authMessage ? <StatusCard icon="check-circle" message={authMessage} tone="success" /> : null}
+        </View>
+      </ScrollView>
+    </KeyboardAvoidingView>
   );
 }
 
@@ -304,6 +387,45 @@ function AuthButton({
   );
 }
 
+function PasswordInput({
+  placeholder,
+  returnKeyType,
+  value,
+  visible,
+  onChangeText,
+  onSubmitEditing,
+  onToggleVisible,
+}: {
+  placeholder: string;
+  returnKeyType?: 'done' | 'next';
+  value: string;
+  visible: boolean;
+  onChangeText: (value: string) => void;
+  onSubmitEditing?: () => void;
+  onToggleVisible: () => void;
+}) {
+  return (
+    <View style={styles.passwordInputWrap}>
+      <TextInput
+        autoCapitalize="none"
+        autoCorrect={false}
+        placeholder={placeholder}
+        placeholderTextColor={theme.colors.textSoft}
+        returnKeyType={returnKeyType}
+        secureTextEntry={!visible}
+        style={styles.passwordInput}
+        textContentType="password"
+        value={value}
+        onChangeText={onChangeText}
+        onSubmitEditing={onSubmitEditing}
+      />
+      <Pressable accessibilityRole="button" accessibilityLabel={visible ? 'Hide password' : 'Show password'} onPress={onToggleVisible} style={styles.passwordEye}>
+        <Feather color={theme.colors.textMuted} name={visible ? 'eye-off' : 'eye'} size={17} />
+      </Pressable>
+    </View>
+  );
+}
+
 function StatusCard({
   icon,
   message,
@@ -322,10 +444,14 @@ function StatusCard({
 }
 
 const styles = StyleSheet.create({
+  keyboardRoot: {
+    flex: 1,
+  },
   root: {
     flexGrow: 1,
     paddingHorizontal: 24,
-    paddingVertical: 34,
+    paddingTop: 34,
+    paddingBottom: 96,
     justifyContent: 'center',
     gap: 22,
   },
@@ -430,6 +556,18 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontWeight: '700',
   },
+  inlineLinkMuted: {
+    color: theme.colors.textSoft,
+    opacity: 0.72,
+  },
+  cooldownText: {
+    marginTop: -8,
+    color: theme.colors.textSoft,
+    fontSize: 11,
+    fontWeight: '600',
+    opacity: 0.68,
+    textAlign: 'center',
+  },
   input: {
     minHeight: 48,
     borderRadius: 15,
@@ -440,6 +578,36 @@ const styles = StyleSheet.create({
     color: theme.colors.text,
     fontSize: 14,
     fontWeight: '600',
+  },
+  passwordInputWrap: {
+    minHeight: 48,
+    borderRadius: 15,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  passwordInput: {
+    flex: 1,
+    minHeight: 48,
+    paddingLeft: 14,
+    paddingRight: 8,
+    color: theme.colors.text,
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  passwordEye: {
+    width: 44,
+    minHeight: 48,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  codeInput: {
+    textAlign: 'center',
+    fontSize: 19,
+    fontWeight: '800',
+    letterSpacing: 6,
   },
   statusCard: {
     borderRadius: 14,
